@@ -1,193 +1,257 @@
 # DECISIONS.md
 
-# Architecture Decision Log
+# Architectural Decision Log
 
 ---
 
-## ADR-001
+## Decision ID
+ADR-001
 
-Status: Active
+### Title
+Use an Application Factory
 
-Title:
-Contract-First Development
+### Context
 
-Context:
+The Coordinator service requires a single location responsible for application construction.
 
-The project is a distributed system where multiple services must communicate reliably.
+### Decision
 
-Decision:
+Construct the FastAPI application using a dedicated `create_app()` factory.
 
-Define communication contracts before implementing services.
+### Reasoning
 
-Reasoning:
+- Separation of concerns
+- Easier testing
+- Centralized initialization
 
-Prevents incompatible implementations between Coordinator and Worker.
+### Alternatives Considered
 
-Alternatives:
+- Direct application construction inside `main.py`
 
-Implement Coordinator first.
+### Tradeoffs
 
-Rejected because contracts would evolve unpredictably.
+Slightly more structure for a small project but significantly better scalability.
 
-Consequences:
+### Consequences
 
-Shared models become the authoritative communication layer.
+All future infrastructure initialization occurs through the application factory.
 
----
+### Status
 
-## ADR-002
-
-Status: Active
-
-Title:
-Dedicated Shared Package
-
-Context:
-
-Coordinator, Worker and Dashboard require common definitions.
-
-Decision:
-
-Create a dedicated shared package.
-
-Reasoning:
-
-Avoid duplicate implementations.
-
-Maintain one source of truth.
-
-Alternatives:
-
-Duplicate models inside every service.
-
-Rejected.
+**Active**
 
 ---
 
-## ADR-003
+## Decision ID
+ADR-002
 
-Status: Active
+### Title
+Modular Infrastructure Layout
 
-Title:
-Pydantic for Shared Models
+### Context
 
-Context:
+Infrastructure responsibilities should remain isolated.
 
-Communication contracts require validation.
+### Decision
 
-Decision:
+Separate infrastructure into dedicated modules.
 
-Use Pydantic BaseModel.
+### Reasoning
 
-Reasoning:
+Improves maintainability and scalability.
 
-Strong typing.
+### Alternatives Considered
 
-Validation.
+Single monolithic application module.
 
-FastAPI compatibility.
+### Tradeoffs
 
-Serialization support.
+More files in exchange for cleaner architecture.
 
-Alternatives:
+### Consequences
 
-Dataclasses
+Infrastructure evolves independently.
 
-TypedDict
+### Status
 
-Plain dictionaries
-
-Rejected.
-
----
-
-## ADR-004
-
-Status: Active
-
-Title:
-Centralized Enumerations
-
-Decision:
-
-All shared state values must be defined once inside shared/enums.
-
-Reasoning:
-
-Prevent inconsistent state definitions.
+**Active**
 
 ---
 
-## ADR-005
+## Decision ID
+ADR-003
 
-Status: Active
+### Title
+Use FastAPI Lifespan Events
 
-Title:
-Centralized Constants
+### Context
 
-Decision:
+Modern FastAPI recommends lifespan over legacy startup/shutdown events.
 
-Protocol constants, API constants, timeout values and error codes must be centralized.
+### Decision
 
-Reasoning:
+Adopt the lifespan API.
 
-Avoid duplicated literals.
+### Reasoning
 
----
+Future-proof and officially recommended.
 
-## ADR-006
+### Alternatives Considered
 
-Status: Active
+`@app.on_event`
 
-Title:
-Configuration Schemas Separate from Configuration Loading
+### Tradeoffs
 
-Decision:
+Requires slightly different initialization style.
 
-Shared package contains only configuration schemas.
+### Consequences
 
-Loading configuration belongs to individual services.
+Lifecycle management remains modern and maintainable.
 
-Reasoning:
+### Status
 
-Separates contracts from implementation.
-
----
-
-## ADR-007
-
-Status: Active
-
-Title:
-Documentation-Driven Protocol
-
-Decision:
-
-Worker lifecycle, task lifecycle, message flow and versioning are documented before implementation.
-
-Reasoning:
-
-Documentation becomes the protocol specification.
+**Active**
 
 ---
 
-## ADR-008
+## Decision ID
+ADR-004
 
-Status: Active
+### Title
+Versioned API Architecture
 
-Title:
-Strict Incremental Development
+### Context
 
-Decision:
+The Coordinator API will evolve over time.
 
-Only one implementation step may be completed at a time.
+### Decision
 
-Every step must be validated before continuing.
+Organize endpoints under version-specific packages (`api/v1`).
 
-Reasoning:
+### Reasoning
 
-Reduces accumulated technical debt.
+Supports future API versions without breaking existing clients.
 
-Simplifies debugging.
+### Alternatives Considered
 
-Ensures demonstrable milestones.
+Single unversioned API.
+
+### Tradeoffs
+
+Additional package structure.
+
+### Consequences
+
+Future versions (`v2`, `v3`) can coexist cleanly.
+
+### Status
+
+**Active**
+
+---
+
+## Decision ID
+ADR-005
+
+### Title
+Central API Router Aggregation
+
+### Context
+
+Endpoint routers require a single integration point.
+
+### Decision
+
+Use a dedicated `api_router` to aggregate all Version 1 endpoint routers.
+
+### Reasoning
+
+Provides modular endpoint registration.
+
+### Alternatives Considered
+
+Register every endpoint directly in the application factory.
+
+### Tradeoffs
+
+One additional routing layer.
+
+### Consequences
+
+Future endpoint modules integrate consistently.
+
+### Status
+
+**Active**
+
+---
+
+## Decision ID
+ADR-006
+
+### Title
+Separate API Schemas from Endpoints
+
+### Context
+
+Response contracts should remain independent from routing logic.
+
+### Decision
+
+Introduce dedicated Pydantic response models.
+
+### Reasoning
+
+Improves documentation, validation, maintainability, and type safety.
+
+### Alternatives Considered
+
+Return anonymous dictionaries.
+
+### Tradeoffs
+
+Requires additional schema modules.
+
+### Consequences
+
+Stable API contracts and improved OpenAPI generation.
+
+### Status
+
+**Active**
+
+---
+
+## Decision ID
+ADR-007
+
+### Title
+Dedicated Health Endpoint
+
+### Context
+
+Operational health checks should remain separate from service identification.
+
+### Decision
+
+Expose a dedicated `/health` endpoint.
+
+### Reasoning
+
+Supports future readiness and liveness checks.
+
+### Alternatives Considered
+
+Reuse the root endpoint.
+
+### Tradeoffs
+
+Additional endpoint.
+
+### Consequences
+
+Health monitoring can evolve independently.
+
+### Status
+
+**Active**

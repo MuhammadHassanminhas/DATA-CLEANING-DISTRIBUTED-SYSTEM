@@ -2,134 +2,99 @@
 
 # Project Overview
 
-This project aims to build a production-grade Distributed AI-Orchestrated SQL Database Cleaning Platform.
+This project is building the first version of a distributed AI-powered SQL database cleaning platform.
 
-Version 1 focuses exclusively on SQL databases.
+Version 1 focuses exclusively on building the distributed infrastructure.
 
-The long-term architecture separates:
+Current development is limited to the Coordinator foundation.
 
-- AI planning
-- Distributed execution
-- Verification
-- Scheduling
-- Reporting
-
-Current development is focused only on the distributed infrastructure.
+No distributed functionality has been implemented yet.
 
 ---
 
 # Current Status
 
-Current Phase:
+Phase 1 — Step 4 has been completed.
 
-Phase 1
+The Coordinator now provides:
 
-Current Step:
-
-Step 2 completed.
-
-Shared communication layer is fully defined.
-
-No Coordinator implementation has started.
+- Executable FastAPI application
+- Configuration infrastructure
+- Logging infrastructure
+- Lifecycle infrastructure
+- Versioned API architecture
+- Root endpoint
+- Health endpoint
+- Response schemas
+- OpenAPI documentation
 
 ---
 
 # What Was Completed
 
-Step 1
+Previous Sessions
 
-- Repository foundation
-- Development structure
+- Coordinator application skeleton.
+- Modular infrastructure.
+- Application factory.
 
-Step 2
+Current Session
 
-- Shared package
-- Shared enums
-- Shared models
-- Shared constants
-- Shared configuration schemas
-- Protocol documentation
-- Versioning strategy
-- Package responsibility documentation
-
-Architecture review completed.
+- API package structure.
+- Version 1 router.
+- Root endpoint.
+- Health endpoint.
+- Router integration.
+- Response schemas.
+- OpenAPI metadata.
 
 ---
 
 # Current Objective
 
-Begin implementation of the Coordinator service skeleton.
-
-No networking.
-
-No authentication.
-
-No worker registration.
-
-Only establish the executable Coordinator application structure.
+Begin Phase 1 — Step 5 following the implementation roadmap.
 
 ---
 
 # Next Immediate Step
 
-Start Step 3.
+Start **Phase 1 — Step 5**.
 
-Build the Coordinator service skeleton.
+Follow the implementation plan exactly.
+
+Continue using one small implementation step at a time.
 
 ---
 
 # Important Decisions
 
-- Contract-first architecture.
-- Shared package is the single source of truth.
-- Pydantic models for communication.
-- Centralized enums.
-- Centralized constants.
-- Documentation-first protocol design.
-- Strict incremental implementation.
-- Validate every step before proceeding.
+- Application Factory pattern.
+- Modular infrastructure architecture.
+- FastAPI lifespan events.
+- Versioned API structure.
+- Aggregated API router.
+- Dedicated response schemas.
+- Dedicated health endpoint.
+
+Refer to `DECISIONS.md` for the complete decision log.
 
 ---
 
 # Important Constraints
 
-Do not skip implementation steps.
-
-Do not implement future functionality early.
-
-Every step must be independently verifiable.
-
-The implementation must remain aligned with the architecture specification.
-
-Version 1 supports only SQL databases.
-
-Workers communicate only with the Coordinator.
-
-Workers never communicate with each other.
+- Implement only one mini-step at a time.
+- Do not skip implementation steps.
+- Do not introduce future functionality early.
+- Preserve modular architecture.
+- Keep distributed-system functionality out of the Coordinator foundation until scheduled.
 
 ---
 
 # Pending Work
 
-Coordinator implementation.
+Everything beginning with Phase 1 — Step 5.
 
-Worker implementation.
-
-Networking.
-
-Registration.
-
-Authentication.
-
-Heartbeats.
-
-Task distribution.
-
-Fault tolerance.
-
-Adaptive scheduling.
-
-Dashboard.
+No later implementation has started.
 
 ---
 
@@ -141,16 +106,8 @@ None.
 
 # Suggested First Prompt
 
-Read the architecture documents, especially:
-
-- SESSION_HANDOFF.md
-- PHASE_STATE.md
-- DECISIONS.md
+Read `PHASE_STATE.md`, `DECISIONS.md`, `SESSION_HANDOFF.md`, `implementation_plan.md`, and `Project Architecture Specification.md`.
 
 Treat them as the source of truth.
 
-Continue exactly from the Next Immediate Step.
-
-Do not repeat completed work.
-
-Follow the project's strict incremental implementation process.
+Continue exactly from the **Next Immediate Step** without repeating completed work.

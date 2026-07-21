@@ -1,0 +1,3 @@
+"""
+Coordinator HTTP API package.
+"""

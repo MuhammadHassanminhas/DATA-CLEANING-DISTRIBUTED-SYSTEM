@@ -419,7 +419,7 @@ The implementation plan must explain in detail:
 
 # Expected Output
 
-Produce a production-grade architecture document in multiple md files covering different phases with different small steps and an exit criteria and a claude md file under 300 lines containing the guard rails of the projec and a phase state md file containing the state of the project and containing:
+Produce a production-grade architecture document in multiple md files covering different phases with different steps and an exit criteria and a claude md file under 300 lines containing the guard rails of the projec and a phase state md file containing the state of the project and containing:
 
 1. High-level architecture
 2. Component breakdown
