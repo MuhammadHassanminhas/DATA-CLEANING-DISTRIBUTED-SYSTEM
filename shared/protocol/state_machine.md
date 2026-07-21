@@ -1,0 +1,39 @@
+# System State Machines
+
+## Worker
+
+NEW
+↓
+REGISTERED
+↓
+AUTHENTICATED
+↓
+IDLE
+↓
+BUSY
+↓
+IDLE
+↓
+OFFLINE
+
+---
+
+## Task
+
+CREATED
+↓
+QUEUED
+↓
+ASSIGNED
+↓
+RUNNING
+↓
+COMPLETED
+
+Possible alternative paths:
+
+RUNNING → FAILED
+
+RUNNING → TIMEOUT
+
+ASSIGNED → CANCELLED
