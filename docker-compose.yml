@@ -34,6 +34,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      ENROLLMENT_SECRET: ${ENROLLMENT_SECRET}
+      CREDENTIAL_PEPPER: ${CREDENTIAL_PEPPER}
     ports:
       - "${COORDINATOR_PORT}:8443"
     volumes:
@@ -50,6 +52,8 @@ services:
       dockerfile: dashboard/Dockerfile
     environment:
       LOG_LEVEL: ${LOG_LEVEL}
+      COORDINATOR_URL: https://coordinator:8443
+      ENROLLMENT_SECRET: ${ENROLLMENT_SECRET}
     ports:
       - "${DASHBOARD_PORT}:8444"
     volumes:
@@ -64,9 +68,15 @@ services:
       dockerfile: worker/Dockerfile
     environment:
       WORKER_LOOP_INTERVAL_SECONDS: 5
+      COORDINATOR_URL: https://coordinator:8443
+      ENROLLMENT_SECRET: ${ENROLLMENT_SECRET}
+    volumes:
+      - ./certs:/certs:ro
+      - worker-identity-data:/var/lib/worker-identity
     depends_on:
       coordinator:
         condition: service_healthy
 
 volumes:
   postgres-data:
+  worker-identity-data:

@@ -3,6 +3,10 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
+COPY worker/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY protocol ./protocol
 COPY worker/worker.py ./worker.py
 
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD python -c "\
