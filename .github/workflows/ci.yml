@@ -81,12 +81,9 @@ jobs:
           pip-audit -r dashboard/requirements.txt
           pip-audit -r worker/requirements.txt
       - name: Trivy filesystem scan (report-only — base-image CVEs shouldn't block merge)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: fs
-          scanners: vuln,secret,misconfig
-          severity: HIGH,CRITICAL
-          exit-code: "0"
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/repo" aquasec/trivy:latest fs \
+            --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 0 /repo
 
   terraform:
     runs-on: ubuntu-latest
