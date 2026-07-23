@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 certs/
 
+# Terraform — never commit provider cache, local state, or plans.
+# .terraform.lock.hcl IS committed (provider version pins, no secrets).
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+
