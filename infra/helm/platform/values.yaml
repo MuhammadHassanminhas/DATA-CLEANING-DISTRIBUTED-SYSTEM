@@ -1,0 +1,54 @@
+# Default values. Per-environment overrides in values-staging.yaml /
+# values-production.yaml. Secret VALUES are never here (CLAUDE.md §12) —
+# only the names of pre-created Secrets (see infra/helm/bootstrap-secrets.ps1).
+
+coordinator:
+  image:
+    repository: coordinator
+    tag: local
+    pullPolicy: IfNotPresent   # images are k3d-imported locally (Decision B)
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  hpa:
+    minReplicas: 1
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    minAvailable: 1
+
+dashboard:
+  image:
+    repository: dashboard
+    tag: local
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+postgres:
+  image: postgres:16-alpine
+  storage: 1Gi
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+redis:
+  image: redis:7-alpine
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+config:
+  logLevel: INFO
+  postgresUser: coordinator
+  postgresDb: coordinator
+
+# Names of Secrets created out-of-band (bootstrap script locally,
+# sealed-secrets in CI/CD). The chart references, never defines, them.
+secretNames:
+  app: app-secrets          # ENROLLMENT_SECRET, CREDENTIAL_PEPPER
+  postgres: postgres-secret # POSTGRES_PASSWORD
+  tls: tls-certs            # coordinator.crt/key, dashboard.crt/key, dev-ca.crt

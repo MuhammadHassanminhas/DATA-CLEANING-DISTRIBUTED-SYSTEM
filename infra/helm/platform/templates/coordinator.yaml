@@ -1,0 +1,116 @@
+# Coordinator: Deployment + Service + HPA + PodDisruptionBudget.
+# Migrations run in an initContainer BEFORE the app container starts
+# (Decision #55) — the app image's own startup migration is disabled via
+# RUN_MIGRATIONS_ON_STARTUP=false in app-config. Rolling update is
+# surge-one / zero-unavailable so an upgrade never drops the fleet.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coordinator
+spec:
+  replicas: {{ .Values.coordinator.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels: { app: coordinator }
+  template:
+    metadata:
+      labels: { app: coordinator }
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: {{ .Values.postgres.image }}
+          command: ["sh", "-c", "until pg_isready -h postgres -p 5432 -U \"$POSTGRES_USER\"; do echo waiting-for-postgres; sleep 2; done"]
+          envFrom:
+            - configMapRef: { name: app-config }
+            - secretRef: { name: {{ .Values.secretNames.postgres }} }
+          # Required: the namespace ResourceQuota (Step 1.5.1) tracks
+          # requests/limits for every container, initContainers included.
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+        # ponytail: alembic upgrade, one-shot before serve. With maxSurge=1
+        # + minReplicas>=1 only one pod ever migrates pending revisions at a
+        # time; a cold multi-replica start would race — add a DB advisory
+        # lock if that path ever becomes real.
+        - name: migrate
+          image: "{{ .Values.coordinator.image.repository }}:{{ .Values.coordinator.image.tag }}"
+          imagePullPolicy: {{ .Values.coordinator.image.pullPolicy }}
+          workingDir: /app/coordinator
+          # PYTHONPATH so alembic's env.py can `import app.config` — the
+          # alembic CLI entrypoint lives in /usr/local/bin, so cwd isn't
+          # on sys.path the way it is under uvicorn.
+          command: ["sh", "-c", "PYTHONPATH=/app/coordinator alembic upgrade head"]
+          envFrom:
+            - configMapRef: { name: app-config }
+            - secretRef: { name: {{ .Values.secretNames.app }} }
+            - secretRef: { name: {{ .Values.secretNames.postgres }} }
+          resources: {{ toYaml .Values.coordinator.resources | nindent 12 }}
+      containers:
+        - name: coordinator
+          image: "{{ .Values.coordinator.image.repository }}:{{ .Values.coordinator.image.tag }}"
+          imagePullPolicy: {{ .Values.coordinator.image.pullPolicy }}
+          ports:
+            - containerPort: 8443
+          envFrom:
+            - configMapRef: { name: app-config }
+            - secretRef: { name: {{ .Values.secretNames.app }} }
+            - secretRef: { name: {{ .Values.secretNames.postgres }} }
+          volumeMounts:
+            - name: tls
+              mountPath: /certs
+              readOnly: true
+          livenessProbe:
+            httpGet: { path: /health, port: 8443, scheme: HTTPS }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /ready, port: 8443, scheme: HTTPS }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources: {{ toYaml .Values.coordinator.resources | nindent 12 }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.secretNames.tls }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator
+spec:
+  selector: { app: coordinator }
+  ports:
+    - port: 8443
+      targetPort: 8443
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: coordinator
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: coordinator
+  minReplicas: {{ .Values.coordinator.hpa.minReplicas }}
+  maxReplicas: {{ .Values.coordinator.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.coordinator.hpa.targetCPUUtilizationPercentage }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coordinator
+spec:
+  minAvailable: {{ .Values.coordinator.pdb.minAvailable }}
+  selector:
+    matchLabels: { app: coordinator }

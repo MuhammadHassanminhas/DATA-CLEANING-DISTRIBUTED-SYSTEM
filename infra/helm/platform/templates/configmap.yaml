@@ -1,0 +1,18 @@
+# Non-secret env shared by coordinator + dashboard. Hosts/ports are
+# in-cluster service DNS names. RUN_MIGRATIONS_ON_STARTUP=false because
+# migrations run once in the coordinator initContainer (Decision #55),
+# not in every replica's boot.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: {{ .Values.config.postgresUser | quote }}
+  POSTGRES_DB: {{ .Values.config.postgresDb | quote }}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  COORDINATOR_URL: https://coordinator:8443
+  RUN_MIGRATIONS_ON_STARTUP: "false"

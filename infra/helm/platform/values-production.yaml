@@ -1,0 +1,8 @@
+# Production overrides (Decision #40 — production namespace).
+coordinator:
+  replicas: 2
+  hpa:
+    minReplicas: 2
+    maxReplicas: 4
+config:
+  logLevel: INFO

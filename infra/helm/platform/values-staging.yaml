@@ -1,0 +1,8 @@
+# Staging overrides (Decision #40 — staging namespace). Small footprint.
+coordinator:
+  replicas: 1
+  hpa:
+    minReplicas: 1
+    maxReplicas: 3
+config:
+  logLevel: DEBUG

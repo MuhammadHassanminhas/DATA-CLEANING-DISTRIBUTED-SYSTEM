@@ -32,6 +32,7 @@ from app.config import (
     heartbeat_suspect_threshold_seconds,
     heartbeat_sweep_interval_seconds,
     register_rate_limit_per_minute,
+    run_migrations_on_startup,
     worker_claim_ttl_seconds,
     ws_ping_interval_seconds,
     ws_pong_timeout_seconds,
@@ -83,12 +84,15 @@ def _run_migrations() -> None:
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
     logger.info("coordinator starting")
-    await asyncio.to_thread(_run_migrations)
-    # Alembic's fileConfig (invoked inside _run_migrations via env.py)
-    # reconfigures the root logger's level and handler as a side effect —
-    # reassert ours or every INFO log after this point is silently dropped.
-    configure_logging()
-    logger.info("migrations applied")
+    if run_migrations_on_startup():
+        await asyncio.to_thread(_run_migrations)
+        # Alembic's fileConfig (invoked inside _run_migrations via env.py)
+        # reconfigures the root logger's level and handler as a side effect —
+        # reassert ours or every INFO log after this point is silently dropped.
+        configure_logging()
+        logger.info("migrations applied")
+    else:
+        logger.info("startup migrations skipped (RUN_MIGRATIONS_ON_STARTUP=false)")
     sweep_task = asyncio.create_task(_heartbeat_sweep_loop())
     yield
     # No app-level connection drain here: uvicorn's own `Server.shutdown()`

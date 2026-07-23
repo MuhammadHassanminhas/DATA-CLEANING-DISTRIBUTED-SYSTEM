@@ -31,6 +31,16 @@ def credential_pepper() -> str:
     return os.environ["CREDENTIAL_PEPPER"]
 
 
+def run_migrations_on_startup() -> bool:
+    """Whether the coordinator runs `alembic upgrade head` from its own
+    FastAPI lifespan on boot. True by default (Docker Compose dev relies
+    on it — Decisions Log #8). Kubernetes sets this false and runs
+    migrations once, before the container serves, via an initContainer
+    (Decision #55) — so N horizontally-scaled replicas never race an
+    upgrade on cold start."""
+    return os.environ.get("RUN_MIGRATIONS_ON_STARTUP", "true").lower() != "false"
+
+
 def register_rate_limit_per_minute() -> int:
     """Recommendation, not a measured value — no load test has run yet."""
     return int(os.environ.get("REGISTER_RATE_LIMIT_PER_MINUTE", "5"))
