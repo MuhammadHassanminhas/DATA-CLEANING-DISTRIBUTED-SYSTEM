@@ -15,11 +15,11 @@ This file stays the authority on phase/gate status if the two disagree.
 |---|---|
 | Project | Distributed AI-Orchestrated SQL Database Cleaning Platform |
 | Scope in progress | Version 1 — Distributed Worker Network |
-| Current milestone | M1 — Reliable Worker Network |
-| Current phase | 1.10 — M1 demo and fresh-clone verification |
-| Phase status | NOT STARTED |
-| Last updated | 2026-07-22 |
-| Approval gate | Phases 1.0–1.9 approved 2026-07-22. Phase 1.9 approved by explicit user sign-off accepting the 50-worker level as sufficient; 100-worker level and its 10-minute soak explicitly waived, not silently skipped. |
+| Current milestone | M1.5 — Infrastructure & Deployment (M1 complete) |
+| Current phase | 1.5.3 — GitHub Actions CI pipeline (IN PROGRESS — built + locally verified, not pushed) |
+| Phase status | **Steps 1.5.1 and 1.5.2 DONE and approved 2026-07-23**, both built and verified live on a real local k3d cluster. 1.5.1: thin Terraform (Decision #54) — k3d CLI owns the cluster, Terraform manages namespaces/quotas/sealed-secrets via `kubernetes`+`helm` providers, remote state in Terraform Cloud (state-locking tested, destroy/apply/apply reproduce clean). 1.5.2: `infra/helm/platform` chart — coordinator+dashboard Deployments, in-cluster Postgres StatefulSet + Redis, HPA, PDB, migrations via initContainer (Decision #55), TLS via mounted dev-CA Secret; all 7 exit criteria verified (external worker connect→ONLINE, pod-delete reschedule, rolling upgrade no loss). Tooling installed and working: `k3d` v5.9.0, Terraform v1.15.8, Helm v4.2.3, kubectl. The `platform` release is currently deployed to the `staging` namespace on the running cluster. **Next: Step 1.5.3 — GitHub Actions CI pipeline (not started).** Nothing committed or pushed this session. |
+| Last updated | 2026-07-23 |
+| Approval gate | Phases 1.0–1.10 approved 2026-07-22. **Milestone 1 (Reliable Worker Network) is complete.** Phase 1.10's "100 workers" figures were substituted with 50 by explicit user direction (Decisions Log #35), consistent with the same substitution already accepted for Phase 1.9 — both explicitly approved regardless. **Phase 1.5.0 (design gate) went through three rounds this session, all approved by the user in sequence 2026-07-22**: (1) OCI-based plan (Decisions Log #36–41), approved, then (2) rejected once the user learned every cloud requires a card on file even for free tiers — revised to a self-hosted plan (Decisions Log #42–46: k3d on the laptop, Cloudflare Tunnel/DNS, ghcr.io, Terraform Cloud), approved, then (3) **reverted back to OCI** once the user explicitly chose to accept the card requirement after all (Decisions Log #47–49, superseding #42–44 again). OCI + OKE was the 2026-07-22 state. **On 2026-07-23 the design gate was re-opened and re-decided again** (Decisions Log #50–#53): after discovering the user's cloud access is blocked only by a company **network MAC-filter on Google** (not an account restriction), the plan settled on **local Kubernetes via k3d + Cloudflare Tunnel for reachability, no paid cloud provider** — the current authoritative state (see Snapshot's Phase status, Decisions #52–#53, Open Questions #2). Decisions #39–41/#45–46 (self-hosted Postgres/Redis, staging/production namespaces, sealed-secrets, ghcr.io, Terraform Cloud remote state) stood unchanged through every round. CI has not run on the latest commit — not yet pushed to `origin`, pushing was not requested. |
 
 ---
 
@@ -27,8 +27,8 @@ This file stays the authority on phase/gate status if the two disagree.
 
 | Milestone | Title | Status | Demo done | Failure demo done | Internet tested | Fresh clone verified |
 |---|---|---|---|---|---|---|
-| M1 | Reliable Worker Network | NOT STARTED | No | No | n/a | No |
-| M1.5 | Infrastructure & Deployment | BLOCKED (M1) | No | No | No | No |
+| M1 | Reliable Worker Network | DONE | Yes | Yes | n/a | Yes |
+| M1.5 | Infrastructure & Deployment | IN PROGRESS | No | No | No | No |
 | M2 | Task Distribution | BLOCKED (M1.5) | No | No | No | No |
 | M3 | Fault Tolerance | BLOCKED (M2) | No | No | No | No |
 | M4 | Adaptive Scheduling | BLOCKED (M3) | No | No | No | No |
@@ -52,21 +52,40 @@ Status values: `NOT STARTED` · `IN PROGRESS` · `AWAITING APPROVAL` · `DONE` �
 | 1.7 | Reconnection and session conflict | DONE |
 | 1.8 | Dashboard v1 — live worker view | DONE |
 | 1.9 | Scale simulation 1 → 100 workers | DONE |
-| 1.10 | M1 demo and fresh-clone verification | NOT STARTED |
+| 1.10 | M1 demo and fresh-clone verification | DONE |
 
 ### Milestone 1.5 — Infrastructure & Deployment
 | Phase | Title | Status |
 |---|---|---|
-| 1.5.0 | Design gate — cloud topology and cost | NOT STARTED |
-| 1.5.1 | Terraform base infrastructure | NOT STARTED |
-| 1.5.2 | Kubernetes manifests and Helm packaging | NOT STARTED |
-| 1.5.3 | GitHub Actions CI pipeline | NOT STARTED |
+| 1.5.0 | Design gate — cloud topology and cost | DONE (re-decided 2026-07-23) |
+| 1.5.1 | Terraform base infrastructure | DONE (approved 2026-07-23; verified live on k3d — all exit criteria met, destroy/apply/apply reproduce clean, state-locking tested) |
+| 1.5.2 | Kubernetes manifests and Helm packaging | DONE (approved 2026-07-23; all 7 exit criteria verified live on k3d: Helm deploy, pods ready+probes, migrations before serve, external worker connect→ONLINE, pod-delete reschedule→worker reconnect, rolling upgrade no permanent loss, resource limits on every container). HPA object present but shows cpu:<unknown> — no metrics-server yet; live autoscaling proof deferred to Step 1.5.7. |
+| 1.5.3 | GitHub Actions CI pipeline | IN PROGRESS (pipeline built + verified locally 2026-07-23: 8/8 tests pass vs ephemeral PG/Redis, ruff+actionlint+terraform fmt clean; NOT pushed — green Actions run, required checks, branch protection pending a push) |
 | 1.5.4 | GitHub Actions CD pipeline | NOT STARTED |
 | 1.5.5 | Public ingress, TLS, DNS | NOT STARTED |
 | 1.5.6 | Observability stack | NOT STARTED |
 | 1.5.7 | Coordinator horizontal scaling proof | NOT STARTED |
 | 1.5.8 | Real Internet worker onboarding | NOT STARTED |
 | 1.5.9 | M1.5 demo and verification | NOT STARTED |
+
+> **Milestone 1.5 direction settled (2026-07-23): local Kubernetes
+> (k3d) + Cloudflare Tunnel, no paid cloud provider** (Decisions Log
+> #52–#53). The re-opened Step 1.5.0 is re-closed and Open Questions #2
+> is resolved. The system will be deployed to a **local k3d cluster**
+> (real CNCF Kubernetes on the user's PC, $0), reached from other
+> networks via **Cloudflare Tunnel**. M1.5's Kubernetes/Helm/CI-CD
+> content stays real — only "cloud-hosted" becomes "local cluster", and
+> "always-on public" becomes "reachable while the PC + tunnel run"
+> (honest limitation; §8 needs only a per-phase cross-network worker,
+> not 24/7). The existing OCI/GKE-oriented `infra/terraform/` scaffold
+> will be rewritten or retired at Step 1.5.1, whose own short design
+> sub-gate decides Terraform's reduced scope now that there are no cloud
+> resources (e.g. Terraform managing the k3d cluster + namespaces + Helm
+> releases via the `kubernetes`/`helm` providers, vs the k3d CLI + Helm
+> directly). Provider-agnostic Decisions #39–41 / #45–46 (self-hosted
+> Postgres/Redis, staging/production namespaces, sealed-secrets,
+> ghcr.io, Terraform Cloud remote state) still stand. No M1.5 phase is
+> DONE yet — build starts next.
 
 ### Milestone 2 — Task Distribution
 | Phase | Title | Status |
@@ -172,6 +191,35 @@ Append only. Never rewrite an entry.
 | 32 | 2026-07-22 | Visual identity: **dark "radar/phosphor console" theme** — deep green-tinted black (not neutral or blue-black), a signature animated hub-and-spoke glyph as the wordmark icon (a literal, functional nod to the star-topology invariant, CLAUDE.md §3.1, not decoration), and a multi-hue functional color system (five distinct status colors) rather than one decorative accent color | The generic "near-black background + one bright accent color" AI-default template | Deliberately avoided the single-accent-color cliché: the palette's chroma comes from the five worker states themselves (ONLINE/SUSPECT/OFFLINE/QUARANTINED/CONNECTING), which is what this page is actually *for*, not from a brand accent layered on top. The radar/phosphor console direction is grounded in the subject (a network-operations monitoring tool watching a hub-and-spoke fleet) rather than picked as a generic dark-mode default. A light theme is also implemented (`prefers-color-scheme`) for completeness. | 1.8 |
 | 33 | 2026-07-22 | Scale-test worker identity: **`docker-compose.scale.yml` override** replacing the named `worker-identity-data` volume with an anonymous per-replica volume, used only via `-f docker-compose.yml -f docker-compose.scale.yml up --scale worker=N` | Modify the base `docker-compose.yml` itself to use an anonymous volume always | The base compose file's named volume is what makes identity persist across restart/recreation for normal single-worker dev (Phase 1.3's own verified exit criterion) — changing it there would silently undo that. An override file gets `--scale` working for the transient scale-simulation use case without touching the persistence behavior every earlier phase already demonstrated. Identity not persisting across a scaled replica's recreation is acceptable here: a scale simulation is a transient measurement, not a persistence test. | 1.9 |
 | 34 | 2026-07-22 | Phase 1.9 scope: **stopped at 50 workers, by explicit user direction**, not a discovered bottleneck | Continue to the 100-worker level and its 10-minute no-heartbeat-loss soak in this same session | All containers stopped simultaneously right after the level-50 measurement. Read initially as a possible Docker Desktop resource-ceiling event and reported to the user as such (CLAUDE.md §16 — a benchmark-adjacent result contradicting the expected outcome is a stop-and-ask trigger, not something to push through). The user then clarified they had stopped the containers themselves, not realizing a test was mid-run — no technical bottleneck was actually found. The user accepted 50 workers as sufficient ("if it worked for 50 it is fine") rather than continuing to 100. Recorded honestly as a user scope call, not fabricated as a discovered limitation. | 1.9 |
+| 35 | 2026-07-22 | Phase 1.10 demo: **the "100 workers" figures in Step 1.10's written demo/failure-demo (scale-to-100, restart-coordinator-with-100) were run at 50 workers instead**, by explicit user direction given twice this session ("do not scale up to 100 workers") | Run the literal 100-worker figures as the phase document originally specified | Same substitution already accepted for Phase 1.9 (Decisions Log #34) — 50 workers already demonstrated clean at every measured dimension (zero ID collisions, dashboard/DB count match, modest coordinator resource use) at that level. Every other Step 1.10 demo/failure-demo item was run as written, against a genuine `git clone` of the local repo (not the working tree), not the working tree itself. | 1.10 |
+| 36 | 2026-07-22 | Cloud provider: **Oracle Cloud Infrastructure (OCI) Always Free tier** | GCP (GKE Autopilot control-plane fee waiver, but only a 90-day/$300 credit before node costs bill); AWS (EKS control-plane fee alone is ~$73/mo, free tier is a 12-month trial, not perpetual) | User set a hard $0/month cost ceiling (this decision). OCI is the only major provider with a genuinely perpetual (not trial) free tier generous enough to run real Kubernetes: no OKE control-plane fee at all, plus free Ampere A1 compute (4 OCPU/24GB total) for nodes. GCP/AWS free allowances expire and then bill. | 1.5.0 |
+| 37 | 2026-07-22 | Region: **nearest OCI home region with Ampere A1 capacity, determined empirically when Step 1.5.1 actually provisions**, not fixed in advance | Committing to a single named region now | User had no region preference ("any available"). OCI's Always Free Ampere A1 shape is frequently reported out of capacity in popular regions — a well-documented, provider-wide constraint outside this project's control — so availability, not preference, is the binding constraint. Region is chosen at provisioning time based on where capacity actually exists, with nearer regions tried first to minimize latency. | 1.5.0 |
+| 38 | 2026-07-22 | Kubernetes distribution: **OKE (managed control plane)**, not self-managed k3s | Self-managed k3s installed directly on the same free compute VMs | OKE's control-plane fee is $0 on OCI regardless of tier, so a managed control plane costs nothing extra over self-managed while removing the operational burden of upgrading and securing the control plane itself. | 1.5.0 |
+| 39 | 2026-07-22 | Database and Redis: **self-hosted in-cluster** — Postgres and Redis run as Kubernetes StatefulSets on OCI Always Free block storage, not managed services | Managed Postgres/Redis (e.g. OCI Base Database Service, a managed Redis offering) | No provider offers a genuinely free managed database or Redis tier; the user's $0 ceiling rules them out entirely. Documented limitation, not silently assumed away: no automated managed backups or failover — backup/restore becomes the operator's own manual responsibility. | 1.5.0 |
+| 40 | 2026-07-22 | Environment topology: **one cluster, two Kubernetes namespaces** (`staging`, `production`) for isolation | Two fully separate clusters, one per environment | Two clusters would need roughly double the Always Free compute quota (8 OCPU/48GB), which OCI does not grant for free. Namespace-level isolation within a single small cluster is a scoped compromise made explicitly for the $0 ceiling — revisit if a real budget becomes available. | 1.5.0 |
+| 41 | 2026-07-22 | Secret management: **Kubernetes-native Secrets plus `sealed-secrets`** (free, open-source; encrypts secrets so the encrypted form is safe to commit to Git) | OCI Vault | OCI Vault's free allowance is limited and anything past it is a paid, cloud-specific dependency the project doesn't otherwise need. `sealed-secrets` satisfies CLAUDE.md §12 ("secrets from a secret manager or Kubernetes secrets, never in Git") at $0 cost. | 1.5.0 |
+| 42 | 2026-07-22 | Compute platform: **k3d (k3s running as Docker containers) on the user's own laptop** — **supersedes Decision #36 and #38 (OCI, OKE)** | WSL2 + a native k3s install on the same laptop | User rejected OCI once told every major cloud requires a card on file for identity verification even on a free tier, and confirmed no spare always-on machine exists — only the main laptop, on only while testing. k3d reuses Docker Desktop, already the project's dependency for every phase through M1, rather than adding a second virtualization layer (WSL2) for no benefit at a 4–5-worker test scale. Real CNCF-conformant k3s under the hood, not a toy. | 1.5.0 |
+| 43 | 2026-07-22 | Region: **not applicable** — compute is local, no cloud region exists — **supersedes Decision #37** | — | Direct consequence of Decision #42; no cloud provider means no region to choose. | 1.5.0 |
+| 44 | 2026-07-22 | Public ingress: **Cloudflare Tunnel + Cloudflare-managed DNS** (free plan, no card required) | ngrok free tier (rotating URL on restart, unsuited to a stable public hostname); manual router port-forwarding + Let's Encrypt (opens an inbound port directly on the user's home network) | Cloudflare Tunnel keeps a pod-initiated outbound-only connection to Cloudflare's edge, giving a stable public hostname with zero inbound ports opened on the laptop or router — the same "dial out, never accept inbound" philosophy CLAUDE.md §3.4 already applies to workers, extended here to ingress. Free Cloudflare plan requires no payment method. | 1.5.0 |
+| 45 | 2026-07-22 | Container registry: **GitHub Container Registry (ghcr.io)** | Docker Hub free tier (tighter pull-rate limits); a cloud provider's registry (needs a card, per Decision #42's own rejection) | Free, no card, and integrates directly with the GitHub Actions CI pipeline already planned for Step 1.5.3 — no new account or credential type introduced. | 1.5.0 |
+| 46 | 2026-07-22 | Terraform remote state: **Terraform Cloud (HCP Terraform) free tier** | Local state file only; cloud object storage backend (S3/GCS-style, needs a cloud account with a card) | The only no-card option that actually satisfies Step 1.5.1's own exit criterion of remote state with real locking (tested by attempting a concurrent apply) — a local state file cannot provide genuine locking against a second machine or session. | 1.5.0 |
+
+**Honest limitation carried into every later step that assumes uptime**: this cluster exists only while the user's laptop is on, awake, and Docker Desktop is running. "Public reachability" (Step 1.5.5), "24/7"-flavored language in the M1.5 demo (Step 1.5.9), and any real Internet worker onboarding (Step 1.5.8) will be scoped honestly to "reachable while the laptop is running," not real always-on production hosting. This is a user-driven scope constraint (no spare hardware), not a silently discovered limitation.
+
+| 47 | 2026-07-22 | Compute platform: **reverted to OCI (Oracle Cloud) Always Free tier + OKE** — **supersedes Decision #42** (k3d on the laptop) | Staying on k3d/laptop (previous decision) | User explicitly reconsidered and confirmed acceptance of OCI's card-on-file requirement for identity verification (Always Free itself is not billed). Restores a genuinely always-on, cloud-reachable cluster — removes the "only reachable while the laptop is on" limitation Decision #42 carried. | 1.5.0 |
+| 48 | 2026-07-22 | Region: **restored to "nearest OCI home region with Ampere A1 capacity, determined empirically at Step 1.5.1 apply-time"** — **supersedes Decision #43** (n/a) | Fixing one region in advance | Direct consequence of Decision #47 restoring a cloud region; same reasoning as original Decision #37 — Ampere A1 capacity availability, not preference, is the binding constraint. | 1.5.0 |
+| 49 | 2026-07-22 | Public ingress: **retired as a design-gate decision — reverts to Step 1.5.5's original scope** (ingress controller, cert-manager/TLS, DNS zone) — **supersedes Decision #44** (Cloudflare Tunnel) | Keep Cloudflare Tunnel in front of OCI anyway | Cloudflare Tunnel (Decision #44) existed specifically to reach a laptop with no public IP and no router port opened. OCI compute has a real public IP/load-balancer path, so the workaround is unnecessary — keeping it would add a second DNS/ingress system to maintain for no benefit. Ingress specifics (controller choice, DNS zone, certificates) are correctly Step 1.5.5's job, not the design gate's. | 1.5.0 |
+| 50 | 2026-07-23 | Cloud provider: **changed to GCP (Google Cloud) + GKE** — **supersedes OCI Decisions #47–49** | Staying on OCI | User directed the switch to GCP for a "test end-to-end cheaply now, migrate to a proper provider later" plan: GKE Autopilot's $300 / 90-day credit is the most generous runway, GKE is the most portable/standard managed K8s (least migration lock-in), and it avoids OCI's Ampere-A1 "out of capacity" lottery. Trade-off accepted honestly: GCP's free allowance is a 90-day credit that then bills, not OCI's perpetual $0 — aligned with the stated "test then migrate" intent. Decisions #39–41 and #45–46 (self-hosted Postgres/Redis, single-cluster namespaces, sealed-secrets, ghcr.io, Terraform Cloud) are provider-agnostic and still stand. | 1.5.0 |
+| 51 | 2026-07-23 | **All Milestone 1.5 cloud provisioning and verification is deferred (parked) until the user's GCP account is unblocked.** The user's Google account is currently restricted by their employer; unblock ETA unknown. When access is restored, every cloud-dependent M1.5 phase will be built and tested against the real GKE cluster in one focused pass. No M1.5 phase is marked DONE until then; the OCI-targeted Terraform scaffold from the prior session will be rewritten for GCP at resume time. §8 consequence carried forward honestly: the Internet-testing exit criterion applies to every phase from M1.5 onward, so the internet-verification half of later phases (M2+) also cannot be completed until this same cloud access lands — M2+ *logic* can still be built and locally verified on Docker Compose in the meantime, but such phases would accumulate as "locally verified, internet/cloud-verification pending" and must not be marked fully DONE until the cluster exists. | 1.5.1 |
+| 52 | 2026-07-23 | Public reachability / cross-network worker testing: **Cloudflare Tunnel with the coordinator self-hosted on local Docker Compose** — **supersedes the paid-cloud provider choice for reachability (GCP #50, OCI #47–49) and the parked-pending-account state (#51)** | A paid cloud provider (GCP/OCI/DO) hosting an always-on public coordinator | The user's cloud access is blocked only by a company network **MAC-filter on Google specifically** — not an account/identity restriction, and not other domains (this corrects the earlier misread recorded in #50–#51). Cloudflare is not Google → reachable from the company network, free, no card. `cloudflared` runs on the coordinator PC only (dials out to Cloudflare's edge, no inbound ports, no router changes), producing a public HTTPS/WSS URL a worker on any other PC/network dials into — satisfying §8 ("at least one worker outside the local network, per phase") for a live test session with no paid cloud. Revives the reachability half of the earlier-reverted Decision #44, now scoped to testing/reachability, not as the cloud provider. Honest limitation: reachable only while the user's PC and the tunnel run — not always-on production hosting; §8 does not require always-on. Quick-tunnel URL is ephemeral (changes per restart); a stable hostname would need a free Cloudflare account + a domain (named tunnel), deferred until needed. | 1.5.0 |
+| 53 | 2026-07-23 | Milestone 1.5 compute host: **local Kubernetes via k3d** (k3s running as Docker containers on the user's own PC) — real CNCF-conformant Kubernetes at $0, **resolving Open Questions #2 and re-closing the re-opened Step 1.5.0** | (B) Stay on Docker Compose for V1 and re-scope M1.5, dropping Kubernetes / Terraform / Helm | User chose Option A to keep M1.5's Kubernetes/Helm/CI-CD deliverable real rather than cut it. k3d reuses Docker Desktop (already a project dependency), needs no cloud account or card, and is unaffected by the company's Google-only network block. Deployment target becomes a local k3d cluster reached via Cloudflare Tunnel (#52); "cloud-hosted" → "local cluster", "always-on public" → "reachable while the PC + tunnel run" (honest limitation — §8 requires only a per-phase cross-network worker, not 24/7 hosting). Provider-agnostic Decisions #39–41 / #45–46 still stand. Terraform's now-reduced scope (no cloud resources to provision) is a Step 1.5.1 design sub-gate — e.g. Terraform managing the k3d cluster + namespaces + Helm releases via the `kubernetes`/`helm` providers, versus creating the cluster with the k3d CLI and using Helm directly — not decided here. | 1.5.0 |
+| 54 | 2026-07-23 | Step 1.5.1 Terraform scope: **thin Terraform** — the k3d CLI owns cluster lifecycle (create/destroy); Terraform manages only in-cluster declarative state (`staging`/`production` namespaces, a per-namespace ResourceQuota, the sealed-secrets controller) via the `kubernetes`/`helm` providers; remote state stays Terraform Cloud (Decision #46) | (A) Terraform-as-orchestrator — make the k3d cluster itself a Terraform resource via a `null_resource`+CLI or the unofficial community k3d provider; (C) retire Terraform for local, use k3d CLI + Helm directly | A wraps a CLI in Terraform (fragile, unofficial provider, hand-rolled `destroy`) for no real gain; C drops M1.5's Terraform deliverable (CLAUDE.md §4) and loses the remote-state-locking exit criterion. B keeps Terraform a real IaC deliverable doing what it is good at (declarative in-cluster state) while k3d does cluster lifecycle. `infra/terraform/` was rewritten from the OCI/OKE scaffold to `kubernetes`+`helm` providers accordingly (UNVERIFIED — no terraform CLI installed yet). Exit criteria re-scoped honestly: cluster "from nothing" = k3d CLI (one documented command); "full environment from nothing" = `terraform apply` of all in-cluster resources; "cost after 24h" = n/a ($0 local). User approved Option B 2026-07-23. | 1.5.1 |
+
+| 55 | 2026-07-23 | Step 1.5.2 migrations: **run `alembic upgrade head` in a coordinator `initContainer` before the app container starts**, and disable the in-app startup migration in Kubernetes via `RUN_MIGRATIONS_ON_STARTUP=false` (config gate added; Docker Compose keeps the Decision #8 startup migration, default true). **Refines the design-gate's stated "Helm pre-install hook Job."** | The pre-install hook Job originally described (approved as Option C of the 1.5.2 gate) | Discovered during build: a Helm `pre-install` hook runs *before* the chart's own Postgres exists, so a migration Job in that phase can never reach the same-chart DB on first install — the described approach is structurally broken for an in-chart datastore. The initContainer achieves Decision C's actual intent better: migrations complete before the app container serves (the container literally cannot start until the initContainer exits 0), and with `maxSurge=1`/`minReplicas>=1` only one pod migrates pending revisions at a time so replicas never race on cold start (`ponytail:` ceiling noted in the template — add a DB advisory lock if a true concurrent cold-start path ever becomes real). Verified live: initContainer logged `Running upgrade -> 0001, create workers table`, coordinator then reached readiness (`/ready` passing = Postgres+Redis reachable). | 1.5.2 |
+
+| 56 | 2026-07-23 | Step 1.5.3 CI pipeline scope (user-approved calls): **(A) write a baseline test suite now** — protocol-envelope unit tests + a coordinator integration test run against ephemeral Postgres+Redis (GitHub Actions `services:`) — since M1 shipped no tests at all (a §11 debt); **(B) Terraform in CI = `fmt -check` (always) + `validate` (gated on a `TF_API_TOKEN` repo secret), NO real `terraform plan`** — the thin-Terraform `kubernetes`/`helm` providers target the local k3d cluster (Decision #54), unreachable from GitHub's hosted runners, so `plan` runs locally only (honest limitation, same family as "reachable only while the PC runs"); **(C) build-only, not pushed** this session. | (A) minimal smoke tests / defer tests; (B) a self-hosted runner on the user's PC so CI could reach the local cluster for a real `plan`; (C) push + open a PR to verify green | Baseline tests start paying down the real §11 gap rather than papering over it; validate-only keeps CI honest about what a local cluster can and can't do from a hosted runner; a self-hosted runner was declined for now (setup + exposes the machine to CI jobs). `ci.yml` extended to jobs `lint`/`test`/`build`(SHA-tagged images, never only `latest`)/`scan`(`pip-audit` enforced + Trivy fs report-only)/`terraform`. Verified locally, not on a PR: 8/8 tests pass vs ephemeral Postgres+Redis, `ruff` clean, `actionlint` clean, `terraform fmt -check` clean. Still pending a push: an actual green Actions run, required-status-checks, and branch protection (a manual GitHub setting — standing Blocker #1). | 1.5.3 |
+
+**Decisions #39–41 and #45–46 are unaffected by this reversal** — self-hosted Postgres/Redis in-cluster, single-cluster namespace topology, `sealed-secrets`, ghcr.io for images, and Terraform Cloud for remote state were never OCI-specific or k3d-specific and still stand. Cost ceiling remains $0/month — a card on file for identity verification does not change that; OCI Always Free is not billed. **User re-confirmed this second reversal on 2026-07-22.** `infra/terraform/` is being rewritten for OCI accordingly (see Step 1.5.1 update below).
 
 ---
 
@@ -197,6 +245,10 @@ Record only measured numbers here. Recommendations belong in phase docs.
 | Redis instantaneous ops/sec | 0 (level 1), 3 (level 5), 14 (level 10), 24 (level 50) | `redis-cli INFO stats`, point-in-time sample at each level | 1.9 |
 | Worker-ID collisions | 0 at every level tested (1/5/10/50) | `SELECT count(*), count(DISTINCT id) FROM workers` — totals matched distinct counts exactly every time | 1.9 |
 | Dashboard-reported worker count vs DB count | Matched exactly at every level tested (1/5/10/50) | `GET /api/workers` array length vs Postgres row count | 1.9 |
+| SIGKILL-to-OFFLINE latency (fresh-clone stack) | ~3s | Genuine fresh clone, single worker, `docker kill -s SIGKILL` | 1.10 |
+| Duplicate-session eviction round trip | <200ms each way (raw client won at 11:15:08.306, evicted back at 11:15:08.485) | Genuine fresh clone, raw WS client vs real worker racing for the same worker ID | 1.10 |
+| Coordinator restart with 50 workers connected — reconnect completion | 46/49 back ONLINE within 8s; all 49 back ONLINE within 18s (1 pre-existing QUARANTINED row correctly stayed disconnected) | Genuine fresh clone, `docker compose restart coordinator` with 50 scaled worker replicas live | 1.10 |
+| Network partition detection and recovery (fresh-clone stack) | SUSPECT at 15s elapsed; recovered to ONLINE within ~9s of `docker network connect` | Genuine fresh clone, single worker, `docker network disconnect`/`connect` | 1.10 |
 
 ---
 
@@ -205,6 +257,7 @@ Record only measured numbers here. Recommendations belong in phase docs.
 | # | Question | Raised in | Blocking? | Resolution |
 |---|---|---|---|---|
 | 1 | Working tree had a large batch of previously-tracked files (coordinator/, README.md, docker-compose.yml, DECISIONS.md, SESSION_HANDOFF.md, pyproject.toml, etc.) showing as unstaged deletions in `git status`. `git show HEAD` revealed these were real prior-session progress (a coordinator skeleton that had reached that session's own "Step 4", with no design gate). | 1.0 | No — resolved | User chose to discard and build fresh under the current CLAUDE.md/PHASE_STATE.md process rather than recover the old code. Old commit remains in git history if ever needed. |
+| 2 | Now that no paid cloud provider will host the system (Decision #52 — self-hosted coordinator + Cloudflare Tunnel for reachability), does Milestone 1.5 still run Kubernetes — on a local `k3d`/`kind` cluster (reviving superseded Decisions #42–43) — or does V1 stay on Docker Compose, making much of M1.5's Terraform/OKE/GKE-oriented phase content (1.5.1–1.5.2, parts of 1.5.5–1.5.7) obsolete or re-scoped? | 1.5.0 (re-opened) | No — resolved | **Resolved 2026-07-23: Option A — local Kubernetes via k3d** (real CNCF K8s on the user's PC, $0). V1 keeps Kubernetes; it runs locally instead of on a cloud host. Recorded as Decisions Log #53. Terraform's exact reduced scope is a Step 1.5.1 sub-decision. |
 
 ---
 
@@ -227,6 +280,20 @@ Empty is the correct state.
    working tree without a GitHub token/`gh` CLI (neither available
    here). Needs to be done manually, or delegated with explicit
    authorization.
+2. **Tooling not yet installed for M1.5 build.** `k3d` (local
+   Kubernetes) and the **Terraform CLI** are not on this machine, and no
+   Terraform Cloud account/workspace/token exists yet (needed only if
+   Step 1.5.1 keeps Terraform for remote state — Decision #46). These are
+   the practical prerequisites to start Step 1.5.1. The company's
+   Google-only network block does not affect k3d (local), Cloudflare,
+   ghcr.io, HashiCorp, or Terraform Cloud — none is Google.
+
+   The M1.5 compute-host **design decision is now resolved** — local k3d,
+   Decisions Log #53, Open Questions #2 closed. The earlier "GCP account
+   restricted" blocker is **removed**: the block is a network-level
+   MAC-filter on Google only, not an account restriction, and the
+   approach no longer depends on any cloud account. Decisions Log
+   #50–#51 are **superseded by #52–#53.**
 
 Resolved: **CI runs green on a pull request** — GitHub MCP was
 reconnected (user updated the token's permissions to include "Pull
@@ -636,5 +703,321 @@ accepting the 50-worker level as sufficient. Level 100 and its
 10-minute no-heartbeat-loss soak were not run and are waived, not
 silently skipped — documented above and in Decisions Log #34. Status
 updated from `IN PROGRESS` to `DONE` in the Phase Register and Snapshot
-above. Current phase is now **1.10 — M1 demo and fresh-clone
-verification**, `NOT STARTED`.
+above.
+
+**Phase 1.10** — M1 demo and fresh-clone verification — run against a
+genuine `git clone` of the local repository (not the working tree that
+built every prior phase), in a scratch directory, following the
+README's documented fresh-clone startup sequence exactly (`cp
+.env.example .env`, `bash infra/dev-ca/generate-dev-ca.sh`, `docker
+compose up --build`). Every exit criterion below was exercised live
+against that clone, not the development working tree — a first for
+this project, since all prior phases verified against the same
+long-running dev stack.
+
+**Prerequisite this step surfaced**: all work through Phase 1.9 was
+uncommitted in the working tree (see `SESSION_HANDOFF.md`'s prior
+"Open items"), which meant a real fresh clone at the start of this
+step would have produced a coordinator missing most of its own code
+(`config.py`, `db.py`, `models.py`, `security.py`,
+`migrations/`, and more — the entire persistence/auth/transport layer).
+Flagged to the user as a blocker rather than worked around silently;
+user explicitly instructed the work be committed. Committed as a
+single commit (`78277be`, "Phases 1.2-1.9: coordinator persistence,
+auth, WS transport, heartbeat, reconnection, dashboard, scale
+simulation") covering Phases 1.2 through 1.9 in one commit rather than
+fabricating a granular per-phase history that was never actually kept
+separate during development — not pushed to `origin` (2 local commits
+now ahead; pushing was not requested).
+
+**Demo, run against the fresh clone:**
+- **Fresh clone, documented startup command**: verified — `docker
+  compose build` then `up -d`, all 5 containers (postgres, redis,
+  coordinator, dashboard, worker) reached `healthy`;
+  `https://localhost:8443/health` → `{"status":"healthy"}`,
+  `https://localhost:8443/ready` → `{"status":"ready", ...}`,
+  `https://localhost:8444/` → 200.
+- **Worker 1 appears online**: verified — the single worker started by
+  `docker compose up` reached `status: "ONLINE"` in `GET /api/workers`
+  within seconds, matching Phase 1.8's own verified behavior.
+- **Worker 2 appears online**: verified — scaled to 2 replicas via
+  `docker compose -f docker-compose.yml -f docker-compose.scale.yml up
+  -d --scale worker=2`; the new replica reached `ONLINE` with a
+  distinct worker ID.
+- **Stop Worker 2 → offline within timeout**: verified — `docker stop`
+  (graceful), `OFFLINE` confirmed in `GET /api/workers` at 27s elapsed
+  (past the 25s documented threshold).
+- **Restart Worker 2 → same worker ID, back online**: verified —
+  `docker start` on the same (stopped, not removed) container; came
+  back `ONLINE` with the identical worker ID and `created_at`
+  timestamp, new `session_epoch`.
+- **Scale to N workers → all appear** (**N=50, not 100** — see
+  Decisions Log #35): verified — `--scale worker=50`; `GET
+  /api/workers` showed 50 total rows (49 fresh `ONLINE` + the 1
+  already-`QUARANTINED` row from the revocation test below, correctly
+  still present and still quarantined); container count matched (49
+  running worker containers, the 50th row being the quarantined one
+  whose container was replaced during the scale reconciliation).
+
+**Failure demo, run against the same fresh clone:**
+- **`docker kill` a worker (not graceful) → timeout-driven offline**:
+  verified — `docker kill -s SIGKILL` on worker 1, `OFFLINE` in
+  `GET /api/workers` within 3s (transport-disconnect path, consistent
+  with Phase 1.6's own finding that a hard kill bypasses the
+  heartbeat-miss state machine).
+- **Invalid enrollment credential → rejected, never appears online**:
+  verified — `POST /workers/register` with a wrong `enrollment_secret`
+  → 401 `{"detail":"invalid enrollment credential"}`, logged as
+  `registration_rejected_invalid_credential`.
+- **Revoke a live worker → disconnected within the bound, cannot
+  reconnect**: verified — `POST /workers/{id}/revoke` with the admin
+  secret → `{"status":"revoked"}`; worker's DB status flipped to
+  `QUARANTINED` immediately (`revoked: true`). Consistent with
+  Decisions Log #18, the live socket wasn't dropped instantly — a
+  forced container restart was used to make the worker's own reaffirm
+  attempt happen immediately, which was rejected (`reaffirm_rejected`,
+  401 `"invalid identity"`); the worker then correctly failed to
+  reconnect at all, leaving `connected: false`, status still
+  `QUARANTINED` (sticky, per Decisions Log #27).
+- **Force a duplicate session → one winner, loser terminated and
+  logged**: verified using the same raw-WebSocket-client technique as
+  Phase 1.7, run from inside the worker's own container (`docker exec`,
+  `PYTHONPATH=/app` so the shared `protocol` package resolved) using
+  its real credential read from `identity.json`. The raw client won
+  the first race (`session_superseded`, old=3 new=4), then was itself
+  evicted less than 200ms later when the real worker reconnected and
+  won back (`session_superseded`, old=4 new=5) — exactly the same
+  "exactly one winner at every instant" result as Phase 1.7's own
+  verification, reproduced independently against the fresh clone.
+- **Restart the coordinator with N workers connected → all return
+  automatically** (**N=50, not 100** — see Decisions Log #35):
+  verified — `docker compose restart coordinator` with 50 scaled
+  worker replicas live; 46 of 49 connectable workers were back `ONLINE`
+  within 8s, all 49 within 18s, with zero manual intervention. The
+  1 already-`QUARANTINED` worker correctly stayed disconnected
+  throughout (it's revoked; it isn't supposed to reconnect).
+- **Disconnect a machine's network entirely and reconnect it →
+  recovers with visible backoff in the logs**: verified — `docker
+  network disconnect`/`connect` on a live worker's container; `SUSPECT`
+  at 15s elapsed, recovered to `ONLINE` within ~9s of reconnecting the
+  network, consistent with Phase 1.7's own finding that the underlying
+  socket can recover without a fresh handshake.
+
+**Structured logs present for every named category** (registration,
+auth success, auth failure, connect, heartbeat gap, offline, reconnect,
+session conflict): verified by grepping the coordinator's own log
+stream from this fresh-clone run for each category's distinct event
+name — `worker_registered`, `access_token_issued`,
+`registration_rejected_invalid_credential`, `ws_authenticated` /
+`ws_session_established`, `heartbeat_missed_suspect_threshold`,
+`ws_disconnected`, `ws_session_established` (post-reconnect),
+`session_superseded` — one real log line per category, not asserted.
+
+`ruff check` (same command CI runs) passed clean against the working
+repo. Full teardown via `scripts/teardown.sh` on the fresh-clone stack
+confirmed clean afterward (containers, network, both volumes removed).
+
+**Not yet done / known gaps, not silently claimed:**
+- **CI green**: not verified on the latest commit. `ruff check` passes
+  locally with the exact command the workflow runs, but the commit
+  containing all of Phases 1.2–1.9's code (`78277be`) has not been
+  pushed to `origin` — pushing was not requested this session. The
+  same gap Phase 1.1 originally had for its own first commit (later
+  resolved via PR #1, still open, for the older `5003ad9` commit only).
+- **Worker ID stability across a real reinstall** (as opposed to
+  restart/container-recreate, both of which are verified above and in
+  Phase 1.3): not separately re-tested this step — "reinstall" isn't
+  distinguishable from "container recreation" in this Docker-only
+  environment; no separate installer mechanism exists yet to test
+  against.
+- **Screenshots/video**: not captured this session — no browser tool
+  was available; all verification was done via the same `GET
+  /api/workers` endpoint the browser polls, exactly as done in every
+  prior phase (Phase 1.8 onward).
+
+**Phase 1.10 approved by user on 2026-07-22.** Status updated from
+`AWAITING APPROVAL` to `DONE` in the Phase Register above.
+
+**Milestone 1 — Reliable Worker Network — is complete.** All ten
+phases (1.0–1.10) are `DONE` and approved. Milestone Progress table
+above updated: `DONE`, demo done, failure demo done, fresh clone
+verified all `Yes` (Internet-tested remains `n/a` for M1 — that is
+M1.5's own job, per the Milestone Progress table's own column
+definition and CLAUDE.md §8).
+
+Current milestone is now **M1.5 — Infrastructure & Deployment**,
+starting at **Step 1.5.0 — Design gate — cloud topology and cost**,
+`NOT STARTED`. Session ended here at the user's request; no M1.5 work
+was started.
+
+**Phase 1.5.0** — design gate — cloud topology and cost — all six
+required decisions made and recorded (Decisions Log #36–41): cloud
+provider, region strategy, Kubernetes distribution, database/Redis
+hosting model, environment topology, and secret management. Driven by
+a user-set hard constraint given directly in this session: **$0/month
+cost ceiling**, testing scale of 5–7 workers, no region preference.
+
+- **Cost ceiling**: $0/month, stated and accepted by the user before
+  any resource is provisioned (satisfies this step's own exit
+  criterion). Not a recommendation — an explicit user constraint.
+- **Provider**: OCI (Oracle Cloud) Always Free tier — the only major
+  cloud with a perpetual (not trial) free tier able to run real
+  Kubernetes at $0: no OKE control-plane fee, free Ampere A1 compute
+  (4 OCPU/24GB total). Real, flagged risk carried into Step 1.5.1: OCI
+  Always Free Ampere A1 capacity is frequently unavailable
+  ("out of host capacity") in popular regions — a provider-side
+  constraint, not something this project controls. If no region has
+  capacity when Step 1.5.1 attempts to provision, that is a blocker to
+  surface to the user, not something to silently substitute a paid
+  shape for.
+- **Region**: not fixed — chosen at Step 1.5.1 apply-time based on
+  which OCI home region actually has Ampere A1 capacity, nearest first.
+- **Kubernetes**: OKE (managed control plane), not self-managed k3s.
+- **Database/Redis**: self-hosted in-cluster (StatefulSets on Always
+  Free block storage), not managed — no free managed tier exists on
+  any provider. Known limitation recorded: no automated managed backup
+  or failover; operator-managed only.
+- **Environment topology**: one cluster, two namespaces (`staging`,
+  `production`) rather than two clusters — the free compute quota
+  cannot support two full clusters.
+- **Secrets**: Kubernetes Secrets + `sealed-secrets` (free, encrypts
+  secrets safely into Git), not OCI Vault (paid past a small free
+  limit).
+- **Teardown procedure**: `terraform destroy` against the OCI Terraform
+  provider removes the OKE cluster, its node pool, and the VCN it
+  runs in. To be written out in full as part of Step 1.5.1 (Terraform
+  base infrastructure), per this step's own exit criterion that
+  teardown be documented before provisioning — not yet provisioned, so
+  not yet exercised.
+
+**Phase 1.5.0 approved by user on 2026-07-22.** Status updated from
+`NOT STARTED` to `DONE` in the Phase Register above. Current phase is
+now **1.5.1 — Terraform base infrastructure**, `NOT STARTED`. Session
+ended here at the user's explicit instruction ("do initial steps and
+then stop, do not move further") — no Terraform code written, no OCI
+resource created.
+
+**Phase 1.5.0 was reopened the same day and re-decided.** Told every
+major cloud (including OCI) requires a card on file for identity
+verification even on a free tier, the user rejected the OCI-based plan
+above outright and asked for a platform requiring no payment method at
+all. Clarified via direct questions: no spare always-on machine exists
+— only the user's main laptop, on only while testing. Revised plan
+recorded as Decisions Log #42–46, **superseding #36–38** (#39–41
+unchanged — they were never OCI-specific): k3d (k3s in Docker) on the
+user's own laptop; Cloudflare Tunnel + Cloudflare DNS for public
+reachability, no router ports opened; GitHub Container Registry
+(ghcr.io) for images; Terraform Cloud free tier for remote state.
+Explicitly recorded as an honest limitation, not hidden: the cluster
+and its public reachability only exist while the laptop is on. **User
+re-confirmed this revised plan on 2026-07-22.**
+
+**Step 1.5.1 — Terraform base infrastructure — started, scaffolded,
+not run.** `infra/terraform/{versions.tf,variables.tf,main.tf,README.md}`
+written: Terraform Cloud remote-state backend block, Cloudflare
+provider, a `cloudflare_zero_trust_tunnel_cloudflared` +
+`_config` pair routing two hostnames to the coordinator/dashboard, and
+two `cloudflare_record` CNAMEs. Explicitly marked in the code and its
+README as **unverified** — the `terraform` CLI is not installed on
+this machine, and none of the Terraform Cloud / Cloudflare accounts
+this config depends on exist yet, so no `terraform init`, `validate`,
+`plan`, or `apply` has run. Not claimed as tested; zero-hallucination
+rule applies to infrastructure code exactly as it does to application
+code.
+
+**Blocking this step's actual exit criteria (`terraform plan`
+producing no unexpected diff, `apply`/`destroy` verified, remote-state
+locking tested)**, in order:
+1. Terraform CLI installed on this laptop.
+2. A Terraform Cloud account, organization, and workspace
+   (`data-cleaning-distributed-system`), plus a login token.
+3. A Cloudflare account with a real domain added to it, an API token
+   scoped to that zone, and the account ID/zone ID.
+4. Two hostnames chosen under that domain.
+
+None of these can be created by this session unattended — items 2–3
+need the user's own account signup (email/identity, even though no
+card). Session ended here at the user's instruction ("proceed with the
+next step then stop"); no further Terraform work attempted, nothing
+applied.
+
+---
+
+## Session update — 2026-07-23 (cloud work parked)
+
+No code or infrastructure was changed this session. The session
+resolved the cloud direction and recorded a deliberate pause:
+
+- **Provider decision changed OCI → GCP + GKE** (Decisions Log #50),
+  chosen for the "test end-to-end cheaply now, migrate to a proper
+  provider later" plan (GKE Autopilot $300 / 90-day credit,
+  portability, no Ampere-A1 capacity lottery).
+- **All Milestone 1.5 cloud provisioning and verification is deferred**
+  (Decisions Log #51) because the user's GCP account is currently
+  restricted by their employer (Current Blockers #2). Every M1.5 phase
+  depends on a live cluster, so all are treated as INCOMPLETE / PENDING
+  and none is marked DONE.
+- **Resume plan** (when GCP access is restored): (1) rewrite
+  `infra/terraform/` for the GCP provider + GKE Autopilot, keeping the
+  Terraform Cloud backend and the provider-agnostic Decisions #39–41 /
+  #45–46; (2) run Step 1.5.1 for real
+  (`init`/`plan`/`apply`/`destroy`, remote-state locking); (3) proceed
+  through 1.5.2–1.5.9, building and testing every cloud-dependent phase
+  against the real GKE cluster in one focused pass.
+- **Honest §8 consequence** recorded: from M1.5 onward the
+  Internet-testing exit criterion applies to every phase, so later
+  milestones (M2+) also cannot be fully completed until this same cloud
+  access lands. M2+ *logic* can still be built and locally verified on
+  Docker Compose in the meantime, but such phases would remain
+  "locally verified, internet/cloud-verification pending" and must not
+  be marked fully DONE.
+
+Nothing committed or pushed this session. The two identical phase-state
+files (`docs/PHASE_STATE.md` and `phase_state.md`) were both updated in
+sync — this duplication is a documentation hazard worth resolving to a
+single canonical file in a future session.
+
+---
+
+## Session update — 2026-07-23 (later): Cloudflare Tunnel adopted
+
+Supersedes the "cloud work parked" note above. Clarified with the user
+that the company's block is a **network MAC-filter on Google only**, not
+an account restriction — so the earlier GCP-account framing (Decisions
+#50–#51) was based on a misread and is now superseded by **Decision
+#52**:
+
+- **No paid cloud provider.** The coordinator stays self-hosted on local
+  Docker Compose; **Cloudflare Tunnel** (`cloudflared` on the coordinator
+  PC) provides the public / cross-network reachability §8 needs — free,
+  no card, and reachable from the company network (Cloudflare ≠ Google).
+- **The cloud-account blocker is gone.** Testing a worker on a different
+  PC over a different network is now free and unblocked.
+- **Cloudflare Tunnel setup** (given to the user, not yet run): install
+  `cloudflared` on the coordinator PC (`winget install
+  --id Cloudflare.cloudflared`) → `docker compose up` →
+  `cloudflared tunnel --no-tls-verify --url https://localhost:8443` →
+  prints a public `trycloudflare.com` URL → point a worker on another
+  PC/network at `wss://<that-host>` (port 443, no dev-CA needed).
+  Worker/test PCs install nothing.
+- **One design question remains open** (Open Questions #2): whether M1.5
+  still uses Kubernetes (local `k3d`/`kind`) or V1 stays on Docker
+  Compose. To be decided at a re-opened Step 1.5.0 before Step 1.5.1.
+- Still nothing committed or pushed this session; docs-only changes.
+
+---
+
+## Session update — 2026-07-23 (final): Option A chosen — local k3d + Cloudflare Tunnel
+
+The re-opened Step 1.5.0 is closed. **Compute host = local Kubernetes
+via k3d** (Decisions Log #53); **reachability = Cloudflare Tunnel**
+(#52); **no paid cloud provider**. Open Questions #2 resolved. The MD
+files are now updated and build-ready for **Step 1.5.1** — no code was
+written this session, per user instruction.
+
+Practical prerequisites before 1.5.1 (Current Blockers #2): install
+`k3d` and the Terraform CLI, and create a Terraform Cloud workspace if
+Terraform is kept for remote state. Step 1.5.1 opens with a short design
+sub-gate on Terraform's reduced scope (there are no cloud resources to
+provision anymore). Provider-agnostic Decisions #39–41 / #45–46 stand.
+Still nothing committed or pushed; docs-only.
