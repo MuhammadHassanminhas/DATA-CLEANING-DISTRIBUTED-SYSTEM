@@ -11,13 +11,103 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - name: Lint
-        run: uv run --with ruff ruff check coordinator worker dashboard protocol
+        run: uv run --with ruff ruff check coordinator worker dashboard protocol tests
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: coordinator
+          POSTGRES_PASSWORD: ci-pass
+          POSTGRES_DB: coordinator
+        options: >-
+          --health-cmd "pg_isready -U coordinator -d coordinator"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+        ports:
+          - 6379:6379
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: coordinator
+      POSTGRES_PASSWORD: ci-pass
+      POSTGRES_DB: coordinator
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      ENROLLMENT_SECRET: ci-enrollment-secret
+      CREDENTIAL_PEPPER: ci-credential-pepper
+      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/coordinator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r coordinator/requirements.txt -r requirements-dev.txt
+      - name: Run tests (unit + integration against ephemeral Postgres/Redis)
+        run: pytest -q
 
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Create .env for build-time variable substitution
-        run: cp .env.example .env
-      - name: Build images
-        run: docker compose build
+      - name: Build images tagged with the commit SHA (never only latest)
+        run: |
+          for svc in coordinator dashboard worker; do
+            docker build -f "$svc/Dockerfile" -t "distributed-worker-network/$svc:${{ github.sha }}" .
+          done
+
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip-audit — dependency vulnerabilities (fails on a known-vulnerable dep)
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r coordinator/requirements.txt
+          pip-audit -r dashboard/requirements.txt
+          pip-audit -r worker/requirements.txt
+      - name: Trivy filesystem scan (report-only — base-image CVEs shouldn't block merge)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    env:
+      TF_CLOUD_ORGANIZATION: DATA_CLEANING_DISTRIBUTED_SYS
+      # Set repo secret TF_API_TOKEN to enable `validate` (the cloud{} block
+      # needs a token even offline). fmt-check always runs. A real
+      # `terraform plan` is NOT run in CI — the kubernetes/helm providers
+      # target the local k3d cluster, unreachable from GitHub runners
+      # (Decision #54 local-k3d limitation); plan runs locally only.
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Format check
+        run: terraform fmt -check -recursive
+      - name: Validate
+        if: ${{ env.TF_TOKEN_app_terraform_io != '' }}
+        run: |
+          terraform init -input=false
+          terraform validate
