@@ -147,16 +147,21 @@ jobs:
       - name: Validate
         if: ${{ env.TF_TOKEN_app_terraform_io != '' }}
         run: terraform validate
-      # Real plan against the live workspace. The AKS API server stays up
-      # even when the node is `az aks stop`'d (Free-tier control plane),
-      # so the kubernetes/helm providers refresh fine. CI never applies.
-      # Plan text is written to the PR's checks summary (exit criterion:
-      # "plan output appears on infrastructure pull requests").
-      - name: Plan
+      # Real plan of the azurerm infra layer (resource group + AKS cluster),
+      # written to the PR's checks summary (exit criterion: "plan output
+      # appears on infrastructure pull requests"). Scoped with -target: the
+      # cluster is `az aks stop`'d between sessions to save credit, which
+      # deallocates the whole control plane, so its API FQDN doesn't resolve
+      # — the kubernetes/helm providers can't refresh from CI. Their plan is
+      # a local task run with the cluster started. CI never applies.
+      - name: Plan (azurerm infra layer)
         if: ${{ env.ARM_CLIENT_ID != '' }}
         run: |
-          echo '### Terraform plan' >> "$GITHUB_STEP_SUMMARY"
+          set -o pipefail
+          echo '### Terraform plan (azurerm infra layer)' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           terraform plan -input=false -no-color -lock-timeout=120s \
+            -target=azurerm_resource_group.main \
+            -target=azurerm_kubernetes_cluster.main \
             | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
