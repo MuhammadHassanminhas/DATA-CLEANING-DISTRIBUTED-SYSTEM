@@ -1,8 +1,17 @@
 name: CI
 
+# Phase 1.5.3 — CI pipeline, rebuilt for the Azure/AKS method (Decision #57).
+# Jobs run in parallel; wall-clock target < ~8 min (documented duration,
+# Step 1.5.3 exit criterion). Caching: pip (setup-python) + Docker layer
+# cache (buildx gha). A concurrency group cancels superseded runs per ref.
+
 on:
   push:
   pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
@@ -50,6 +59,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -59,13 +69,37 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io on merge to main
+    strategy:
+      matrix:
+        service: [coordinator, dashboard, worker]
+    env:
+      # ghcr.io owner is lowercased (Decision #45/#65); must match the
+      # image repositories in infra/helm/platform/values*.yaml.
+      IMAGE_PREFIX: ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system
+      # Push only when merging to main; PR/feature runs build-only.
+      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build images tagged with the commit SHA (never only latest)
-        run: |
-          for svc in coordinator dashboard worker; do
-            docker build -f "$svc/Dockerfile" -t "distributed-worker-network/$svc:${{ github.sha }}" .
-          done
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to ghcr.io
+        if: ${{ env.PUSH == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (and push on main) — SHA-tagged, never only :latest
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.service }}/Dockerfile
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
   scan:
     runs-on: ubuntu-latest
@@ -87,24 +121,42 @@ jobs:
 
   terraform:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: infra/terraform
     env:
       TF_CLOUD_ORGANIZATION: DATA_CLEANING_DISTRIBUTED_SYS
-      # Set repo secret TF_API_TOKEN to enable `validate` (the cloud{} block
-      # needs a token even offline). fmt-check always runs. A real
-      # `terraform plan` is NOT run in CI — the kubernetes/helm providers
-      # target the local k3d cluster, unreachable from GitHub runners
-      # (Decision #54 local-k3d limitation); plan runs locally only.
       TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+      # azurerm auth for a real `plan` (Decision #57). Set as repo secrets
+      # from a service principal scoped to the resource group. Without them
+      # the plan step is skipped and only fmt/validate run.
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
       - name: Format check
         run: terraform fmt -check -recursive
+      - name: Init (Terraform Cloud remote state)
+        if: ${{ env.TF_TOKEN_app_terraform_io != '' }}
+        run: terraform init -input=false
       - name: Validate
         if: ${{ env.TF_TOKEN_app_terraform_io != '' }}
+        run: terraform validate
+      # Real plan against the live workspace. The AKS API server stays up
+      # even when the node is `az aks stop`'d (Free-tier control plane),
+      # so the kubernetes/helm providers refresh fine. CI never applies.
+      # Plan text is written to the PR's checks summary (exit criterion:
+      # "plan output appears on infrastructure pull requests").
+      - name: Plan
+        if: ${{ env.ARM_CLIENT_ID != '' }}
         run: |
-          terraform init -input=false
-          terraform validate
+          echo '### Terraform plan' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          terraform plan -input=false -no-color -lock-timeout=120s \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
