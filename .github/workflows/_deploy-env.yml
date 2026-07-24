@@ -76,11 +76,17 @@ jobs:
       - name: Smoke test + version assert (criteria 3 & 4)
         run: |
           set -o pipefail
-          # In-cluster curl: coordinator is HTTPS on 8443 with the self-signed
-          # dev CA, so -k. /health now returns the deployed SHA (GIT_SHA env).
-          out=$(kubectl -n "$NS" run "smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --rm -i --restart=Never --image=curlimages/curl:latest --command -- \
-            sh -c 'curl -fsk https://coordinator:8443/ready; echo; curl -fsk https://coordinator:8443/health')
+          # exec into the already-running coordinator and hit its own /health
+          # over localhost. NOT an ephemeral `kubectl run` pod: the namespace
+          # ResourceQuota rejects any pod without requests+limits, and an
+          # ad-hoc pod has none. python is guaranteed present in the image;
+          # TLS is self-signed so verification is disabled.
+          out=$(kubectl -n "$NS" exec deploy/coordinator -c coordinator -- python -c '
+          import urllib.request, ssl
+          ctx = ssl._create_unverified_context()
+          for path in ("/ready", "/health"):
+              print(urllib.request.urlopen("https://localhost:8443" + path, context=ctx).read().decode())
+          ')
           echo "$out"
           echo "$out" | grep -q "$SHA" || { echo "::error::/health version does not match deployed SHA $SHA"; exit 1; }
 
