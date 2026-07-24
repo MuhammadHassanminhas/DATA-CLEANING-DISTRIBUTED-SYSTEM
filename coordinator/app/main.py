@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket
 import time
 import uuid
@@ -121,10 +122,16 @@ def root() -> dict[str, str]:
     return {"service": "coordinator", "status": "ok"}
 
 
+# Deployed image SHA, injected by the Helm chart (GIT_SHA env = image.tag).
+# Lets CD assert the running version matches the commit it deployed
+# (Step 1.5.4, exit criterion 4). "unknown" outside k8s / local runs.
+GIT_SHA = os.getenv("GIT_SHA", "unknown")
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     """Liveness only — the process is up. Never checks dependencies."""
-    return {"status": "healthy"}
+    return {"status": "healthy", "version": GIT_SHA}
 
 
 @app.get("/ready")
