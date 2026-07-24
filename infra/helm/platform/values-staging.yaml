@@ -16,3 +16,11 @@ coordinator:
     maxReplicas: 2
 config:
   logLevel: DEBUG
+
+# Public ingress ON for staging (Step 1.5.5). host = Terraform's
+# `ingress_fqdn` output; set letsencryptEmail before the first deploy.
+ingress:
+  enabled: true
+  host: dcds-staging.centralindia.cloudapp.azure.com
+  createClusterIssuer: true
+  letsencryptEmail: muhammadhassan1762005@gmail.com

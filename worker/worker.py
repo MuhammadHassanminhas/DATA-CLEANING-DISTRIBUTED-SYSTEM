@@ -86,8 +86,17 @@ IDENTITY_FILE = Path(
 LOCK_FILE = IDENTITY_FILE.with_suffix(".lock")
 INTERVAL_SECONDS = int(os.environ.get("WORKER_LOOP_INTERVAL_SECONDS", "5"))
 COORDINATOR_URL = os.environ["COORDINATOR_URL"]
+# Private dev CA for local Docker (self-signed coordinator cert). Set
+# WORKER_CA_FILE="" for a worker reaching the PUBLIC ingress (Step 1.5.5):
+# the coordinator there presents a Let's Encrypt cert chaining to a public
+# root, so the OS trust store validates it — no dev CA needed.
 CA_FILE = os.environ.get("WORKER_CA_FILE", "/certs/dev-ca.crt")
 AGENT_VERSION = os.environ.get("WORKER_AGENT_VERSION", "0.1.0")
+
+
+def _ssl_context() -> ssl.SSLContext:
+    # cafile set → trust exactly that CA (local dev). Empty → system roots.
+    return ssl.create_default_context(cafile=CA_FILE) if CA_FILE else ssl.create_default_context()
 WS_HELLO_ACK_TIMEOUT_SECONDS = 10
 # Full-jitter exponential backoff. Recommendations, not measured values.
 WS_BACKOFF_BASE_SECONDS = float(os.environ.get("WORKER_WS_BACKOFF_BASE_SECONDS", "1"))
@@ -171,7 +180,7 @@ def _acquire_single_instance_lock() -> None:
 
 
 def _post(path: str, payload: dict) -> tuple[int, dict]:
-    ctx = ssl.create_default_context(cafile=CA_FILE)
+    ctx = _ssl_context()
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"{COORDINATOR_URL}{path}",
@@ -292,7 +301,7 @@ async def _hold_connection(identity: dict, access_token: str, established: dict)
     `established["value"] = True` the moment a real session exists
     (`hello_ack`) — the caller uses this, not how the function exits, to
     decide whether the Phase 1.7 backoff should reset."""
-    ctx = ssl.create_default_context(cafile=CA_FILE)
+    ctx = _ssl_context()
     headers = {"Authorization": f"Bearer {access_token}"}
     async with websockets.connect(_ws_url(), extra_headers=headers, ssl=ctx) as ws:
         send_lock = asyncio.Lock()

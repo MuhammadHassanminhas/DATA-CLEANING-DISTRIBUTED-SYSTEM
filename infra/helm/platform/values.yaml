@@ -59,6 +59,19 @@ config:
   postgresUser: coordinator
   postgresDb: coordinator
 
+# Public ingress (Step 1.5.5). Disabled by default; staging turns it on.
+# host MUST be set to the Terraform `ingress_fqdn` output
+# (<label>.<region>.cloudapp.azure.com) for the env that enables it.
+ingress:
+  enabled: false
+  host: ""                              # = terraform output ingress_fqdn
+  tlsSecret: platform-tls               # cert-manager writes the LE cert here
+  clusterIssuerName: letsencrypt-prod
+  createClusterIssuer: false            # exactly one env creates the cluster-scoped issuer
+  letsencryptEmail: ""                  # required when createClusterIssuer=true
+  basicAuthSecret: dashboard-basic-auth # pre-created htpasswd Secret (bootstrap)
+  limitRps: 5                           # edge rate limit on coordinator paths
+
 # Names of Secrets created out-of-band (bootstrap script for now,
 # sealed-secrets in CI/CD Step 1.5.3/1.5.4). The chart references, never
 # defines, them.
