@@ -8,9 +8,102 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## 2026-07-23 — LATEST: local k3d + Cloudflare Tunnel DECIDED, build-ready
+## 2026-07-24 (evening) — LATEST: Step 1.5.5 built + LIVE, mid-verification
 
-Read this first; the GCP/OCI narrative below it is superseded history.
+Read this first. Everything below (k3d/Cloudflare, GCP/OCI) is superseded
+history — compute host has been Microsoft Azure / AKS since Decision #57.
+
+**Phase: Step 1.5.5 (Public ingress, TLS, DNS) — IN PROGRESS, NOT DONE.**
+Built and applied live on AKS. 4 of 6 exit criteria objectively met; 2
+outstanding (both need real elapsed time / a second machine, not more code).
+
+### What is live right now
+- Staging is PUBLIC at **https://dcds-staging.centralindia.cloudapp.azure.com**
+  (static IP **4.240.120.113**, real Let's Encrypt cert). ingress-nginx +
+  cert-manager + a Terraform-owned public IP with the free cloudapp FQDN.
+- Design + build recorded in **Decisions #69 (gate)** and **#70 (build)**.
+- PR #7 **merged to main**; CI published images at SHA **69028dee1613923daed0c5da2fe4970ffd586e1f**
+  (the worker image at this SHA HAS the system-CA fix); CD auto-deployed
+  staging to that SHA (`/health` returns it).
+
+### Exit criteria status (the whole point of resuming)
+- ✅ 1 coordinator public + valid LE cert (`/health`=200, deployed SHA)
+- ✅ 2 dashboard public + protected (401 anon / 200 basic-auth)
+- ✅ 4 cert renewal proven (deleted secret → cert-manager reissued)
+- ✅ 5 edge rate-limit blocks register flood (6th+ request → 429)
+- ⏳ 3 **60-min soak**: worker `dcds-ext-worker` (Docker on the laptop, the
+  PUBLISHED image) connected through the ingress at **14:05:33Z**, was still
+  `session_epoch: 1` (no reconnect) at 14:26Z. **Verify at ≥15:05:33Z** with
+  `docker logs dcds-ext-worker | tail -3` — same epoch, no new
+  "registered"/"ws_connected" = survived = criterion met. (If the node was
+  stopped or the container removed before 60 min elapsed, RE-RUN the soak
+  tomorrow — see resume commands.)
+- ⏳ 6 **second-network worker**: run the worker on a DIFFERENT PC on a
+  mobile hotspot AND a corporate network. The public network path is already
+  proven working (a test from another PC reached the coordinator and got a
+  401 — that 401 was a mistyped enrollment secret, capital-L "enroLlment",
+  NOT a network failure). Correct command below.
+
+### CRITICAL state notes for resume
+- **The AKS node may still be RUNNING** (billing) — user was ending the day.
+  If the soak finished, run `az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system`.
+- **Production was scaled DOWN** to free CPU (coordinator HPA min 2→1,
+  dashboard/redis/postgres →0) so the ingress controllers could schedule on
+  the single B2s_v2 node. Reversible — the next CD deploy / `helm upgrade`
+  restores it. Not a defect; the node just can't hold both full stacks +
+  the controllers at once.
+- `demo-worker` in staging scaled 5→1 (leftover deployment, `demo-worker.yaml`
+  is untracked in the repo).
+- **1.5.5 is NOT marked DONE** in the Phase Register — needs criteria 3+6
+  confirmed and explicit user approval (§15). When both are confirmed, flip
+  the register row to DONE and note the final SHA.
+
+### Resume commands (tomorrow)
+```
+# bring cluster up (interactive az login if needed)
+az aks start -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+az aks get-credentials -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+
+# confirm public endpoint back up (may take 1-2 min after node start)
+curl -s https://dcds-staging.centralindia.cloudapp.azure.com/health
+
+# criterion 3 — (re)start the 60-min soak if needed, then check an hour later
+docker run -d --name dcds-ext-worker --rm=false \
+  -e COORDINATOR_URL=https://dcds-staging.centralindia.cloudapp.azure.com \
+  -e WORKER_CA_FILE= -e ENROLLMENT_SECRET=dev-enrollment-secret-6f3a1c \
+  ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system-worker:69028dee1613923daed0c5da2fe4970ffd586e1f
+# ...60 min later:  docker logs dcds-ext-worker | tail -3   (epoch still 1 = pass)
+
+# criterion 6 — on a SEPARATE PC on a different network (copy exactly, do not retype):
+docker run --rm -e COORDINATOR_URL=https://dcds-staging.centralindia.cloudapp.azure.com -e WORKER_CA_FILE= -e ENROLLMENT_SECRET=dev-enrollment-secret-6f3a1c ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system-worker:69028dee1613923daed0c5da2fe4970ffd586e1f
+```
+Enrollment secret = `dev-enrollment-secret-6f3a1c` (all lowercase).
+Dashboard basic-auth login = `operator` / `D68y1YIA6v9rF3g` (in .env).
+
+### Terraform / secrets gotchas (so they don't bite again)
+- `TF_CLOUD_ORGANIZATION=DATA_CLEANING_DISTRIBUTED_SYS` is now saved in
+  `.env` (was lost as a shell-only var last time). Terraform apply needs:
+  `ARM_SUBSCRIPTION_ID=6a171ca5-3089-48d7-98a8-caec998fa574`,
+  `TF_TOKEN_app_terraform_io=$TF_API_TOKEN`, `TF_CLOUD_ORGANIZATION` — all
+  from `.env`. Workspace runs in LOCAL execution (uses `az` CLI creds).
+- `bootstrap-secrets.ps1`'s `openssl passwd` step fails in Windows
+  PowerShell (openssl is on git-bash PATH, not PS). The
+  `dashboard-basic-auth` htpasswd Secret was created from git-bash instead.
+  `.env` now has `DASHBOARD_USER`/`DASHBOARD_PASSWORD`.
+
+### Uncommitted at session end
+`worker/worker.py` and the 1.5.5 infra ARE committed + merged (PR #7).
+Only `PHASE_STATE.md` / `SESSION_HANDOFF.md` doc edits from this wrap-up may
+be uncommitted on branch `phase-1.5.5-ingress-tls-dns` (local). Untracked,
+intentionally not committed: `.claude.backup/`, `.playwright-mcp/`,
+`demo-worker.yaml`.
+
+---
+
+## 2026-07-23 — local k3d + Cloudflare Tunnel (SUPERSEDED by Azure #57)
+
+Historical. The compute host is Azure / AKS now; ignore the k3d/Cloudflare
+plan below except as decision history.
 
 - **Compute host decided = local Kubernetes via k3d** (k3s-in-Docker,
   real CNCF K8s on the user's PC, $0) — Decisions Log #53, resolving the
