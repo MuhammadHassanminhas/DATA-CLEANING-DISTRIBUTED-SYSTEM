@@ -7,3 +7,11 @@ coordinator:
     maxReplicas: 2
 config:
   logLevel: INFO
+
+# Public ingress OFF for production (Step 1.5.5 honest ceiling): a second
+# public env needs a second static IP + FQDN and more node headroom than
+# the single B2s_v2 has. The templates are ready — flip enabled=true, set a
+# distinct host (a second Terraform IP), and keep createClusterIssuer=false
+# (staging already owns the cluster-scoped issuer) when that runway exists.
+ingress:
+  enabled: false

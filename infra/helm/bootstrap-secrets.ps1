@@ -24,6 +24,10 @@ function Get-EnvVal($name) {
 $enroll = Get-EnvVal "ENROLLMENT_SECRET"
 $pepper = Get-EnvVal "CREDENTIAL_PEPPER"
 $pgpass = Get-EnvVal "POSTGRES_PASSWORD"
+# Step 1.5.5 dashboard edge basic-auth (nginx auth-secret). User/password
+# from .env; the Secret holds an htpasswd line under key `auth`.
+$dashUser = Get-EnvVal "DASHBOARD_USER"
+$dashPass = Get-EnvVal "DASHBOARD_PASSWORD"
 
 # apply pattern = create --dry-run | apply, so re-running is idempotent.
 # Note: param must NOT be named $args ($args is a reserved automatic var).
@@ -42,4 +46,10 @@ Apply-Secret @(
   "--from-file=dev-ca.crt=$certs\dev-ca.crt"
 )
 
-Write-Host "Secrets app-secrets, postgres-secret, tls-certs applied to namespace '$Namespace'."
+# htpasswd line via openssl apr1 (openssl is already a project dependency —
+# infra/dev-ca generates the dev CA with it). nginx-ingress accepts apr1.
+$hash = (& openssl passwd -apr1 $dashPass)
+if ($LASTEXITCODE -ne 0) { throw "openssl passwd failed - is openssl on PATH?" }
+Apply-Secret @("dashboard-basic-auth", "--from-literal=auth=$dashUser`:$hash")
+
+Write-Host "Secrets app-secrets, postgres-secret, tls-certs, dashboard-basic-auth applied to namespace '$Namespace'."

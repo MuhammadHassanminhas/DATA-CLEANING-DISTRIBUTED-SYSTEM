@@ -74,3 +74,27 @@ variable "sealed_secrets_chart_version" {
   type        = string
   default     = "2.19.1"
 }
+
+# --- Step 1.5.5 ingress inputs -----------------------------------------
+
+# DNS label for the static public IP → <label>.<region>.cloudapp.azure.com.
+# Must be unique within the region. This is the public hostname workers and
+# the dashboard reach staging at.
+variable "ingress_dns_label" {
+  description = "Azure domain_name_label for the ingress public IP (region-unique)."
+  type        = string
+  default     = "dcds-staging"
+}
+
+# UNVERIFIED chart versions — confirm against the repos on first apply.
+variable "ingress_nginx_chart_version" {
+  description = "ingress-nginx Helm chart version (kubernetes.github.io/ingress-nginx)."
+  type        = string
+  default     = "4.11.3"
+}
+
+variable "cert_manager_chart_version" {
+  description = "cert-manager Helm chart version (charts.jetstack.io)."
+  type        = string
+  default     = "v1.16.2"
+}

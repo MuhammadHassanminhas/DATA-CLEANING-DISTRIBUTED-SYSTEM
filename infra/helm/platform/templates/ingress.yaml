@@ -1,0 +1,79 @@
+{{- if .Values.ingress.enabled }}
+# Step 1.5.5 — public ingress for this environment.
+#
+# One public hostname, path-routed to two backends (the worker only ever
+# hits /workers and /ws, so there is no path collision with the dashboard):
+#   /workers /ws /health /ready  → coordinator (8443)
+#   /  /api                      → dashboard   (8444)
+#
+# Both backends already serve HTTPS with the in-cluster dev cert, so the
+# backend-protocol is HTTPS: ingress-nginx re-encrypts to the pod and TLS
+# is never terminated in the clear inside the cluster (CLAUDE.md §3.8).
+# nginx does not verify the backend cert by default, so the self-signed
+# pod cert is fine on that internal hop. The PUBLIC cert is the Let's
+# Encrypt one cert-manager writes into {{ .Values.ingress.tlsSecret }}.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: coordinator
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuerName }}
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    # 60-minute persistent connections must survive the ingress (exit
+    # criterion 3): keep read/send timeouts well past an hour.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Edge rate limiting (exit criterion 5) — a registration flood is
+    # rejected at nginx before it ever reaches the coordinator. Per source
+    # IP (externalTrafficPolicy=Local preserves it).
+    nginx.ingress.kubernetes.io/limit-rps: {{ .Values.ingress.limitRps | quote }}
+spec:
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ .Values.ingress.tlsSecret }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          {{- range $p := list "/workers" "/ws" "/health" "/ready" }}
+          - path: {{ $p }}
+            pathType: Prefix
+            backend:
+              service:
+                name: coordinator
+                port: { number: 8443 }
+          {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dashboard
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    # Dashboard must not be anonymously accessible (exit criterion 2).
+    # HTTP basic auth at the edge; credentials in a pre-created htpasswd
+    # Secret (see bootstrap-secrets.ps1), never in Git.
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: {{ .Values.ingress.basicAuthSecret }}
+    nginx.ingress.kubernetes.io/auth-realm: "Restricted — operator dashboard"
+spec:
+  # Same host + same TLS secret as the coordinator ingress; cert-manager
+  # issues the cert once (via the coordinator ingress annotation) and nginx
+  # serves it for every ingress on this host.
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ .Values.ingress.tlsSecret }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dashboard
+                port: { number: 8444 }
+{{- end }}

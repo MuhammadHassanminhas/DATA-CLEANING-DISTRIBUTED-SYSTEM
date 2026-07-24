@@ -14,5 +14,17 @@ Open the dashboard:
   kubectl -n {{ .Release.Namespace }} port-forward svc/dashboard 8444:8444
   # then https://localhost:8444
 
-Public ingress (a real hostname + TLS, reachable from any Internet) is
-Step 1.5.5, not this chart.
+{{- if .Values.ingress.enabled }}
+
+PUBLIC INGRESS (Step 1.5.5) is ON for this namespace:
+  https://{{ .Values.ingress.host }}/            → dashboard (basic-auth)
+  https://{{ .Values.ingress.host }}/workers ... → coordinator
+  wss://{{ .Values.ingress.host }}/ws/connect    → worker WebSocket
+A worker on ANY Internet connection points at:
+  COORDINATOR_URL=https://{{ .Values.ingress.host }}  WORKER_CA_FILE=""
+(empty WORKER_CA_FILE → trust the public Let's Encrypt cert via system roots)
+Watch the cert issue:  kubectl -n {{ .Release.Namespace }} get certificate,order,challenge
+{{- else }}
+
+Public ingress is OFF for this namespace (ingress.enabled=false).
+{{- end }}
