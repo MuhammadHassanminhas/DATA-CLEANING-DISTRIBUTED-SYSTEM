@@ -1,23 +1,41 @@
-# Thin-Terraform inputs for the local k3d cluster (Decision #54).
-# No cloud/OCI auth variables anymore — the k3d cluster is a documented
-# prerequisite created by the k3d CLI, not a Terraform resource.
+# Inputs for Step 1.5.1 on Azure/AKS (Decision #57, sub-gate A + B2s).
+# subscription_id is NOT a variable — azurerm reads ARM_SUBSCRIPTION_ID
+# from the environment (see versions.tf).
+
+variable "resource_group_name" {
+  description = "Azure resource group holding all M1.5 resources. `terraform destroy` or `az group delete` on it removes everything."
+  type        = string
+  default     = "data-cleaning-distributed-system-rg"
+}
+
+variable "location" {
+  description = "Azure region. RECOMMENDATION: a region near the user (centralindia) that has AKS Free tier + Standard_B2s. Confirm B-series vCPU quota for the Azure-for-Students subscription in this region at apply time; change if capacity/quota is short."
+  type        = string
+  default     = "centralindia"
+}
 
 variable "cluster_name" {
-  description = "k3d cluster name. Terraform targets the kube context k3d-<cluster_name>."
+  description = "AKS cluster name."
   type        = string
   default     = "data-cleaning-distributed-system"
 }
 
-variable "kube_config_path" {
-  description = "Path to the kubeconfig k3d writes on cluster create."
+# Node size — sub-gate Open Questions #3(b) picked Standard_B2s (2 vCPU /
+# 4GB). That v1 B-series is NOT offered in centralindia for the student
+# subscription (only v2 B-series is), so substituted with the closest
+# available burstable SKU: Standard_B2s_v2 (2 vCPU / 8GB), user-approved
+# 2026-07-24. The extra RAM also pre-empts the 4GB-tight memory ceiling
+# the sub-gate flagged for a single-node full stack.
+variable "node_vm_size" {
+  description = "VM size for the single AKS node pool."
   type        = string
-  default     = "~/.kube/config"
+  default     = "Standard_B2s_v2"
 }
 
-variable "kube_context" {
-  description = "Override the kube context. Empty = k3d-<cluster_name> (see locals in versions.tf)."
-  type        = string
-  default     = ""
+variable "node_count" {
+  description = "Node count for the system pool. Single node, no autoscaling (Decision #57 cost discipline)."
+  type        = number
+  default     = 1
 }
 
 variable "environments" {
@@ -27,9 +45,10 @@ variable "environments" {
 }
 
 # Per-namespace resource quota. RECOMMENDATION, not measured — sized to
-# comfortably hold one coordinator + dashboard + Postgres + Redis per
-# environment on a laptop k3d node. Revisit if Step 1.5.2's real pods
-# exceed it.
+# hold one coordinator + dashboard + Postgres + Redis per environment.
+# Note: a single Standard_B2s node is 2 vCPU / 4GB, so both namespaces'
+# quotas together are a ceiling, not a reservation. Revisit against
+# Step 1.5.2's real pods.
 variable "namespace_quota" {
   description = "ResourceQuota applied to each environment namespace."
   type = object({
@@ -40,18 +59,18 @@ variable "namespace_quota" {
     pods            = string
   })
   default = {
-    requests_cpu    = "2"
-    requests_memory = "2Gi"
-    limits_cpu      = "4"
-    limits_memory   = "4Gi"
+    requests_cpu    = "1"
+    requests_memory = "1Gi"
+    limits_cpu      = "2"
+    limits_memory   = "2Gi"
     pods            = "30"
   }
 }
 
-# sealed-secrets controller (Decision #41) — encrypts secrets so the
-# encrypted form is safe to commit. UNVERIFIED chart version.
+# sealed-secrets controller (Decision #41). UNVERIFIED chart version —
+# confirm on first `terraform init` against the Azure cluster.
 variable "sealed_secrets_chart_version" {
-  description = "sealed-secrets Helm chart version (bitnami.github.io/sealed-secrets repo). Verified present 2026-07-23."
+  description = "sealed-secrets Helm chart version (bitnami.github.io/sealed-secrets repo)."
   type        = string
   default     = "2.19.1"
 }

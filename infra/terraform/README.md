@@ -1,51 +1,48 @@
-# Step 1.5.1 — Terraform base infrastructure (thin Terraform)
+# Step 1.5.1 — Terraform base infrastructure (Microsoft Azure / AKS)
 
-Status: **applied and verified against a local k3d cluster on
-2026-07-23** — `terraform init` (HCP Terraform remote state),
-`plan`, and `apply` all ran clean; `staging`, `production`, and
-`sealed-secrets` namespaces plus the sealed-secrets controller exist in
-the cluster. sealed-secrets chart repo is `https://bitnami.github.io/sealed-secrets`
-(the old `bitnami-labs.github.io` URL now 404s).
+Status: **written, NOT yet applied.** Files drafted 2026-07-24 under
+Decision #57 (Azure) and the Open Questions #3 sub-gate resolution
+(Option A "Terraform owns the cluster" + node size `Standard_B2s`). No
+`terraform init/plan/apply` has run against Azure yet — provider
+versions and the sealed-secrets chart version are UNVERIFIED drafts.
 
-## What changed (Decision #54)
+## What this provisions (Decision #57, sub-gate A + B2s)
 
-Shifted OFF every cloud provider (OCI/OKE/GKE — Decisions Log #36–53) to
-**local Kubernetes via k3d** (Decision #53) reached via **Cloudflare
-Tunnel** (Decision #52). Consequence for Terraform's scope:
+One `terraform apply` goes from nothing to:
 
-- **k3d CLI owns the cluster** (create/destroy). The cluster is a
-  documented prerequisite, the same role a cloud account played before.
-- **Terraform owns only in-cluster declarative state**: the `staging` /
-  `production` namespaces (Decision #40), a per-namespace ResourceQuota,
-  and the sealed-secrets controller (Decision #41) — via the
-  `kubernetes` + `helm` providers, no cloud providers.
-- **Remote state stays Terraform Cloud** (Decision #46 — never
-  cloud-specific), which still gives the real state-locking this step's
-  exit criteria require.
+- **`azurerm_resource_group`** — one RG holding everything.
+- **`azurerm_kubernetes_cluster`** — **Free-tier** control plane ($0),
+  a single **`Standard_B2s`** (2 vCPU / 4GB) node, **no autoscaling**
+  (the explicit cost discipline of Decision #57).
+- **In-cluster** (kubernetes + helm providers, pointed at the AKS cluster
+  just created): `staging` / `production` namespaces (Decision #40), a
+  per-namespace ResourceQuota, and the sealed-secrets controller
+  (Decision #41).
+
+Remote state stays **Terraform Cloud** (Decision #46) — never
+cloud-specific; still gives the real state-locking this step's exit
+criteria require.
 
 ## Prerequisites before `terraform init`
 
-1. **Install tooling** (both non-Google, unaffected by the company
-   network block):
+1. **Azure CLI logged in** (done): `az login`, `az account show` shows
+   the *Azure for Students* subscription as default.
+2. **Register resource providers** (once per subscription):
    ```
-   winget install --id k3d.k3d
-   winget install --id Hashicorp.Terraform
+   az provider register --namespace Microsoft.ContainerService
+   az provider register --namespace Microsoft.Compute
+   az provider register --namespace Microsoft.Network
    ```
-2. **Create the k3d cluster** (this is the "environment from nothing"
-   the exit criteria mean, at the cluster level):
+3. **Environment variables** (nothing secret is written into any `.tf`):
    ```
-   k3d cluster create data-cleaning-distributed-system
-   ```
-   k3d writes the `k3d-data-cleaning-distributed-system` context into
-   your default kubeconfig; Terraform targets that context.
-3. **Terraform Cloud auth** — token lives in `.env` as `terraform_token`
-   (gitignored, never committed). Export it before running Terraform,
-   and set the org:
-   ```
+   export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
    export TF_TOKEN_app_terraform_io=<terraform_token from .env>
    export TF_CLOUD_ORGANIZATION=<your Terraform Cloud org>
    ```
-   The token is **never** written into any `.tf` file.
+   The Terraform Cloud **workspace must run in LOCAL execution mode** so
+   the azurerm provider can use the local `az` CLI credentials. A
+   remote-execution workspace would instead need a service principal
+   (`ARM_CLIENT_ID`/`ARM_CLIENT_SECRET`/`ARM_TENANT_ID`).
 
 ## Run
 
@@ -54,24 +51,46 @@ cd infra/terraform
 terraform init
 terraform plan
 terraform apply
+```
+
+If the first apply errors with a provider-configuration-unknown message
+(the kubernetes/helm providers read their config from the cluster that
+doesn't exist yet on a from-nothing run), do a staged apply once:
+
+```
+terraform apply -target=azurerm_kubernetes_cluster.main
+terraform apply
+```
+
+Then point kubectl at the cluster:
+
+```
+az aks get-credentials -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
 kubectl get ns          # staging, production, sealed-secrets present
 ```
 
-## Teardown
+## Cost discipline (Decision #57)
 
-```
-terraform destroy                                   # removes in-cluster resources
-k3d cluster delete data-cleaning-distributed-system # removes the cluster
-```
-
-Documented before any `apply`, per this step's own exit criterion.
-$0 cost — local only — so the "cost after 24h" criterion is n/a here.
+- Free control plane = **$0**; the only compute cost is the single
+  `Standard_B2s` node while it runs.
+- **Stop the node between test sessions** (billing halts):
+  ```
+  az aks stop  -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+  az aks start -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+  ```
+- **Nuke everything** when done:
+  ```
+  terraform destroy
+  # or, to remove the whole RG regardless of Terraform state:
+  az group delete -n data-cleaning-distributed-system-rg --yes
+  ```
 
 ## What Terraform does NOT manage
 
-- **Postgres / Redis** — self-hosted in-cluster (Decision #39) as
-  Kubernetes manifests in Step 1.5.2, not here.
-- **Public ingress / TLS / DNS** — Cloudflare Tunnel (Decision #52) +
-  Step 1.5.5, not Terraform.
+- **Postgres / Redis** — self-hosted in-cluster (Decision #39) as the
+  Helm chart in Step 1.5.2, not here.
+- **Public ingress / TLS / DNS** — Step 1.5.5 (real Azure
+  LoadBalancer/IP; Cloudflare Tunnel retired, Decision #57).
 - **Container images** — ghcr.io (Decision #45).
-- **The k3d cluster itself** — k3d CLI, not Terraform (Decision #54).
+- **Azure Container Registry / Key Vault / Storage backend** — NOT used
+  (Decision #57 — each would burn student credit for no benefit).

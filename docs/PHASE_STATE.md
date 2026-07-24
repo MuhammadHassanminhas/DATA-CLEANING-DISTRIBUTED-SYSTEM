@@ -16,10 +16,10 @@ This file stays the authority on phase/gate status if the two disagree.
 | Project | Distributed AI-Orchestrated SQL Database Cleaning Platform |
 | Scope in progress | Version 1 — Distributed Worker Network |
 | Current milestone | M1.5 — Infrastructure & Deployment (M1 complete) |
-| Current phase | 1.5.3 — GitHub Actions CI pipeline (IN PROGRESS — built + locally verified, not pushed) |
-| Phase status | **Steps 1.5.1 and 1.5.2 DONE and approved 2026-07-23**, both built and verified live on a real local k3d cluster. 1.5.1: thin Terraform (Decision #54) — k3d CLI owns the cluster, Terraform manages namespaces/quotas/sealed-secrets via `kubernetes`+`helm` providers, remote state in Terraform Cloud (state-locking tested, destroy/apply/apply reproduce clean). 1.5.2: `infra/helm/platform` chart — coordinator+dashboard Deployments, in-cluster Postgres StatefulSet + Redis, HPA, PDB, migrations via initContainer (Decision #55), TLS via mounted dev-CA Secret; all 7 exit criteria verified (external worker connect→ONLINE, pod-delete reschedule, rolling upgrade no loss). Tooling installed and working: `k3d` v5.9.0, Terraform v1.15.8, Helm v4.2.3, kubectl. The `platform` release is currently deployed to the `staging` namespace on the running cluster. **Next: Step 1.5.3 — GitHub Actions CI pipeline (not started).** Nothing committed or pushed this session. |
-| Last updated | 2026-07-23 |
-| Approval gate | Phases 1.0–1.10 approved 2026-07-22. **Milestone 1 (Reliable Worker Network) is complete.** Phase 1.10's "100 workers" figures were substituted with 50 by explicit user direction (Decisions Log #35), consistent with the same substitution already accepted for Phase 1.9 — both explicitly approved regardless. **Phase 1.5.0 (design gate) went through three rounds this session, all approved by the user in sequence 2026-07-22**: (1) OCI-based plan (Decisions Log #36–41), approved, then (2) rejected once the user learned every cloud requires a card on file even for free tiers — revised to a self-hosted plan (Decisions Log #42–46: k3d on the laptop, Cloudflare Tunnel/DNS, ghcr.io, Terraform Cloud), approved, then (3) **reverted back to OCI** once the user explicitly chose to accept the card requirement after all (Decisions Log #47–49, superseding #42–44 again). OCI + OKE was the 2026-07-22 state. **On 2026-07-23 the design gate was re-opened and re-decided again** (Decisions Log #50–#53): after discovering the user's cloud access is blocked only by a company **network MAC-filter on Google** (not an account restriction), the plan settled on **local Kubernetes via k3d + Cloudflare Tunnel for reachability, no paid cloud provider** — the current authoritative state (see Snapshot's Phase status, Decisions #52–#53, Open Questions #2). Decisions #39–41/#45–46 (self-hosted Postgres/Redis, staging/production namespaces, sealed-secrets, ghcr.io, Terraform Cloud remote state) stood unchanged through every round. CI has not run on the latest commit — not yet pushed to `origin`, pushing was not requested. |
+| Current phase | **M1.5 restarting from scratch on Microsoft Azure / AKS.** By user direction 2026-07-24, **all prior Phase 1.5 build work (done on local k3d) is SCRAPPED** and M1.5 is redone on Azure (Decision #57–#58). Design gate 1.5.0 = Azure; **Steps 1.5.1–1.5.9 reset to NOT STARTED** and the scrapped infra code (`infra/terraform/`, `infra/helm/`) **deleted** (Decision #59). **Step 1.5.1 is now BUILT + VERIFIED on AKS (2026-07-24):** `az login` done (Azure-for-Students sub active), `infra/terraform/` rewritten for `azurerm` (Terraform-owns-cluster, Decisions #60–#62), `terraform apply` created the resource group + Free-tier AKS cluster + single `Standard_B2s_v2` node + staging/production namespaces + quotas + sealed-secrets, all verified live via `kubectl`. Node stopped with `az aks stop` after verification to conserve credit. Awaiting user demo/approval to mark 1.5.1 DONE. |
+| Phase status | **2026-07-24: compute host changed to Microsoft Azure (AKS), and ALL prior M1.5 build work is SCRAPPED to be redone on Azure (Decisions #57–#58).** Azure CLI v2.88.0 installed locally at `C:\Program Files\Microsoft SDKs\Azure\CLI2` and verified; **not yet `az login`'d**, no subscription selected, no resource created. The account is **Azure for Students** ($100 credit / 12 months / no card); strict cost discipline applies — AKS Free-tier control plane ($0), single small B-series node, no autoscaling, `az aks stop` between test sessions, `az group delete` to nuke everything (see Decision #57). **Steps 1.5.1 (thin k3d Terraform), 1.5.2 (Helm deploy on k3d), and 1.5.3 (CI) are all reset to NOT STARTED** — they will be rebuilt from scratch under the Azure method. **`infra/terraform/` and `infra/helm/` were deleted this session** (Decision #59) so M1.5 restarts with no infra code; `infra/dev-ca/` (M1 Phase 1.1) is kept. `.github/workflows/ci.yml` (originated in M1 Phase 1.1, only extended in 1.5.3) and `tests/` (provider-agnostic §11 work) are **retained pending a user decision** — deleting either would regress M1. Provider-agnostic Decisions #39–41 / #45–46 (in-cluster Postgres/Redis, staging/production namespaces, sealed-secrets, ghcr.io, Terraform Cloud remote state) still stand — no Azure Container Registry, no Key Vault, no Azure Storage backend (each would burn student credit for no benefit). Two Azure sub-choices remain OPEN (Open Questions #3): Terraform-owns-cluster vs thin, and node VM size. A later 2026-07-24 session then executed Step 1.5.1 on Azure: `az login`, resource-provider registration, `terraform init` (HCP Terraform remote state), `plan`, and `apply` — a **real Azure resource group + Free-tier AKS cluster + single `Standard_B2s_v2` node + staging/production namespaces + quotas + sealed-secrets now exist and were verified live**, then the node was `az aks stop`'d (compute billing halted; control plane $0). Decisions #60–#62 record the sub-gate resolution and two build fixes (node-RG-name length; `Standard_B2s`→`Standard_B2s_v2` forced availability substitution). |
+| Last updated | 2026-07-24 |
+| Approval gate | Phases 1.0–1.10 approved 2026-07-22. **Milestone 1 (Reliable Worker Network) is complete.** Phase 1.10's "100 workers" figures were substituted with 50 by explicit user direction (Decisions Log #35), consistent with the same substitution already accepted for Phase 1.9 — both explicitly approved regardless. **Phase 1.5.0 (design gate) went through three rounds this session, all approved by the user in sequence 2026-07-22**: (1) OCI-based plan (Decisions Log #36–41), approved, then (2) rejected once the user learned every cloud requires a card on file even for free tiers — revised to a self-hosted plan (Decisions Log #42–46: k3d on the laptop, Cloudflare Tunnel/DNS, ghcr.io, Terraform Cloud), approved, then (3) **reverted back to OCI** once the user explicitly chose to accept the card requirement after all (Decisions Log #47–49, superseding #42–44 again). OCI + OKE was the 2026-07-22 state. **On 2026-07-23 the design gate was re-opened and re-decided again** (Decisions Log #50–#53): after discovering the user's cloud access is blocked only by a company **network MAC-filter on Google** (not an account restriction), the plan settled on **local Kubernetes via k3d + Cloudflare Tunnel for reachability, no paid cloud provider** — the current authoritative state (see Snapshot's Phase status, Decisions #52–#53, Open Questions #2). Decisions #39–41/#45–46 (self-hosted Postgres/Redis, staging/production namespaces, sealed-secrets, ghcr.io, Terraform Cloud remote state) stood unchanged through every round. CI has not run on the latest commit — not yet pushed to `origin`, pushing was not requested. **On 2026-07-24 the design gate was re-opened and re-decided a fourth time: compute host → Microsoft Azure / AKS (Decision #57), superseding the local-k3d + Cloudflare-Tunnel plan (#52–#53). Azure for Students account; docs updated this session; awaiting user go-ahead before any Azure provisioning.** |
 
 ---
 
@@ -57,10 +57,10 @@ Status values: `NOT STARTED` · `IN PROGRESS` · `AWAITING APPROVAL` · `DONE` �
 ### Milestone 1.5 — Infrastructure & Deployment
 | Phase | Title | Status |
 |---|---|---|
-| 1.5.0 | Design gate — cloud topology and cost | DONE (re-decided 2026-07-23) |
-| 1.5.1 | Terraform base infrastructure | DONE (approved 2026-07-23; verified live on k3d — all exit criteria met, destroy/apply/apply reproduce clean, state-locking tested) |
-| 1.5.2 | Kubernetes manifests and Helm packaging | DONE (approved 2026-07-23; all 7 exit criteria verified live on k3d: Helm deploy, pods ready+probes, migrations before serve, external worker connect→ONLINE, pod-delete reschedule→worker reconnect, rolling upgrade no permanent loss, resource limits on every container). HPA object present but shows cpu:<unknown> — no metrics-server yet; live autoscaling proof deferred to Step 1.5.7. |
-| 1.5.3 | GitHub Actions CI pipeline | IN PROGRESS (pipeline built + verified locally 2026-07-23: 8/8 tests pass vs ephemeral PG/Redis, ruff+actionlint+terraform fmt clean; NOT pushed — green Actions run, required checks, branch protection pending a push) |
+| 1.5.0 | Design gate — cloud topology and cost | DONE (re-decided 2026-07-24 → **Microsoft Azure / AKS**, Decision #57, supersedes k3d #52–#53) |
+| 1.5.1 | Terraform base infrastructure | **BUILT + VERIFIED (awaiting approval)** — rebuilt on Azure with the `azurerm` provider (Decisions #60–#62). `terraform apply` created resource group + Free-tier AKS + single `Standard_B2s_v2` node + staging/production namespaces + per-namespace quotas + sealed-secrets; all verified live via `kubectl` 2026-07-24. Node `az aks stop`'d after. Terraform Cloud remote state (#46) retained; locking observed real. Remaining before DONE: fresh-clone apply verify, user demo/approval. |
+| 1.5.2 | Kubernetes manifests and Helm packaging | **NOT STARTED** — prior k3d Helm work SCRAPPED 2026-07-24 (Decision #58); to be rebuilt/re-verified against the AKS cluster during the redo. |
+| 1.5.3 | GitHub Actions CI pipeline | **NOT STARTED** — prior CI pipeline (built + verified green on PR #2, 2026-07-23) SCRAPPED 2026-07-24 (Decision #58) as part of the M1.5 clean redo; to be rebuilt under the Azure method. (History: 5 jobs lint/test/build/scan/terraform previously ran green; PR #2 left open.) |
 | 1.5.4 | GitHub Actions CD pipeline | NOT STARTED |
 | 1.5.5 | Public ingress, TLS, DNS | NOT STARTED |
 | 1.5.6 | Observability stack | NOT STARTED |
@@ -68,24 +68,31 @@ Status values: `NOT STARTED` · `IN PROGRESS` · `AWAITING APPROVAL` · `DONE` �
 | 1.5.8 | Real Internet worker onboarding | NOT STARTED |
 | 1.5.9 | M1.5 demo and verification | NOT STARTED |
 
-> **Milestone 1.5 direction settled (2026-07-23): local Kubernetes
-> (k3d) + Cloudflare Tunnel, no paid cloud provider** (Decisions Log
-> #52–#53). The re-opened Step 1.5.0 is re-closed and Open Questions #2
-> is resolved. The system will be deployed to a **local k3d cluster**
-> (real CNCF Kubernetes on the user's PC, $0), reached from other
-> networks via **Cloudflare Tunnel**. M1.5's Kubernetes/Helm/CI-CD
-> content stays real — only "cloud-hosted" becomes "local cluster", and
-> "always-on public" becomes "reachable while the PC + tunnel run"
-> (honest limitation; §8 needs only a per-phase cross-network worker,
-> not 24/7). The existing OCI/GKE-oriented `infra/terraform/` scaffold
-> will be rewritten or retired at Step 1.5.1, whose own short design
-> sub-gate decides Terraform's reduced scope now that there are no cloud
-> resources (e.g. Terraform managing the k3d cluster + namespaces + Helm
-> releases via the `kubernetes`/`helm` providers, vs the k3d CLI + Helm
-> directly). Provider-agnostic Decisions #39–41 / #45–46 (self-hosted
-> Postgres/Redis, staging/production namespaces, sealed-secrets,
-> ghcr.io, Terraform Cloud remote state) still stand. No M1.5 phase is
-> DONE yet — build starts next.
+> **Milestone 1.5 direction (current, 2026-07-24): Microsoft Azure —
+> AKS (Azure Kubernetes Service), Free-tier control plane** (Decisions
+> Log #57, supersedes local k3d + Cloudflare Tunnel #52–#53). The system
+> deploys to a **managed AKS cluster** on an **Azure for Students**
+> subscription ($100 credit / 12 months / no card). Because student
+> credit is finite, cost discipline is mandatory and explicit: AKS
+> **Free-tier control plane ($0)**, a **single small B-series burstable
+> node with no autoscaling**, **`az aks stop` whenever a test session
+> ends** (deallocates node VMs → compute billing halts), and
+> `az group delete` to remove everything. A real managed cloud has a real
+> public LoadBalancer/IP, so **Cloudflare Tunnel is retired** (same
+> reasoning as the earlier Decision #49). M1.5's Kubernetes/Helm/CI-CD
+> content is fully real again — "local cluster" becomes "managed AKS
+> cluster", and reachability is a real Azure public endpoint (spun up
+> only while demoing to conserve credit). The k3d-era `infra/terraform/`
+> (thin, `kubernetes`/`helm` only) is rewritten at Step 1.5.1 to add the
+> **`azurerm` provider** (resource group + AKS + node pool); its short
+> design sub-gate settles two open sub-choices (Open Questions #3):
+> whether Terraform provisions the cluster itself vs `az aks create` +
+> thin Terraform, and the node VM size. Provider-agnostic Decisions
+> #39–41 / #45–46 (self-hosted Postgres/Redis, staging/production
+> namespaces, sealed-secrets, ghcr.io, Terraform Cloud remote state)
+> still stand — no ACR, no Key Vault, no Azure Storage backend. **All
+> prior M1.5 build work (done on k3d) is scrapped (Decision #58);
+> Steps 1.5.1–1.5.9 are NOT STARTED and rebuilt from scratch on Azure.**
 
 ### Milestone 2 — Task Distribution
 | Phase | Title | Status |
@@ -135,8 +142,8 @@ Status values: `NOT STARTED` · `IN PROGRESS` · `AWAITING APPROVAL` · `DONE` �
 | Environment | Purpose | Status | URL |
 |---|---|---|---|
 | local | Docker Compose development | NOT PROVISIONED | — |
-| staging | Kubernetes, public Internet testing | NOT PROVISIONED | — |
-| production | Kubernetes, real fleet | NOT PROVISIONED | — |
+| staging | Azure AKS namespace, public Internet testing (Decision #57) | PROVISIONED (namespace + quota; node stopped) | AKS `data-cleaning-distributed-system` |
+| production | Azure AKS namespace, real fleet (Decision #57) | PROVISIONED (namespace + quota; node stopped) | AKS `data-cleaning-distributed-system` |
 
 ---
 
@@ -219,6 +226,18 @@ Append only. Never rewrite an entry.
 
 | 56 | 2026-07-23 | Step 1.5.3 CI pipeline scope (user-approved calls): **(A) write a baseline test suite now** — protocol-envelope unit tests + a coordinator integration test run against ephemeral Postgres+Redis (GitHub Actions `services:`) — since M1 shipped no tests at all (a §11 debt); **(B) Terraform in CI = `fmt -check` (always) + `validate` (gated on a `TF_API_TOKEN` repo secret), NO real `terraform plan`** — the thin-Terraform `kubernetes`/`helm` providers target the local k3d cluster (Decision #54), unreachable from GitHub's hosted runners, so `plan` runs locally only (honest limitation, same family as "reachable only while the PC runs"); **(C) build-only, not pushed** this session. | (A) minimal smoke tests / defer tests; (B) a self-hosted runner on the user's PC so CI could reach the local cluster for a real `plan`; (C) push + open a PR to verify green | Baseline tests start paying down the real §11 gap rather than papering over it; validate-only keeps CI honest about what a local cluster can and can't do from a hosted runner; a self-hosted runner was declined for now (setup + exposes the machine to CI jobs). `ci.yml` extended to jobs `lint`/`test`/`build`(SHA-tagged images, never only `latest`)/`scan`(`pip-audit` enforced + Trivy fs report-only)/`terraform`. Verified locally, not on a PR: 8/8 tests pass vs ephemeral Postgres+Redis, `ruff` clean, `actionlint` clean, `terraform fmt -check` clean. Still pending a push: an actual green Actions run, required-status-checks, and branch protection (a manual GitHub setting — standing Blocker #1). | 1.5.3 |
 
+| 57 | 2026-07-24 | Compute host / cloud provider: **Microsoft Azure — AKS (Azure Kubernetes Service), Free-tier control plane** — **supersedes Decisions #52–#53** (local k3d) and retires the Cloudflare-Tunnel reachability role of #52 | Staying on local k3d + Cloudflare Tunnel | User moved back to a real managed cloud now that an **Azure for Students** subscription is available (Azure CLI 2.88.0 installed locally and verified; **not yet `az login`'d**). Azure for Students = **$100 credit / 12 months / no credit card**, and when the credit is exhausted resources stop rather than billing a card — a genuine safety net for the $0-out-of-pocket ceiling, unlike pay-as-you-go. A managed cloud has a real public LoadBalancer/IP, so **Cloudflare Tunnel is retired** (same reasoning as the earlier Decision #49 — a cloud with real ingress doesn't need the tunnel workaround). **Cost discipline is mandatory and explicit** (student credit is finite): AKS **Free-tier control plane ($0)**; a **single small B-series burstable node, no autoscaling**; **`az aks stop` whenever a test session ends** to deallocate node VMs and halt compute billing; `az group delete` to remove everything. Provider-agnostic Decisions **#39–41 / #45–46 still stand** — in-cluster Postgres/Redis, staging/production namespaces, sealed-secrets, ghcr.io for images, Terraform Cloud remote state (**no** Azure Container Registry, **no** Key Vault, **no** Azure Storage backend — each would burn credit for no benefit at this scale). **Consequence:** the k3d-verified work of Steps 1.5.1 (thin Terraform) and 1.5.2 (Helm deploy) must be **re-implemented/re-verified on AKS** — 1.5.1's Terraform is rewritten from `kubernetes`/`helm`-only to add the `azurerm` provider (resource group + AKS + node pool); the 1.5.2 chart is portable and only re-targets the new cluster. Step 1.5.3 CI is provider-agnostic and largely stands. Two sub-choices remain OPEN, deferred to the Step 1.5.1 design sub-gate (Open Questions #3): (a) Terraform provisions the AKS cluster via `azurerm` vs `az aks create` + thin Terraform; (b) node VM size. This session was **docs-only** — no `az login`, no code, no provisioning. | 1.5.0 |
+
+| 58 | 2026-07-24 | **Scrap all prior Milestone 1.5 build work and redo M1.5 from scratch under the Azure method.** Steps 1.5.1 (thin k3d Terraform), 1.5.2 (Helm deploy on k3d) and 1.5.3 (CI pipeline) are reset to NOT STARTED; each existing artifact is reassessed during the redo rather than assumed carried over. | Incrementally port the k3d artifacts to Azure (keep the Helm chart and CI as-is, only rewrite the Terraform) | User directed a clean redo rather than an incremental port. Recorded as a directive for traceability, not a design trade-off. **Docs-only consequence this session:** phase status reset in the register/snapshot; the actual `infra/terraform/`, `infra/helm/platform`, `.github/workflows`, and baseline-test files are **not deleted this session** (deleting code is a separate, explicit step the user has not yet requested) — they remain in the tree, marked scrapped/superseded, to be replaced or reused as the Azure rebuild decides. Provider-agnostic Decisions #39–41 / #45–46 still stand. | 1.5.0 |
+
+| 59 | 2026-07-24 | **Deleted the scrapped M1.5 infra code from the working tree** — `infra/terraform/` (k3d thin Terraform, Step 1.5.1) and `infra/helm/` (Helm chart + bootstrap-secrets, Step 1.5.2), 16 files total — so M1.5 restarts from an empty infra base on Azure. Recoverable from git history (commits `9052662`, `d072962`). | Keep the files in-tree marked scrapped (the #58 docs-only state); or also delete `.github/workflows/ci.yml` and `tests/` | User directed deleting the scrapped infra files to "start from the very beginning." **Kept `infra/dev-ca/`** (M1 Phase 1.1 dev-CA generator — not M1.5, still in use). **`.github/workflows/ci.yml` and `tests/` were NOT deleted** — `ci.yml` originated in M1 Phase 1.1 (lint/build skeleton) and was only extended in 1.5.3, and `tests/` are provider-agnostic §11 debt-paydown; deleting either would regress an approved M1 deliverable, so both are flagged for an explicit user decision rather than removed unilaterally. Note: the pre-existing uncommitted edit to `infra/terraform/variables.tf` is gone with the directory (was part of the scrapped Terraform). No commit made this session. | 1.5.0 |
+
+| 60 | 2026-07-24 | **Step 1.5.1 design sub-gate (Open Questions #3) resolved:** (a) **Terraform owns the AKS cluster** via the `azurerm` provider (resource group + `azurerm_kubernetes_cluster` Free-tier + single node pool); (b) node size **`Standard_B2s`** (2 vCPU / 4GB, cheapest viable). | (a) `az aks create` + thin Terraform; (b) `Standard_B2ms` (8GB) | User approved both 2026-07-24. Thin Terraform (the k3d Decision #54 shape) made sense only because k3d has no cloud API; Azure has a first-class `azurerm` AKS resource, so going thin would be the one place CLAUDE.md §4 ("all cloud resources via Terraform, no console clicks") is actually violated. B2s over B2ms for cost, with an escape hatch on record to bump to 8GB if a memory ceiling appears. | 1.5.1 |
+
+| 61 | 2026-07-24 | AKS **`node_resource_group` set explicitly** to `<cluster>-nodes`. Build fix during apply. | Let Azure auto-name the node RG | Azure's default node RG name `MC_<rg>_<cluster>_<region>` was 84 chars, over the 80-char max → apply failed `400 InvalidParameter`. An explicit short name (`data-cleaning-distributed-system-nodes`, 38 chars) fixes it. | 1.5.1 |
+
+| 62 | 2026-07-24 | Node VM size **substituted `Standard_B2s` → `Standard_B2s_v2`** (2 vCPU / **8GB**), user-approved. | `Standard_B2ls_v2` (2 vCPU / 4GB — exact-spec match, cheapest v2) | Forced availability substitution: `Standard_B2s` (v1 B-series) is **not offered** in `centralindia` for this Azure-for-Students subscription — only v2 B-series is (apply failed `400 BadRequest` listing allowed SKUs). Same burstable class; chose the 8GB `B2s_v2` over the 4GB `B2ls_v2` because a single node running coordinator+Postgres+Redis+sealed-secrets is tight on 4GB (AKS reserves ~1GB), pre-empting the exact memory ceiling Decision #60 flagged. Cost ~$0.083/hr while running, $0 when `az aks stop`'d. **Applied + verified live 2026-07-24:** `terraform apply` = 7 added/0 changed/0 destroyed; cluster up in 4m48s; node Ready (k8s v1.35.6, Ubuntu 24.04); `staging`/`production`/`sealed-secrets` namespaces Active; per-namespace quotas applied; sealed-secrets pod 1/1 Running; remote-state locking observed real (a stale HCP lock had to be cleared via the web UI). | 1.5.1 |
+
 **Decisions #39–41 and #45–46 are unaffected by this reversal** — self-hosted Postgres/Redis in-cluster, single-cluster namespace topology, `sealed-secrets`, ghcr.io for images, and Terraform Cloud for remote state were never OCI-specific or k3d-specific and still stand. Cost ceiling remains $0/month — a card on file for identity verification does not change that; OCI Always Free is not billed. **User re-confirmed this second reversal on 2026-07-22.** `infra/terraform/` is being rewritten for OCI accordingly (see Step 1.5.1 update below).
 
 ---
@@ -257,7 +276,8 @@ Record only measured numbers here. Recommendations belong in phase docs.
 | # | Question | Raised in | Blocking? | Resolution |
 |---|---|---|---|---|
 | 1 | Working tree had a large batch of previously-tracked files (coordinator/, README.md, docker-compose.yml, DECISIONS.md, SESSION_HANDOFF.md, pyproject.toml, etc.) showing as unstaged deletions in `git status`. `git show HEAD` revealed these were real prior-session progress (a coordinator skeleton that had reached that session's own "Step 4", with no design gate). | 1.0 | No — resolved | User chose to discard and build fresh under the current CLAUDE.md/PHASE_STATE.md process rather than recover the old code. Old commit remains in git history if ever needed. |
-| 2 | Now that no paid cloud provider will host the system (Decision #52 — self-hosted coordinator + Cloudflare Tunnel for reachability), does Milestone 1.5 still run Kubernetes — on a local `k3d`/`kind` cluster (reviving superseded Decisions #42–43) — or does V1 stay on Docker Compose, making much of M1.5's Terraform/OKE/GKE-oriented phase content (1.5.1–1.5.2, parts of 1.5.5–1.5.7) obsolete or re-scoped? | 1.5.0 (re-opened) | No — resolved | **Resolved 2026-07-23: Option A — local Kubernetes via k3d** (real CNCF K8s on the user's PC, $0). V1 keeps Kubernetes; it runs locally instead of on a cloud host. Recorded as Decisions Log #53. Terraform's exact reduced scope is a Step 1.5.1 sub-decision. |
+| 2 | Now that no paid cloud provider will host the system (Decision #52 — self-hosted coordinator + Cloudflare Tunnel for reachability), does Milestone 1.5 still run Kubernetes — on a local `k3d`/`kind` cluster (reviving superseded Decisions #42–43) — or does V1 stay on Docker Compose, making much of M1.5's Terraform/OKE/GKE-oriented phase content (1.5.1–1.5.2, parts of 1.5.5–1.5.7) obsolete or re-scoped? | 1.5.0 (re-opened) | No — resolved | **Resolved 2026-07-23: Option A — local Kubernetes via k3d** (real CNCF K8s on the user's PC, $0). V1 keeps Kubernetes; it runs locally instead of on a cloud host. Recorded as Decisions Log #53. Terraform's exact reduced scope is a Step 1.5.1 sub-decision. **Superseded 2026-07-24 by Decision #57** — compute host moved from local k3d to Azure AKS; V1 still runs Kubernetes, now on a managed Azure cluster. |
+| 3 | Azure Step 1.5.1 sub-choices (raised by Decision #57): (a) does Terraform provision the AKS cluster itself via the `azurerm` provider (matches CLAUDE.md §4 "all cloud resources via Terraform, no console clicks") or does `az aks create` create it with Terraform staying thin (in-cluster only)? (b) which node VM size for the single node pool — `Standard_B2s` (2 vCPU / 4GB, cheapest viable) vs `Standard_B2ms` (2 vCPU / 8GB, more headroom)? | 1.5.0 (2026-07-24) | No — resolved | **Resolved 2026-07-24 (Decision #60):** (a) **Terraform owns the AKS cluster** via `azurerm`; (b) node **`Standard_B2s`** — but `Standard_B2s` proved unavailable in `centralindia` for the student subscription (only v2 B-series offered), so substituted to **`Standard_B2s_v2`** (2 vCPU / 8GB) at apply time, user-approved (Decision #62). Applied + verified live. |
 
 ---
 
@@ -280,20 +300,25 @@ Empty is the correct state.
    working tree without a GitHub token/`gh` CLI (neither available
    here). Needs to be done manually, or delegated with explicit
    authorization.
-2. **Tooling not yet installed for M1.5 build.** `k3d` (local
-   Kubernetes) and the **Terraform CLI** are not on this machine, and no
-   Terraform Cloud account/workspace/token exists yet (needed only if
-   Step 1.5.1 keeps Terraform for remote state — Decision #46). These are
-   the practical prerequisites to start Step 1.5.1. The company's
-   Google-only network block does not affect k3d (local), Cloudflare,
-   ghcr.io, HashiCorp, or Terraform Cloud — none is Google.
+2. **Azure prerequisites before the Step 1.5.1 rewrite (Decision #57).**
+   Azure CLI v2.88.0 is installed (`C:\Program Files\Microsoft SDKs\Azure\CLI2`)
+   but this session's shell PATH did not include it — a fresh terminal
+   (or the full path) is needed. Terraform CLI (v1.15.8) and Helm are
+   already installed from the k3d work. Still to do, in order, before any
+   Azure resource exists:
+   1. **`az login`** — interactive browser auth; the user must run this
+      (an agent cannot complete the browser flow). Suggested:
+      `! "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd" login`
+   2. Confirm the **Azure for Students** subscription is active
+      (`az account show`) and set as default.
+   3. Register resource providers: `Microsoft.ContainerService`,
+      `Microsoft.Compute`, `Microsoft.Network`.
+   4. Resolve Open Questions #3 (Terraform-owns-cluster vs thin; node VM
+      size), then rewrite `infra/terraform/` for `azurerm`.
 
-   The M1.5 compute-host **design decision is now resolved** — local k3d,
-   Decisions Log #53, Open Questions #2 closed. The earlier "GCP account
-   restricted" blocker is **removed**: the block is a network-level
-   MAC-filter on Google only, not an account restriction, and the
-   approach no longer depends on any cloud account. Decisions Log
-   #50–#51 are **superseded by #52–#53.**
+   The prior "k3d/Terraform CLI not installed" and "GCP account
+   restricted" blockers are **removed/superseded** — Decisions Log
+   #50–#51 by #52–#53, and #52–#53 in turn by #57 (Azure).
 
 Resolved: **CI runs green on a pull request** — GitHub MCP was
 reconnected (user updated the token's permissions to include "Pull
@@ -1021,3 +1046,48 @@ Terraform is kept for remote state. Step 1.5.1 opens with a short design
 sub-gate on Terraform's reduced scope (there are no cloud resources to
 provision anymore). Provider-agnostic Decisions #39–41 / #45–46 stand.
 Still nothing committed or pushed; docs-only.
+
+---
+
+## Session update — 2026-07-24: moved to Microsoft Azure (AKS)
+
+Supersedes the local-k3d + Cloudflare-Tunnel direction above. The user
+switched the compute host **back to a real managed cloud — Microsoft
+Azure, AKS** — using a newly available **Azure for Students**
+subscription ($100 credit / 12 months / no credit card). Recorded as
+**Decisions Log #57**, superseding #52–#53.
+
+- **Why it's viable for the $0 ceiling:** Azure for Students bills
+  against a finite credit, not a card — when the credit runs out
+  resources stop rather than charging the user. Still requires active
+  cost discipline (see below).
+- **Cost discipline (mandatory, in Decision #57):** AKS Free-tier
+  control plane ($0); one small B-series burstable node, no autoscaling;
+  `az aks stop` between test sessions to halt compute billing;
+  `az group delete` to remove everything. No ACR, no Key Vault, no Azure
+  Storage backend — keep ghcr.io / sealed-secrets / Terraform Cloud.
+- **Cloudflare Tunnel retired** — AKS has a real public LoadBalancer/IP.
+- **Environment state:** Azure CLI v2.88.0 installed and verified;
+  **not yet `az login`'d**; no subscription selected; no resource
+  created. Terraform + Helm already installed from the k3d work.
+- **Scrap-and-rebuild (Decision #58):** the user then directed that
+  **all prior M1.5 build work be scrapped** and M1.5 redone from scratch
+  under Azure, rather than incrementally ported. Steps 1.5.1 (thin k3d
+  Terraform), 1.5.2 (Helm deploy on k3d) and 1.5.3 (CI pipeline,
+  verified green on PR #2) are all reset to **NOT STARTED**.
+- **Scrapped infra deleted (Decision #59):** the user then directed
+  deleting the scrapped infra files to start M1.5 from the very
+  beginning. **`infra/terraform/` and `infra/helm/` were removed** (16
+  files; recoverable from git history commits `9052662` / `d072962`).
+  **Kept `infra/dev-ca/`** (M1 Phase 1.1). **`.github/workflows/ci.yml`
+  and `tests/` were NOT deleted** — `ci.yml` originated in M1 Phase 1.1
+  and `tests/` are provider-agnostic §11 work; deleting either regresses
+  an approved M1 deliverable, so both await an explicit user decision.
+- **Open (Open Questions #3):** Terraform-owns-cluster vs thin, and node
+  VM size — deferred to the Step 1.5.1 design sub-gate (recommendation
+  on record: Terraform-owns-cluster + `Standard_B2s`).
+- **This session:** doc changes to `phase_state.md` +
+  `docs/PHASE_STATE.md`, plus deletion of the scrapped `infra/terraform/`
+  and `infra/helm/` directories (their README went with them). No
+  `az login`, no Azure provisioning. Nothing committed or pushed.
+  Stopped here at the user's instruction.
