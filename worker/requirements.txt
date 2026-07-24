@@ -1,1 +1,2 @@
 websockets>=12,<13
+requests==2.19.1  # TEMPORARY CVE-2018-18074 — proves scan flags vulns. Revert.

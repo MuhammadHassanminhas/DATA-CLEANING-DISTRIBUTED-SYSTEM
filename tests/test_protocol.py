@@ -37,3 +37,8 @@ def test_to_dict_has_the_fixed_top_level_shape():
 def test_dict_roundtrip_is_lossless():
     e = Envelope(message_type="heartbeat", worker_id="w1", session_epoch=3, payload={"sequence": 1})
     assert Envelope.from_dict(e.to_dict()) == e
+
+
+def test_ci_failure_proof_delete_me():
+    # TEMPORARY — proves a broken test blocks merge (Step 1.5.3). Revert.
+    assert 1 == 2, "deliberate CI failure proof"
