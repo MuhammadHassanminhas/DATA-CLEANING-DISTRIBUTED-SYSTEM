@@ -67,6 +67,12 @@ spec:
           imagePullPolicy: {{ .Values.coordinator.image.pullPolicy }}
           ports:
             - containerPort: 8443
+          env:
+            # Deployed image SHA, surfaced at /health for CD's version
+            # assertion (Step 1.5.4, exit criterion 4). image.tag is the
+            # commit SHA set by CD at deploy time (--set coordinator.image.tag).
+            - name: GIT_SHA
+              value: "{{ .Values.coordinator.image.tag }}"
           envFrom:
             - configMapRef: { name: app-config }
             - secretRef: { name: {{ .Values.secretNames.app }} }

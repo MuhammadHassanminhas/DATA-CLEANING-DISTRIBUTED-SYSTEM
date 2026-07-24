@@ -1,0 +1,101 @@
+# Phase 1.5.4 — reusable per-environment deploy (called by cd.yml for
+# staging then production). Option C (approved 2026-07-24): a GitHub-hosted
+# runner deploys over the PUBLIC AKS API. It does NOT az aks start/stop —
+# the node's up/down is the user's credit lever, run by hand at session
+# boundaries. If the cluster is stopped the deploy fails loudly and burns
+# zero credit. `production` is gated by an Environment protection rule
+# (manual approval) configured in repo settings, not here.
+name: _deploy-env
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target namespace + GitHub Environment (staging | production).
+        required: true
+        type: string
+      sha:
+        description: Full commit SHA to deploy (must match the image tag CI pushed).
+        required: true
+        type: string
+    secrets:
+      ARM_CLIENT_ID: { required: true }
+      ARM_CLIENT_SECRET: { required: true }
+      ARM_TENANT_ID: { required: true }
+      ARM_SUBSCRIPTION_ID: { required: true }
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Environment protection rules apply here: `production` requires a
+    # reviewer's approval before this job runs (exit criterion 2).
+    environment: ${{ inputs.environment }}
+    env:
+      RG: data-cleaning-distributed-system-rg
+      CLUSTER: data-cleaning-distributed-system
+      RELEASE: platform          # helm release name, per namespace
+      NS: ${{ inputs.environment }}
+      SHA: ${{ inputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+
+      - uses: azure/setup-helm@v4
+
+      - name: Deploy start timestamp (criterion 5 — time commit→running)
+        id: t0
+        run: echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login + kubeconfig (reuses the 1.5.3 service-principal secrets)
+        run: |
+          az login --service-principal \
+            -u "${{ secrets.ARM_CLIENT_ID }}" \
+            -p "${{ secrets.ARM_CLIENT_SECRET }}" \
+            --tenant "${{ secrets.ARM_TENANT_ID }}" >/dev/null
+          az account set --subscription "${{ secrets.ARM_SUBSCRIPTION_ID }}"
+          az aks install-cli >/dev/null 2>&1 || true
+          az aks get-credentials -g "$RG" -n "$CLUSTER" --overwrite-existing
+
+      - name: Cluster-up guard (Option C — no auto-start, fail if az aks stop'd)
+        run: |
+          if ! kubectl get ns "$NS" --request-timeout=20s >/dev/null 2>&1; then
+            echo "::error::AKS '$CLUSTER' unreachable — likely 'az aks stop'd. Run: az aks start -g $RG -n $CLUSTER, then re-run this workflow."
+            exit 1
+          fi
+
+      - name: Helm deploy (--atomic = auto-rollback on a failed rollout, criterion 3)
+        run: |
+          helm upgrade --install "$RELEASE" infra/helm/platform \
+            --namespace "$NS" \
+            --values "infra/helm/platform/values-${NS}.yaml" \
+            --set coordinator.image.tag="$SHA" \
+            --set dashboard.image.tag="$SHA" \
+            --atomic --timeout 5m
+
+      - name: Smoke test + version assert (criteria 3 & 4)
+        run: |
+          set -o pipefail
+          # In-cluster curl: coordinator is HTTPS on 8443 with the self-signed
+          # dev CA, so -k. /health now returns the deployed SHA (GIT_SHA env).
+          out=$(kubectl -n "$NS" run "smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --rm -i --restart=Never --image=curlimages/curl:latest --command -- \
+            sh -c 'curl -fsk https://coordinator:8443/ready; echo; curl -fsk https://coordinator:8443/health')
+          echo "$out"
+          echo "$out" | grep -q "$SHA" || { echo "::error::/health version does not match deployed SHA $SHA"; exit 1; }
+
+      - name: Rollback on failure (belt-and-suspenders beyond --atomic)
+        if: failure()
+        run: helm -n "$NS" rollback "$RELEASE" 2>/dev/null || true
+
+      - name: Record deploy event + duration (criterion 5, logged with SHA)
+        if: always()
+        run: |
+          end=$(date +%s)
+          dur=$(( end - ${{ steps.t0.outputs.start }} ))
+          {
+            echo "### CD → ${NS}"
+            echo "- commit: \`${SHA}\`"
+            echo "- release: ${RELEASE} (namespace ${NS})"
+            echo "- duration: ${dur}s (deploy job start → running + smoke-verified)"
+          } >> "$GITHUB_STEP_SUMMARY"

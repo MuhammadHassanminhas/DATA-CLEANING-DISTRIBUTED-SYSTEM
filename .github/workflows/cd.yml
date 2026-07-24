@@ -1,0 +1,41 @@
+# Phase 1.5.4 — CD pipeline (Option C, approved 2026-07-24, Decision #67).
+#
+# Triggers on CI SUCCESS on main (workflow_run), NOT on the push itself:
+# CI's build job pushes the SHA-tagged images to ghcr.io on a main push, and
+# CD must deploy AFTER those images exist. Keying off CI completion removes
+# the race. The commit is github.event.workflow_run.head_sha — the SAME full
+# SHA CI tagged the images with (ci.yml tags ${{ github.sha }}).
+#
+# staging deploys automatically; production waits on the `production`
+# Environment protection rule (a required reviewer = manual approval).
+# The runner never starts/stops the cluster — see _deploy-env.yml.
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+# Never run two deploys at once; never cancel one mid-rollout.
+concurrency:
+  group: cd-main
+  cancel-in-progress: false
+
+jobs:
+  staging:
+    # Only deploy a green build. A failed/cancelled CI run deploys nothing.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    uses: ./.github/workflows/_deploy-env.yml
+    with:
+      environment: staging
+      sha: ${{ github.event.workflow_run.head_sha }}
+    secrets: inherit
+
+  production:
+    needs: staging
+    uses: ./.github/workflows/_deploy-env.yml
+    with:
+      environment: production
+      sha: ${{ github.event.workflow_run.head_sha }}
+    secrets: inherit
