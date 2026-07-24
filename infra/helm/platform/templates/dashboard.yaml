@@ -1,0 +1,55 @@
+# Dashboard: Deployment + Service. Talks to the coordinator over the
+# in-cluster ClusterIP service (https://coordinator:8443 — cert SAN
+# includes "coordinator"). Not publicly exposed here; ingress is 1.5.5.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard
+spec:
+  replicas: {{ .Values.dashboard.replicas }}
+  selector:
+    matchLabels: { app: dashboard }
+  template:
+    metadata:
+      labels: { app: dashboard }
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: dashboard
+          image: "{{ .Values.dashboard.image.repository }}:{{ .Values.dashboard.image.tag }}"
+          imagePullPolicy: {{ .Values.dashboard.image.pullPolicy }}
+          ports:
+            - containerPort: 8444
+          envFrom:
+            - configMapRef: { name: app-config }
+            - secretRef: { name: {{ .Values.secretNames.app }} }
+          volumeMounts:
+            - name: tls
+              mountPath: /certs
+              readOnly: true
+          livenessProbe:
+            httpGet: { path: /health, port: 8444, scheme: HTTPS }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8444, scheme: HTTPS }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources: {{ toYaml .Values.dashboard.resources | nindent 12 }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.secretNames.tls }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard
+spec:
+  selector: { app: dashboard }
+  ports:
+    - port: 8444
+      targetPort: 8444

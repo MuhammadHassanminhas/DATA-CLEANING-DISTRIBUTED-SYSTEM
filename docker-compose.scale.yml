@@ -1,0 +1,24 @@
+# Phase 1.9 scale-simulation override.
+#
+# `docker compose up --scale worker=N` alone doesn't work for N>1 against
+# the base docker-compose.yml: every replica would mount the same named
+# `worker-identity-data` volume and fight over one identity file (the
+# Phase 1.3 `fcntl` single-instance lock correctly rejects N-1 of them as
+# `duplicate_local_instance_detected`). That named volume is deliberate
+# for normal single-worker dev — it's what makes identity survive restart
+# and container recreation (Phase 1.3's own exit criteria).
+#
+# This override drops the named volume in favor of an anonymous one:
+# Docker Compose gives each scaled replica its own distinct anonymous
+# volume with no extra config, so every replica registers its own
+# identity. Identity does not survive a replica being recreated under
+# this override — acceptable here because a scale simulation is a
+# transient measurement, not a persistence test (that's already Phase
+# 1.3's job, already verified against the base compose file).
+#
+# Usage: docker compose -f docker-compose.yml -f docker-compose.scale.yml up -d --scale worker=N
+services:
+  worker:
+    volumes:
+      - ./certs:/certs:ro
+      - /var/lib/worker-identity

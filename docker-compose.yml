@@ -1,0 +1,82 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: coordinator/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      ENROLLMENT_SECRET: ${ENROLLMENT_SECRET}
+      CREDENTIAL_PEPPER: ${CREDENTIAL_PEPPER}
+    ports:
+      - "${COORDINATOR_PORT}:8443"
+    volumes:
+      - ./certs:/certs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+      COORDINATOR_URL: https://coordinator:8443
+      ENROLLMENT_SECRET: ${ENROLLMENT_SECRET}
+    ports:
+      - "${DASHBOARD_PORT}:8444"
+    volumes:
+      - ./certs:/certs:ro
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      WORKER_LOOP_INTERVAL_SECONDS: 5
+      COORDINATOR_URL: https://coordinator:8443
+      ENROLLMENT_SECRET: ${ENROLLMENT_SECRET}
+    volumes:
+      - ./certs:/certs:ro
+      - worker-identity-data:/var/lib/worker-identity
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  worker-identity-data:

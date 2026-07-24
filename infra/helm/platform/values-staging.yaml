@@ -1,0 +1,18 @@
+# Staging overrides (Decision #40 — staging namespace) on AKS (Decision #57).
+# coordinator replicas: 2 (D-D) so pod-delete-reschedule, rolling upgrade,
+# and the PodDisruptionBudget are actually demonstrable. HONEST CEILING
+# (CLAUDE.md §10): both replicas land on the single node — this proves the
+# reschedule/rolling-upgrade MECHANICS, not true multi-node HA. Real HA
+# needs >1 node = more student credit; deferred.
+coordinator:
+  # image.tag MUST be set to the pushed commit SHA at deploy time, e.g.
+  #   helm upgrade ... --set coordinator.image.tag=$(git rev-parse --short HEAD)
+  hpa:
+    # minReplicas MUST be 2 here: the HPA governs the replica count once it
+    # exists, so a floor of 1 lets it scale D-D's two replicas back down to
+    # one and defeats the HA / rolling-upgrade / PDB demo. Bounded above by
+    # single node + namespace quota.
+    minReplicas: 2
+    maxReplicas: 2
+config:
+  logLevel: DEBUG

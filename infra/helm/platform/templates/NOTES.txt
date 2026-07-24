@@ -1,0 +1,18 @@
+Platform deployed to namespace: {{ .Release.Namespace }}  (AKS, Decision #57)
+
+Watch rollout:
+  kubectl -n {{ .Release.Namespace }} get pods -w
+
+Reach the coordinator from a worker on THIS laptop (cert SANs cover
+localhost/127.0.0.1). NOTE: port-forward reaches the cluster only from the
+machine running it — a worker on a DIFFERENT Internet connection needs the
+public ingress from Step 1.5.5, not this.
+  kubectl -n {{ .Release.Namespace }} port-forward svc/coordinator 8443:8443
+  # then point a worker at https://localhost:8443
+
+Open the dashboard:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/dashboard 8444:8444
+  # then https://localhost:8444
+
+Public ingress (a real hostname + TLS, reachable from any Internet) is
+Step 1.5.5, not this chart.

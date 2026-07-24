@@ -1,0 +1,167 @@
+name: CI
+
+# Phase 1.5.3 — CI pipeline, rebuilt for the Azure/AKS method (Decision #57).
+# Jobs run in parallel; wall-clock target < ~8 min (documented duration,
+# Step 1.5.3 exit criterion). Caching: pip (setup-python) + Docker layer
+# cache (buildx gha). A concurrency group cancels superseded runs per ref.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Lint
+        run: uv run --with ruff ruff check coordinator worker dashboard protocol tests
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: coordinator
+          POSTGRES_PASSWORD: ci-pass
+          POSTGRES_DB: coordinator
+        options: >-
+          --health-cmd "pg_isready -U coordinator -d coordinator"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+        ports:
+          - 6379:6379
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: coordinator
+      POSTGRES_PASSWORD: ci-pass
+      POSTGRES_DB: coordinator
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      ENROLLMENT_SECRET: ci-enrollment-secret
+      CREDENTIAL_PEPPER: ci-credential-pepper
+      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/coordinator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r coordinator/requirements.txt -r requirements-dev.txt
+      - name: Run tests (unit + integration against ephemeral Postgres/Redis)
+        run: pytest -q
+
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io on merge to main
+    strategy:
+      matrix:
+        service: [coordinator, dashboard, worker]
+    env:
+      # ghcr.io owner is lowercased (Decision #45/#65); must match the
+      # image repositories in infra/helm/platform/values*.yaml.
+      IMAGE_PREFIX: ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system
+      # Push only when merging to main; PR/feature runs build-only.
+      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to ghcr.io
+        if: ${{ env.PUSH == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (and push on main) — SHA-tagged, never only :latest
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.service }}/Dockerfile
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip-audit — dependency vulnerabilities (fails on a known-vulnerable dep)
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r coordinator/requirements.txt
+          pip-audit -r dashboard/requirements.txt
+          pip-audit -r worker/requirements.txt
+      - name: Trivy filesystem scan (report-only — base-image CVEs shouldn't block merge)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/repo" aquasec/trivy:latest fs \
+            --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 0 /repo
+
+  terraform:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: infra/terraform
+    env:
+      TF_CLOUD_ORGANIZATION: DATA_CLEANING_DISTRIBUTED_SYS
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+      # azurerm auth for a real `plan` (Decision #57). Set as repo secrets
+      # from a service principal scoped to the resource group. Without them
+      # the plan step is skipped and only fmt/validate run.
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Format check
+        run: terraform fmt -check -recursive
+      - name: Init (Terraform Cloud remote state)
+        if: ${{ env.TF_TOKEN_app_terraform_io != '' }}
+        run: terraform init -input=false
+      - name: Validate
+        if: ${{ env.TF_TOKEN_app_terraform_io != '' }}
+        run: terraform validate
+      # Real plan of the azurerm infra layer (resource group + AKS cluster),
+      # written to the PR's checks summary (exit criterion: "plan output
+      # appears on infrastructure pull requests"). Scoped with -target: the
+      # cluster is `az aks stop`'d between sessions to save credit, which
+      # deallocates the whole control plane, so its API FQDN doesn't resolve
+      # — the kubernetes/helm providers can't refresh from CI. Their plan is
+      # a local task run with the cluster started. CI never applies.
+      - name: Plan (azurerm infra layer)
+        if: ${{ env.ARM_CLIENT_ID != '' }}
+        run: |
+          set -o pipefail
+          echo '### Terraform plan (azurerm infra layer)' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          terraform plan -input=false -no-color -lock-timeout=120s \
+            -target=azurerm_resource_group.main \
+            -target=azurerm_kubernetes_cluster.main \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

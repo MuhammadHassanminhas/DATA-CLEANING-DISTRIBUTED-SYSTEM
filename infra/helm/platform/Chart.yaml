@@ -1,0 +1,10 @@
+apiVersion: v2
+name: platform
+description: >-
+  Coordinator + dashboard + in-cluster Postgres/Redis for the Distributed
+  Worker Network (Step 1.5.2). Workers are NOT packaged here — they run
+  outside the cluster by design (CLAUDE.md §3). Targets managed AKS
+  (Decision #57).
+type: application
+version: 0.1.0
+appVersion: "0.2.0"
