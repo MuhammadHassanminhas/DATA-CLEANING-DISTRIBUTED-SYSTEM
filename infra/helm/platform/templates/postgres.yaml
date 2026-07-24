@@ -1,6 +1,6 @@
-# Self-hosted Postgres (Decision #39): StatefulSet + headless-ish ClusterIP
-# Service. Single replica — no HA/backup by design at $0 (Decision #39's
-# documented limitation).
+# Self-hosted Postgres (Decision #39): StatefulSet + ClusterIP Service.
+# Single replica — no HA/backup by design at $0 (Decision #39's documented
+# limitation).
 apiVersion: v1
 kind: Service
 metadata:
@@ -54,6 +54,9 @@ spec:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]
+        {{- with .Values.postgres.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.postgres.storage }}

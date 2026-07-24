@@ -1,8 +1,9 @@
 # Creates the Secrets the platform chart references, in a target namespace,
-# from the gitignored .env and certs/ — for LOCAL dev only. Nothing here is
+# from the gitignored .env and certs/ — for bootstrap use. Nothing here is
 # committed to Git (CLAUDE.md §12). Production path is sealed-secrets
 # (kubeseal), controller already installed in Step 1.5.1 — wiring deferred
-# to the CI/CD phase (1.5.3/1.5.4).
+# to the CI/CD phase (1.5.3/1.5.4). Runs against whatever cluster kubectl's
+# current-context points at (AKS after `az aks get-credentials`).
 #
 # Usage:  ./bootstrap-secrets.ps1 -Namespace staging
 param(

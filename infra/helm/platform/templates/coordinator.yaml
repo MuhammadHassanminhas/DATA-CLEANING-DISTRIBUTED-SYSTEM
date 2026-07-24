@@ -8,18 +8,30 @@ kind: Deployment
 metadata:
   name: coordinator
 spec:
-  replicas: {{ .Values.coordinator.replicas }}
+  # No replicas field: the HorizontalPodAutoscaler below owns replica count.
+  # Setting it here fights kube-controller-manager's scale subresource
+  # (server-side-apply conflict) and lets the HPA floor override intent.
+  # The replica count is governed by hpa.minReplicas (see values-*.yaml).
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
+      # Replace-in-place (surge 0, unavailable 1), NOT surge-then-drain.
+      # The namespace limits.cpu=2 quota (1.5.1) can't fit a transient 3rd
+      # coordinator pod on top of two existing ones, so a maxSurge=1 rollout
+      # deadlocks. With 2 replicas + maxUnavailable=1, one replica keeps
+      # serving throughout (PDB minAvailable=1) — the fleet is never dropped.
+      maxUnavailable: 1
+      maxSurge: 0
   selector:
     matchLabels: { app: coordinator }
   template:
     metadata:
       labels: { app: coordinator }
     spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       initContainers:
         - name: wait-for-postgres
           image: {{ .Values.postgres.image }}

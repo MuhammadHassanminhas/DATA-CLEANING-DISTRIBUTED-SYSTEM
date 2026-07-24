@@ -1,8 +1,9 @@
-# Production overrides (Decision #40 — production namespace).
+# Production overrides (Decision #40 — production namespace) on AKS.
+# Same single-node cluster today; production HA remains bounded by node
+# count (see values-staging honest-ceiling note).
 coordinator:
-  replicas: 2
   hpa:
     minReplicas: 2
-    maxReplicas: 4
+    maxReplicas: 2
 config:
   logLevel: INFO

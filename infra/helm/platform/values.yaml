@@ -2,26 +2,38 @@
 # values-production.yaml. Secret VALUES are never here (CLAUDE.md §12) —
 # only the names of pre-created Secrets (see infra/helm/bootstrap-secrets.ps1).
 
+# Optional pull secrets for the container registry. Empty by default: the
+# ghcr.io packages are expected to be PUBLIC (no auth needed to pull). If a
+# package is made private, add a sealed dockerconfigjson Secret name here,
+# e.g. [{ name: ghcr-pull }].
+imagePullSecrets: []
+
 coordinator:
   image:
-    repository: coordinator
-    tag: local
-    pullPolicy: IfNotPresent   # images are k3d-imported locally (Decision B)
-  replicas: 1
+    # ghcr.io (Decision #45). Tag with the commit SHA, never :latest
+    # (Step 1.5.3 exit criterion). Overridden per-deploy in values-staging.
+    repository: ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system-coordinator
+    tag: latest
+    pullPolicy: IfNotPresent   # SHA tags are immutable; no need to re-pull
+  # replica count is owned by the HPA below (hpa.minReplicas), not a
+  # Deployment replicas field — see templates/coordinator.yaml.
   resources:
     requests: { cpu: 100m, memory: 128Mi }
-    limits: { cpu: 500m, memory: 256Mi }
+    # CPU limit kept at 300m so a maxSurge=1 rollout (a transient 3rd
+    # coordinator pod) stays within the namespace limits.cpu=2 quota
+    # (1.5.1): 3 pods*300m + dashboard/pg/redis 900m = 1800m <= 2000m.
+    limits: { cpu: 300m, memory: 256Mi }
   hpa:
     minReplicas: 1
-    maxReplicas: 4
+    maxReplicas: 2   # single B2s_v2 node + namespace quota (Decision #57)
     targetCPUUtilizationPercentage: 70
   pdb:
     minAvailable: 1
 
 dashboard:
   image:
-    repository: dashboard
-    tag: local
+    repository: ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system-dashboard
+    tag: latest
     pullPolicy: IfNotPresent
   replicas: 1
   resources:
@@ -31,6 +43,7 @@ dashboard:
 postgres:
   image: postgres:16-alpine
   storage: 1Gi
+  # storageClassName left unset → AKS default StorageClass (managed-csi).
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
@@ -46,8 +59,9 @@ config:
   postgresUser: coordinator
   postgresDb: coordinator
 
-# Names of Secrets created out-of-band (bootstrap script locally,
-# sealed-secrets in CI/CD). The chart references, never defines, them.
+# Names of Secrets created out-of-band (bootstrap script for now,
+# sealed-secrets in CI/CD Step 1.5.3/1.5.4). The chart references, never
+# defines, them.
 secretNames:
   app: app-secrets          # ENROLLMENT_SECRET, CREDENTIAL_PEPPER
   postgres: postgres-secret # POSTGRES_PASSWORD

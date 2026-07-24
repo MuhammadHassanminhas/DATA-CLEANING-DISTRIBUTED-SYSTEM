@@ -1,7 +1,7 @@
 # Non-secret env shared by coordinator + dashboard. Hosts/ports are
 # in-cluster service DNS names. RUN_MIGRATIONS_ON_STARTUP=false because
-# migrations run once in the coordinator initContainer (Decision #55),
-# not in every replica's boot.
+# migrations run once in the coordinator initContainer (Decision #55,
+# config.py:41), not in every replica's boot.
 apiVersion: v1
 kind: ConfigMap
 metadata:
