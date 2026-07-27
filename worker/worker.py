@@ -34,11 +34,12 @@ policy below.
 Phase 1.6: alongside the transport-level ping/pong keepalive, the
 worker now sends an application-level `heartbeat` envelope over the
 same socket every `WORKER_HEARTBEAT_INTERVAL_SECONDS`, carrying a
-sequence number, uptime, agent version, and CPU/memory read directly
-from `/proc/stat` and `/proc/meminfo` (stdlib only — no `psutil`
-dependency for two counters). These read host-level figures, not a
-container cgroup limit, which is deliberate: the Step 1.6 exit
-criterion asks for accuracy "against the host". The coordinator times
+sequence number, uptime, agent version, and CPU/memory read via
+`psutil` (cross-platform — Linux/Windows/macOS, so native non-Docker
+workers report real figures instead of blank; Step 1.5.8). These read
+host-level figures, not a container cgroup limit, which is deliberate:
+the Step 1.6 exit criterion asks for accuracy "against the host". The
+coordinator times
 SUSPECT/OFFLINE off its own receipt clock, not this envelope's
 `timestamp` field, so a skewed worker clock cannot affect the state
 machine (Decisions Log #6).
@@ -73,6 +74,8 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+
+import psutil
 
 try:  # POSIX (Docker/Linux/macOS worker)
     import fcntl
@@ -128,56 +131,26 @@ logger = logging.getLogger("worker")
 
 _lock_handle = None  # kept open for the process lifetime; see _acquire_single_instance_lock
 _process_start = time.monotonic()
-_last_cpu_sample: tuple[int, int] | None = None  # (idle_ticks, total_ticks) from the previous read
 
 
 def _read_cpu_percent() -> float | None:
-    """CPU usage since the previous call, from `/proc/stat`'s aggregate
-    `cpu` line — stdlib only, no `psutil`. Returns `None` on the first
-    call (nothing to delta against yet) and on any non-Linux host."""
-    global _last_cpu_sample
+    """Host CPU usage since the previous call, via `psutil` (Linux/
+    Windows/macOS). Non-blocking (`interval=None`): the first call
+    returns 0.0, later calls the delta. `None` only if psutil errors."""
     try:
-        with open("/proc/stat") as f:
-            first_line = f.readline()
-    except OSError:
+        return round(psutil.cpu_percent(interval=None), 1)
+    except Exception:
         return None
-    parts = first_line.split()
-    if len(parts) < 5 or parts[0] != "cpu":
-        return None
-    values = [int(v) for v in parts[1:]]
-    idle = values[3] + (values[4] if len(values) > 4 else 0)  # idle + iowait
-    total = sum(values)
-    previous = _last_cpu_sample
-    _last_cpu_sample = (idle, total)
-    if previous is None:
-        return None
-    prev_idle, prev_total = previous
-    delta_total = total - prev_total
-    if delta_total <= 0:
-        return None
-    return round((1 - (idle - prev_idle) / delta_total) * 100, 1)
 
 
 def _read_memory_percent() -> float | None:
-    """Memory usage from `/proc/meminfo`'s MemTotal/MemAvailable — reads
-    the host's real figures (not a container cgroup limit), which is
-    what the Step 1.6 exit criterion ("accurate against the host") asks
-    for."""
+    """Host memory usage via `psutil` — real host figures, not a
+    container cgroup limit, which is what the Step 1.6 exit criterion
+    ("accurate against the host") asks for."""
     try:
-        with open("/proc/meminfo") as f:
-            lines = f.readlines()
-    except OSError:
+        return round(psutil.virtual_memory().percent, 1)
+    except Exception:
         return None
-    values: dict[str, int] = {}
-    for line in lines:
-        key, _, rest = line.partition(":")
-        if key in ("MemTotal", "MemAvailable"):
-            values[key] = int(rest.strip().split()[0])
-    total = values.get("MemTotal")
-    available = values.get("MemAvailable")
-    if not total or available is None:
-        return None
-    return round((1 - available / total) * 100, 1)
 
 
 def _log(event: str, **fields: object) -> None:
