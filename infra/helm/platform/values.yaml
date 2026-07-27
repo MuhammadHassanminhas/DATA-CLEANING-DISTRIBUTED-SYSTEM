@@ -72,6 +72,13 @@ ingress:
   basicAuthSecret: dashboard-basic-auth # pre-created htpasswd Secret (bootstrap)
   limitRps: 5                           # edge rate limit on coordinator paths
 
+# Observability (Step 1.5.6). When true, the chart emits a ServiceMonitor
+# (coordinator /metrics scrape) and a PrometheusRule (alerts). Both need the
+# Prometheus Operator CRDs installed cluster-wide by Terraform
+# (observability.tf). Disabled by default; staging turns it on.
+observability:
+  enabled: false
+
 # Names of Secrets created out-of-band (bootstrap script for now,
 # sealed-secrets in CI/CD Step 1.5.3/1.5.4). The chart references, never
 # defines, them.

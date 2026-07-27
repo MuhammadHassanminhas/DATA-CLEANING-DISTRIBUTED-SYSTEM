@@ -41,6 +41,7 @@ from app.config import (
 )
 from app.db import engine, get_session
 from app.logging_config import configure_logging
+from app.metrics import MetricsMiddleware, metrics_endpoint
 from app.middleware import CorrelationIDMiddleware
 from app.models import Worker
 from app.redis_client import redis_client
@@ -115,6 +116,12 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(title="Coordinator", version="0.2.0", lifespan=lifespan)
 app.add_middleware(CorrelationIDMiddleware)
+app.add_middleware(MetricsMiddleware)
+
+# Prometheus scrape target (Step 1.5.6). Unauthenticated — exposes only
+# aggregate operational counters, never worker credentials or tokens, and
+# is reachable in-cluster by Prometheus (not via the public ingress route).
+app.add_api_route("/metrics", metrics_endpoint, methods=["GET"], include_in_schema=False)
 
 
 @app.get("/")

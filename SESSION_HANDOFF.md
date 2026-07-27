@@ -8,9 +8,247 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## 2026-07-23 — LATEST: local k3d + Cloudflare Tunnel DECIDED, build-ready
+## 2026-07-27 (session 3) — LATEST: Step 1.5.6 built + stack LIVE, mid-verification
 
-Read this first; the GCP/OCI narrative below it is superseded history.
+Read first. **Step 1.5.6 (Observability) — IN PROGRESS, NOT DONE.**
+
+**Built + committed** (Decisions #71–#72): coordinator `/metrics` (prometheus-client),
+`infra/terraform/observability.tf` (kube-prometheus-stack + Loki + Alloy), node_count
+1→2, platform-chart `observability.enabled` + ServiceMonitor + PrometheusRule,
+`infra/apply-observability.ps1` runner, bootstrap extended.
+
+**LIVE on AKS:** ran `apply-observability.ps1` → 2 nodes, all 9 observability pods
+Running (Prometheus/Grafana/Alertmanager/Loki/Alloy×2/KSM/operator/node-exp×2).
+Two live fixes this session: (a) PowerShell 5.1 splits `terraform -target=...` on the
+`=` → quote it (`"-target=..."`); (b) Alertmanager stuck `undefined receiver "null"` —
+the chart keeps a Watchdog child-route to a `null` receiver my `alertmanager.config`
+didn't define; fixed in observability.tf (added `null` receiver + Watchdog route) and a
+re-apply's `helm upgrade` brought Alertmanager `READY 1`. NOTE: helm `--wait` does NOT
+wait on the operator-created Alertmanager/Prometheus statefulsets, so the first apply went
+"green" while Alertmanager was still broken — check the CR (`kubectl get alertmanager -n
+observability`) not just the apply exit.
+
+**Discord webhook** in `.env` as `ALERTMANAGER_WEBHOOK_URL` (Discord URL + `/slack`).
+Grafana admin creds in `.env`. Alert secret mounted; delivery not yet demoed.
+
+### Verification gap → why staging is being redeployed
+The published coordinator image (`69028dee`, from 1.5.5) has NO `/metrics`. This session's
+coordinator change is only live once CI builds a new image and CD deploys staging. So:
+committed 1.5.6 → PR → merge to main → CI builds `/metrics` image → CD auto-deploys staging
+(brings up coordinator×2 + dashboard + pg + redis + the ServiceMonitor/PrometheusRule).
+**Watch node capacity:** 2× B2s_v2 with production full stack + observability may not fit
+staging's full stack — scale production down (as in 1.5.5) if staging pods go Pending.
+
+### 6 exit criteria — status
+Stack up but NONE formally demoed yet. Need (after staging is on the new SHA):
+1 fleet dashboard · 2 correlation-ID trace across coordinator replicas in Loki ·
+3 kill coordinator → CoordinatorDown alert reaches Discord · 4 auth-spike alert (author a
+LogQL alert in Grafana over `*_rejected`) · 5 retention documented=72h (done in config) ·
+6 no secrets in Loki logs (query).
+
+### Cluster state
+Node RUNNING (billing) — `az aks stop -g data-cleaning-distributed-system-rg -n
+data-cleaning-distributed-system` when done. Production still up on `69028dee`.
+
+### Next step
+Wait for CI/CD to deploy staging, confirm Prometheus scrapes the coordinator target UP,
+then walk the 6 criteria. Then user approval → mark 1.5.6 DONE.
+
+---
+
+## 2026-07-27 (session 2): production redeployed to SHA `69028dee`
+
+Read this first. Between-phase maintenance action, NOT a new phase. 1.5.5
+stays DONE; 1.5.6 still NOT STARTED (do not start without user go-ahead).
+
+**What happened:** production had been stuck on old SHA `0df7e206` while
+staging was on `69028dee`. The CD run `30099341845` (from 2026-07-24) sat 62h
+in the `production` approval gate. This session pushed production up to date.
+
+**Path taken (all approved by user in-session):**
+1. `az aks start` (node was stopped) + `az aks get-credentials`.
+2. Scaled staging fully to 0 (coordinator/dashboard/redis/demo-worker deploys
+   + postgres statefulset) and **deleted the staging coordinator HPA** — the
+   single B2s_v2 can't hold both full stacks + ingress controllers, so staging
+   made room for production's 2-replica stack.
+3. First production deploy FAILED — helm SSA conflict: the prod coordinator
+   HPA `.spec.minReplicas` was owned by field manager `kubectl-patch` (from the
+   1.5.5 manual `kubectl patch` that scaled prod down 2→1). Helm wanted `min=2`
+   and refused to override. **Fix = `kubectl -n production delete hpa
+   coordinator`, then re-run the CD job** (user ran both — a permission
+   classifier blocks destructive prod kubectl/gh from the agent).
+4. Re-run + re-approve → deploy GREEN. helm recreated the HPA clean at min=2.
+
+**Verified live in-cluster (read-only):** prod `/health` version=
+`69028dee1613923daed0c5da2fe4970ffd586e1f` (matches target), `/ready`
+database+redis ok, 2 coordinators + dashboard + postgres + redis all `1/1`,
+HPA `2/2` at ~5% CPU. Nothing broke.
+
+**Cluster state at session end:**
+- **Node stopped by the user** (billing $0).
+- Production: full stack on `69028dee`, HPA min=2 (stale min=1 conflict gone).
+- Staging: all deploys at 0, postgres statefulset 0, **staging coordinator HPA
+  DELETED** — both restore on the next staging helm/CD deploy. Config + PVCs
+  intact; not a data loss.
+- `demo-worker` staging at 0.
+
+**Gotcha for next time (SSA field-manager conflict):** any time you `kubectl
+patch`/`scale` a helm-managed HPA by hand, you hand `minReplicas` ownership to
+a non-helm field manager, and the next `helm upgrade` fails with a conflict on
+that field. Cleanest fix is to delete the object so helm recreates+owns it. The
+staging coordinator HPA was already deleted this way in 1.5.5 for the same
+reason — prefer scaling the underlying Deployment or setting values +
+`helm upgrade` over ad-hoc `kubectl patch` on helm-owned objects.
+
+**Uncommitted:** `PHASE_STATE.md` + `SESSION_HANDOFF.md` doc edits on branch
+`phase-1.5.5-ingress-tls-dns` (local, this wrap-up + the 2026-07-27 session-1
+edits). No commit requested. Untracked, intentional: `.claude.backup/`,
+`.playwright-mcp/`, `demo-worker.yaml`.
+
+### Next step (unchanged)
+**Step 1.5.6 — Observability stack — NOT STARTED.** Open its short design
+sub-gate (§9), get user approval, then build. Resume commands (cluster up,
+endpoint check, secrets) in the 2026-07-24 section below. When resuming
+staging, its coordinator HPA + workloads come back on the next helm/CD deploy.
+
+---
+
+## 2026-07-27 (session 1) — Step 1.5.5 DONE + APPROVED
+
+Everything below (2026-07-24, k3d/Cloudflare, GCP/OCI) is
+superseded history — compute host has been Microsoft Azure / AKS since #57.
+
+**Step 1.5.5 (Public ingress, TLS, DNS) — DONE, user-APPROVED 2026-07-27.**
+Final SHA `69028dee1613923daed0c5da2fe4970ffd586e1f`.
+
+All 6 exit criteria met. The 2 that were outstanding on 2026-07-24 closed
+this session:
+- ✅ **3 soak** — re-run this session on the published worker image via the
+  public ingress. **Duration reduced 60-min→2-min by explicit user direction**
+  (recorded in PHASE_STATE as a user scope call, same family as the 50-worker
+  substitutions #34–35). Worker held `session_epoch: 1`, no reconnect, ONLINE,
+  uptime 176.7s, 77.7ms latency. PASS.
+- ✅ **6 second-network worker** — user ran the worker on a separate PC on a
+  different network; connected successfully through the public ingress. The
+  "AWS IP" the user mentioned = just the public AKS ingress FQDN, not a
+  separate resource.
+
+PHASE_STATE updated: 1.5.5 register row → DONE; "Real Internet Workers
+Verified" table now has 2 entries (laptop Docker soak, second PC).
+
+### State at session end
+- **Node is `az aks stop`'d** — billing $0. `az aks start` to resume.
+- Production still scaled DOWN (coordinator HPA min 2→1, dashboard/redis/
+  postgres→0) + staging `demo-worker` 5→1 from 2026-07-24, to fit the ingress
+  controllers on the single B2s_v2 node. Reversible via next CD/helm.
+- **Uncommitted:** `PHASE_STATE.md` + `SESSION_HANDOFF.md` doc edits on branch
+  `phase-1.5.5-ingress-tls-dns` (local). User did not request a commit this
+  session. Untracked, intentional: `.claude.backup/`, `.playwright-mcp/`,
+  `demo-worker.yaml`.
+
+### Next step
+**Step 1.5.6 — Observability stack — NOT STARTED.** Open its short design
+sub-gate (§9) first, get user approval, then build. Do NOT start without the
+user's go-ahead (guardrails). Resume commands (cluster up, endpoint check,
+secrets) are in the 2026-07-24 section below — unchanged.
+
+---
+
+## 2026-07-24 (evening) — Step 1.5.5 built + LIVE, mid-verification (SUPERSEDED by 2026-07-27 above)
+
+Compute host has been Microsoft Azure / AKS since Decision #57.
+
+**Phase: Step 1.5.5 (Public ingress, TLS, DNS) — IN PROGRESS, NOT DONE.**
+Built and applied live on AKS. 4 of 6 exit criteria objectively met; 2
+outstanding (both need real elapsed time / a second machine, not more code).
+
+### What is live right now
+- Staging is PUBLIC at **https://dcds-staging.centralindia.cloudapp.azure.com**
+  (static IP **4.240.120.113**, real Let's Encrypt cert). ingress-nginx +
+  cert-manager + a Terraform-owned public IP with the free cloudapp FQDN.
+- Design + build recorded in **Decisions #69 (gate)** and **#70 (build)**.
+- PR #7 **merged to main**; CI published images at SHA **69028dee1613923daed0c5da2fe4970ffd586e1f**
+  (the worker image at this SHA HAS the system-CA fix); CD auto-deployed
+  staging to that SHA (`/health` returns it).
+
+### Exit criteria status (the whole point of resuming)
+- ✅ 1 coordinator public + valid LE cert (`/health`=200, deployed SHA)
+- ✅ 2 dashboard public + protected (401 anon / 200 basic-auth)
+- ✅ 4 cert renewal proven (deleted secret → cert-manager reissued)
+- ✅ 5 edge rate-limit blocks register flood (6th+ request → 429)
+- ⏳ 3 **60-min soak**: worker `dcds-ext-worker` (Docker on the laptop, the
+  PUBLISHED image) connected through the ingress at **14:05:33Z**, was still
+  `session_epoch: 1` (no reconnect) at 14:26Z. **Verify at ≥15:05:33Z** with
+  `docker logs dcds-ext-worker | tail -3` — same epoch, no new
+  "registered"/"ws_connected" = survived = criterion met. (If the node was
+  stopped or the container removed before 60 min elapsed, RE-RUN the soak
+  tomorrow — see resume commands.)
+- ⏳ 6 **second-network worker**: run the worker on a DIFFERENT PC on a
+  mobile hotspot AND a corporate network. The public network path is already
+  proven working (a test from another PC reached the coordinator and got a
+  401 — that 401 was a mistyped enrollment secret, capital-L "enroLlment",
+  NOT a network failure). Correct command below.
+
+### CRITICAL state notes for resume
+- **The AKS node may still be RUNNING** (billing) — user was ending the day.
+  If the soak finished, run `az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system`.
+- **Production was scaled DOWN** to free CPU (coordinator HPA min 2→1,
+  dashboard/redis/postgres →0) so the ingress controllers could schedule on
+  the single B2s_v2 node. Reversible — the next CD deploy / `helm upgrade`
+  restores it. Not a defect; the node just can't hold both full stacks +
+  the controllers at once.
+- `demo-worker` in staging scaled 5→1 (leftover deployment, `demo-worker.yaml`
+  is untracked in the repo).
+- **1.5.5 is NOT marked DONE** in the Phase Register — needs criteria 3+6
+  confirmed and explicit user approval (§15). When both are confirmed, flip
+  the register row to DONE and note the final SHA.
+
+### Resume commands (tomorrow)
+```
+# bring cluster up (interactive az login if needed)
+az aks start -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+az aks get-credentials -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+
+# confirm public endpoint back up (may take 1-2 min after node start)
+curl -s https://dcds-staging.centralindia.cloudapp.azure.com/health
+
+# criterion 3 — (re)start the 60-min soak if needed, then check an hour later
+docker run -d --name dcds-ext-worker --rm=false \
+  -e COORDINATOR_URL=https://dcds-staging.centralindia.cloudapp.azure.com \
+  -e WORKER_CA_FILE= -e ENROLLMENT_SECRET=dev-enrollment-secret-6f3a1c \
+  ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system-worker:69028dee1613923daed0c5da2fe4970ffd586e1f
+# ...60 min later:  docker logs dcds-ext-worker | tail -3   (epoch still 1 = pass)
+
+# criterion 6 — on a SEPARATE PC on a different network (copy exactly, do not retype):
+docker run --rm -e COORDINATOR_URL=https://dcds-staging.centralindia.cloudapp.azure.com -e WORKER_CA_FILE= -e ENROLLMENT_SECRET=dev-enrollment-secret-6f3a1c ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system-worker:69028dee1613923daed0c5da2fe4970ffd586e1f
+```
+Enrollment secret = `dev-enrollment-secret-6f3a1c` (all lowercase).
+Dashboard basic-auth login = `operator` / `D68y1YIA6v9rF3g` (in .env).
+
+### Terraform / secrets gotchas (so they don't bite again)
+- `TF_CLOUD_ORGANIZATION=DATA_CLEANING_DISTRIBUTED_SYS` is now saved in
+  `.env` (was lost as a shell-only var last time). Terraform apply needs:
+  `ARM_SUBSCRIPTION_ID=6a171ca5-3089-48d7-98a8-caec998fa574`,
+  `TF_TOKEN_app_terraform_io=$TF_API_TOKEN`, `TF_CLOUD_ORGANIZATION` — all
+  from `.env`. Workspace runs in LOCAL execution (uses `az` CLI creds).
+- `bootstrap-secrets.ps1`'s `openssl passwd` step fails in Windows
+  PowerShell (openssl is on git-bash PATH, not PS). The
+  `dashboard-basic-auth` htpasswd Secret was created from git-bash instead.
+  `.env` now has `DASHBOARD_USER`/`DASHBOARD_PASSWORD`.
+
+### Uncommitted at session end
+`worker/worker.py` and the 1.5.5 infra ARE committed + merged (PR #7).
+Only `PHASE_STATE.md` / `SESSION_HANDOFF.md` doc edits from this wrap-up may
+be uncommitted on branch `phase-1.5.5-ingress-tls-dns` (local). Untracked,
+intentionally not committed: `.claude.backup/`, `.playwright-mcp/`,
+`demo-worker.yaml`.
+
+---
+
+## 2026-07-23 — local k3d + Cloudflare Tunnel (SUPERSEDED by Azure #57)
+
+Historical. The compute host is Azure / AKS now; ignore the k3d/Cloudflare
+plan below except as decision history.
 
 - **Compute host decided = local Kubernetes via k3d** (k3s-in-Docker,
   real CNCF K8s on the user's PC, $0) — Decisions Log #53, resolving the
