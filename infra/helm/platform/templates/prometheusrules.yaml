@@ -2,6 +2,10 @@
 # Step 1.5.6 metric-based alerts. These fire from Prometheus and route to
 # the Discord/Slack webhook wired in Alertmanager (observability.tf).
 #
+# Every alert carries `team: dcds` so Alertmanager routes ONLY our alerts to
+# the chat receiver — the generic kube-prometheus built-in alerts stay muted
+# instead of spamming the channel (observability.tf route + Step 1.5.6 #7).
+#
 # NOT declared here (added in Grafana at demo time, both log-derived):
 #   - auth-failure spike: a LogQL count over the `*_rejected` events the
 #     coordinator already logs (§11), via the Loki datasource.
@@ -17,22 +21,26 @@ spec:
     - name: coordinator.rules
       rules:
         # up{} comes from the ServiceMonitor scrape target being reachable.
+        # `absent(...)` is essential: when every replica is gone the series
+        # disappears entirely, so `max(up)==0` alone never fires (an empty
+        # vector is not 0). absent() covers exactly the "all replicas down or
+        # unreachable" case the summary names (Step 1.5.6 C3).
         - alert: CoordinatorDown
-          expr: max(up{service="coordinator"}) == 0
+          expr: (absent(up{service="coordinator"}) == 1) or (max(up{service="coordinator"}) == 0)
           for: 1m
-          labels: { severity: critical }
+          labels: { severity: critical, team: dcds }
           annotations:
             summary: "Coordinator is not scrapeable (all replicas down or unreachable)."
         - alert: DatabaseDown
           expr: max(coordinator_dependency_up{dependency="database"}) == 0
           for: 2m
-          labels: { severity: critical }
+          labels: { severity: critical, team: dcds }
           annotations:
             summary: "Coordinator cannot reach Postgres."
         - alert: RedisDown
           expr: max(coordinator_dependency_up{dependency="redis"}) == 0
           for: 2m
-          labels: { severity: critical }
+          labels: { severity: critical, team: dcds }
           annotations:
             summary: "Coordinator cannot reach Redis."
         # Fleet drop: connected workers fell sharply vs 10 min ago. Threshold
@@ -40,14 +48,14 @@ spec:
         - alert: WorkerFleetDrop
           expr: max(coordinator_workers_connected) < 0.5 * max(coordinator_workers_connected offset 10m)
           for: 5m
-          labels: { severity: warning }
+          labels: { severity: warning, team: dcds }
           annotations:
             summary: "Connected worker count dropped by more than half in 10 minutes."
         # cert-manager exports this; alerts before Let's Encrypt renewal.
         - alert: CertificateNearExpiry
           expr: (certmanager_certificate_expiration_timestamp_seconds - time()) < 7 * 24 * 3600
           for: 1h
-          labels: { severity: warning }
+          labels: { severity: warning, team: dcds }
           annotations:
             summary: "A managed TLS certificate expires in under 7 days."
 {{- end }}
