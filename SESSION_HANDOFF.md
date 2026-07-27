@@ -8,7 +8,107 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## 2026-07-27 (session 3) — LATEST: Step 1.5.6 built + stack LIVE, mid-verification
+## 2026-07-27 (session 5) — LATEST: Step 1.5.7 BUILT + VERIFIED LIVE, awaiting approval
+
+**Step 1.5.7 (Coordinator horizontal scaling proof) — all 6 exit criteria met live on
+AKS staging; APPROVED by user 2026-07-27. Committed on branch `phase-1.5.7-scaling-proof`.**
+Design gate = Decision #75.
+Almost no new code — it proves invariant §3.9, already built (#19/#29/#30).
+
+**What changed:**
+- `infra/terraform/variables.tf` — `namespace_quota` raised (limits.cpu 2→3, limits.memory
+  2Gi→3Gi, requests 1→1.5 / 1Gi→1.5Gi). Option **A2** (user's pick): keep the 300m coordinator
+  CPU limit, raise the quota instead. Applied via `terraform apply -target=kubernetes_resource_quota.env`
+  (3 in-place). **The user ran the apply by hand** — `terraform apply` is blocked from the agent
+  by the auto-mode classifier.
+- `infra/helm/platform/values-staging.yaml` — coordinator HPA min 2→3, max 2→5. Deployed with
+  a local `helm upgrade --install platform ... --set coordinator.image.tag=b1963f90… --set dashboard.image.tag=b1963f90… --atomic` (image tag preserved).
+- `infra/loadtest-coordinator.yaml` — NEW versioned synthetic-load Job (§7): floods
+  `coordinator:8443/ready` (in-cluster, bypasses the ingress edge `limit-rps`) with fresh-TLS
+  connections. **Option B1** — synthetic HTTP load, honest ceiling (no M2 task pipeline yet).
+
+**Verified live (all objective, via kubectl + per-replica `/workers` queries):**
+1. 3 replicas serve one fleet (across both nodes). 2. Distribution — 6 workers reconnected,
+each of 3 replicas served distinct `worker_id`s (per-pod logs). 3. Killed `fqjnv` (4 workers) →
+reconnect to survivors + replacement pod → `connected` back to 6 in ~30s. 4. Load → HPA
+**191%/70% → 3→5**; load ends → CPU 3% → held 5 through ~5-min scaleDown window → **5→3** at
+15:16:51. 5. `/workers` from **every** replica identical (`total=37 connected=6 online=6`).
+6. Killed all 3 originals in turn → fleet unchanged every time (§3.9, no in-memory authoritative state).
+
+**Gotchas this session:**
+- `terraform apply` **and** destructive/`kubectl delete` on prod are blocked by the classifier;
+  staging pod-delete/scale went through the agent's PowerShell fine. Quota apply = user-run.
+- The `!` prompt shell and the Bash tool are a **minimal sandbox bash with no sed/grep/terraform/kubectl
+  and no Windows PATH** — all `az`/`kubectl`/`helm`/`terraform` must go through the **PowerShell** tool.
+- First load Job was quota-rejected (800m limit + 2400m used > 3000m) — dropped the load pod to 400m
+  and demo-workers to 1 so the HPA could still reach 5 while the load pod ran.
+- `/ready` is ~700ms/call (DB+Redis+TLS each hit) so it's genuinely CPU-heavy — 80 concurrent
+  fresh-TLS floods easily crossed the 70% target.
+- To query a pod's `/workers` (needs `x-admin-secret`), `kubectl exec ... python -c` with the
+  script **base64-encoded** avoids all the PowerShell/quote breakage.
+
+**State at session end:** node RUNNING (user to `az aks stop`). Staging coordinator HPA back at
+3 (min), load Job deleted, demo-worker at 1, quota 1900m/3000m. Config changes **uncommitted**
+(no commit requested). Loose end from 1.5.6 (#7 alert route) still committed-not-applied — user
+said leave Discord alerts as-is, so untouched.
+
+**Next step (after approval): Step 1.5.8 — Real Internet worker onboarding — NOT STARTED.**
+Do NOT start without user go-ahead.
+
+---
+
+## 2026-07-27 (session 4) — Step 1.5.6 VERIFIED + APPROVED DONE
+
+**Step 1.5.6 (Observability) — DONE, user-APPROVED 2026-07-27.** Final SHA
+`b1963f90d53066a836248e11be231286893670aa`. All 6 exit criteria verified live on
+AKS staging (full detail in PHASE_STATE Decision #74 + the 1.5.6 register row).
+
+**What this session did:** started the node, walked the 6 criteria. C1/C4/C5/C6
+passed as-is. Verification found **two real gaps + the noise item**, fixed in
+**PR #9** (merged to main; CI green incl. tests; CD deployed staging on `b1963f90`):
+- **C2** — WS heartbeat/session logs had `correlation_id="-"`; worker minted a
+  fresh random id per envelope. Fix: worker mints ONE session id/connection, sends
+  `X-Correlation-ID` on token-refresh + in hello/heartbeat/pong; coordinator binds
+  `hello.correlation_id` to the WS coroutine contextvar. Verified: session
+  `beed3ee8` traced by one id across BOTH replicas (HTTP leg on `q4skv`, WS leg on
+  `jgbvf`). (`worker/worker.py`, `coordinator/app/main.py`)
+- **C3** — `CoordinatorDown` expr `max(up)==0` can't fire when all pods are gone
+  (empty vector ≠ 0). Fix: `absent(up{...})==1 or max(up{...})==0`
+  (`prometheusrules.yaml`). Verified: scaled coordinator→0 → firing at ~90s →
+  Alertmanager `receiver=chat` (Discord) → resolved on recovery.
+
+**LOOSE END — #7 (quiet built-in alert noise) is committed but NOT applied live.**
+Every platform alert now labelled `team: dcds`; Alertmanager default receiver →
+`null`, only `team=dcds` → chat (in `observability.tf` + `prometheusrules.yaml`,
+both merged in PR #9). Pushing it needs a `terraform apply` on the
+kube-prometheus-stack release — the user's full `apply-observability.ps1` was
+killed mid-session. To apply just this, run **`infra/apply-alertmanager-route.ps1`**
+(untracked helper — targeted `terraform apply -target=helm_release.kube_prometheus_stack`,
+~1-2 min). Until then Alertmanager still sends the noisy kube-prometheus built-ins
+to Discord. NOT an exit criterion; do it whenever.
+
+**State at session end:**
+- Node was **RUNNING** at approval (user was going to `az aks stop` — confirm it's
+  stopped, billing). Staging: 2 coordinators + 2 demo-workers + dashboard + pg +
+  redis on `b1963f90`. Production untouched (`69028dee`; PR #9's CD prod gate is
+  waiting/unapproved — leave it or approve as a maintenance step).
+- **Uncommitted/untracked:** the three verification screenshots in repo root
+  (`c1-fleet-dashboard.png`, `c2-correlation-across-replicas.png`,
+  `c4-authspike-firing.png`), `infra/apply-alertmanager-route.ps1`,
+  `PHASE_STATE.md` + this file's doc edits, plus the pre-existing `.claude.backup/`,
+  `.playwright-mcp/`, `demo-worker.yaml`. No commit of these requested.
+- Grafana fleet dashboard `fleet-15-6` + the `AuthFailureSpike` Loki alert rule
+  were created live in Grafana this session (in-cluster only, reachable via
+  `kubectl -n observability port-forward svc/kube-prometheus-stack-grafana 3000:80`;
+  admin creds in `.env`).
+
+**Next step: Step 1.5.7 — Coordinator horizontal scaling proof — NOT STARTED.**
+Open its short design sub-gate (§9), get user approval, then build. Optionally
+first apply the #7 route + approve the prod CD gate as quick maintenance.
+
+---
+
+## 2026-07-27 (session 3) — Step 1.5.6 built + stack LIVE, mid-verification
 
 Read first. **Step 1.5.6 (Observability) — IN PROGRESS, NOT DONE.**
 

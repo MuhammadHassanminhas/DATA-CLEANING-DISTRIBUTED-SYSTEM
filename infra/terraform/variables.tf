@@ -58,11 +58,17 @@ variable "namespace_quota" {
     limits_memory   = string
     pods            = string
   })
+  # Raised for Step 1.5.7 (user-approved 2026-07-27, option A2): the
+  # horizontal-scaling proof runs the coordinator at HPA min=3/max=5 (@300m
+  # limit) alongside dashboard/pg/redis/demo-workers — 5*300m=1500m of
+  # coordinator alone no longer fits the old 2-core limit. Bound is now the
+  # 2-node * 1900m allocatable, not this quota. Applies to both namespaces;
+  # production is scaled down so its share is unused headroom.
   default = {
-    requests_cpu    = "1"
-    requests_memory = "1Gi"
-    limits_cpu      = "2"
-    limits_memory   = "2Gi"
+    requests_cpu    = "1.5"
+    requests_memory = "1.5Gi"
+    limits_cpu      = "3"
+    limits_memory   = "3Gi"
     pods            = "30"
   }
 }

@@ -8,12 +8,13 @@ coordinator:
   # image.tag MUST be set to the pushed commit SHA at deploy time, e.g.
   #   helm upgrade ... --set coordinator.image.tag=$(git rev-parse --short HEAD)
   hpa:
-    # minReplicas MUST be 2 here: the HPA governs the replica count once it
-    # exists, so a floor of 1 lets it scale D-D's two replicas back down to
-    # one and defeats the HA / rolling-upgrade / PDB demo. Bounded above by
-    # single node + namespace quota.
-    minReplicas: 2
-    maxReplicas: 2
+    # Step 1.5.7 (horizontal-scaling proof): floor raised 2->3 so three
+    # replicas serve one fleet simultaneously (exit criterion 1); ceiling
+    # 2->5 gives the autoscaler real headroom to add pods under load and
+    # remove them after (exit criterion 4). Fits the raised namespace quota
+    # (limits.cpu=3, Terraform var namespace_quota) and the 2-node pool.
+    minReplicas: 3
+    maxReplicas: 5
 config:
   logLevel: DEBUG
 

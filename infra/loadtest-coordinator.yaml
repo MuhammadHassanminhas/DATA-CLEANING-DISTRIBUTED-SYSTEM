@@ -1,0 +1,65 @@
+# Step 1.5.7 — synthetic coordinator load, for the autoscale-under-load
+# exit criterion (4). Scripted + versioned per CLAUDE.md §7/§11.
+#
+# HONEST CEILING (§10): this is synthetic HTTP load, NOT real task load —
+# no task-distribution pipeline exists until M2. It drives coordinator CPU
+# by opening many short-lived HTTPS connections to /ready (each pays a fresh
+# TLS handshake + a DB+Redis readiness check), which is enough to cross the
+# HPA's 70%-of-request CPU target and prove the autoscaler MECHANIC. It
+# does not claim to model production task throughput.
+#
+# Hits the in-cluster Service (coordinator:8443) directly, NOT the public
+# ingress — so the edge limit-rps (Step 1.5.5) does not throttle it.
+#
+# Run:    kubectl -n staging apply -f infra/loadtest-coordinator.yaml
+# Watch:  kubectl -n staging get hpa coordinator -w
+# Remove: kubectl -n staging delete -f infra/loadtest-coordinator.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: coordinator-loadtest
+  namespace: staging
+  labels: { app: coordinator-loadtest }
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: { app: coordinator-loadtest }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: load
+          image: python:3.12-slim
+          env:
+            - { name: DURATION, value: "240" }   # seconds of load
+            - { name: CONC, value: "80" }         # concurrent connections
+            - { name: TARGET, value: "https://coordinator:8443/ready" }
+          command: ["python", "-c"]
+          args:
+            - |
+              import ssl, urllib.request, threading, time, os
+              ctx = ssl._create_unverified_context()
+              url = os.environ["TARGET"]
+              stop = time.time() + int(os.environ["DURATION"])
+              n = [0]
+              lock = threading.Lock()
+              def hammer():
+                  while time.time() < stop:
+                      try:
+                          # no keep-alive: a fresh connection (fresh TLS
+                          # handshake) per request maximizes coordinator CPU
+                          urllib.request.urlopen(url, context=ctx, timeout=5).read()
+                          with lock: n[0] += 1
+                      except Exception:
+                          pass
+              ts = [threading.Thread(target=hammer) for _ in range(int(os.environ["CONC"]))]
+              for t in ts: t.start()
+              for t in ts: t.join()
+              print("requests_ok=%d over %ss" % (n[0], os.environ["DURATION"]))
+          # limit kept low (400m) so the namespace quota (limits.cpu=3) still
+          # has room for the coordinator HPA to scale to 5 (5*300m) + the rest
+          # WHILE this load pod runs. The flooder is network-I/O bound, so
+          # 400m sustains plenty of concurrent fresh-TLS connections.
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { cpu: 400m, memory: 128Mi }
