@@ -31,28 +31,49 @@ observability`) not just the apply exit.
 **Discord webhook** in `.env` as `ALERTMANAGER_WEBHOOK_URL` (Discord URL + `/slack`).
 Grafana admin creds in `.env`. Alert secret mounted; delivery not yet demoed.
 
-### Verification gap → why staging is being redeployed
-The published coordinator image (`69028dee`, from 1.5.5) has NO `/metrics`. This session's
-coordinator change is only live once CI builds a new image and CD deploys staging. So:
-committed 1.5.6 → PR → merge to main → CI builds `/metrics` image → CD auto-deploys staging
-(brings up coordinator×2 + dashboard + pg + redis + the ServiceMonitor/PrometheusRule).
-**Watch node capacity:** 2× B2s_v2 with production full stack + observability may not fit
-staging's full stack — scale production down (as in 1.5.5) if staging pods go Pending.
+### Shipped to staging + verified
+PR #8 **merged to main**; CI built the `/metrics`-capable coordinator image at SHA
+**`bc2c02e59a54e23df95daaf8bc467ad5d8a77610`**; CD deployed staging to it. Verified live
+(read-only) before stopping the node:
+- staging coordinator = 2 pods Running on image `bc2c02e`.
+- **Prometheus scrapes both replicas `up=1`** (`serviceMonitor/staging/coordinator`, HTTPS
+  8443, insecureSkipVerify) — the `/metrics` pipeline works end to end.
+- **Alertmanager → Discord delivery PROVEN** — the kube-prometheus built-in alerts
+  (KubeHpaMaxedOut/KubeCPUOvercommit/KubeClientErrors) landed in Discord at ~11:53. Those
+  are noisy defaults, not our phase alerts (see "quiet the noise" below).
 
-### 6 exit criteria — status
-Stack up but NONE formally demoed yet. Need (after staging is on the new SHA):
-1 fleet dashboard · 2 correlation-ID trace across coordinator replicas in Loki ·
-3 kill coordinator → CoordinatorDown alert reaches Discord · 4 auth-spike alert (author a
-LogQL alert in Grafana over `*_rejected`) · 5 retention documented=72h (done in config) ·
-6 no secrets in Loki logs (query).
+### CD gotcha hit + fixed (leftover state, not a 1.5.6 bug)
+First CD run FAILED: smoke `kubectl exec deploy/coordinator` → "timed out waiting for the
+condition" because the staging coordinator Deployment was at **0/0**. Chain: the Deployment
+has no `replicas` field (HPA owns it, by design); session-2's manual scale-to-0 left it at
+0; **an HPA will not lift a workload off 0 replicas**; so `helm upgrade` kept 0 → no pod →
+smoke fails → CD rollback fired (`helm history` rev 12 = "Rollback to 10"). Fix that
+unstuck it: `kubectl -n staging scale deploy/coordinator --replicas=2` then re-run CD
+(`gh run rerun <id>`). If a future manual scale-to-0 recurs, same fix.
+
+### 6 exit criteria — status (stack proven, formal walkthrough pending)
+1 fleet dashboard — metrics ARE flowing (up=1); open Grafana + confirm a panel. 2
+correlation-ID trace across coordinator replicas in Loki — pending. 3 kill coordinator →
+CoordinatorDown alert to Discord — delivery path proven; fire OUR alert specifically. 4
+auth-spike alert — author a LogQL alert in Grafana over `*_rejected`. 5 retention=72h —
+done in config (Loki `retention_period`). 6 no secrets in Loki logs — run a query.
 
 ### Cluster state
-Node RUNNING (billing) — `az aks stop -g data-cleaning-distributed-system-rg -n
-data-cleaning-distributed-system` when done. Production still up on `69028dee`.
+**Node STOPPED (`az aks stop` done, billing $0).** `az aks start -g
+data-cleaning-distributed-system-rg -n data-cleaning-distributed-system` to resume, then
+`az aks get-credentials ...`. Production still on `69028dee`. Staging on `bc2c02e` with
+observability. 2-node pool (node_count=2) — dial back to 1 after M1.5 if credit tight.
+
+### Loose ends for next session
+- **Quiet the Discord noise:** built-in kube-prometheus alerts (esp. permanent
+  KubeHpaMaxedOut on the pinned prod HPA) spam Discord. Route only OUR PrometheusRule
+  alerts to the `chat` receiver; drop/inhibit the generic defaults. Small Alertmanager
+  route change + re-apply.
+- Then walk criteria 1–4/6, get user approval, mark 1.5.6 DONE.
 
 ### Next step
-Wait for CI/CD to deploy staging, confirm Prometheus scrapes the coordinator target UP,
-then walk the 6 criteria. Then user approval → mark 1.5.6 DONE.
+`az aks start` → confirm endpoints → quiet alert noise → walk the 6 criteria → user
+approval → 1.5.6 DONE.
 
 ---
 
