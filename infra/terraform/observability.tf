@@ -85,8 +85,13 @@ resource "helm_release" "kube_prometheus_stack" {
           requests: { cpu: 25m, memory: 64Mi }
           limits: { cpu: 100m, memory: 128Mi }
       config:
+        # Default receiver is `null`: the generic kube-prometheus built-in
+        # alerts (KubeHpaMaxedOut, KubeCPUOvercommit, ...) are noisy on a
+        # deliberately tiny single-pool cluster and would spam Discord. Only
+        # OUR alerts (labelled team=dcds in the platform PrometheusRule) match
+        # the child route to `chat` (Step 1.5.6 #7).
         route:
-          receiver: chat
+          receiver: "null"
           group_wait: 30s
           group_interval: 5m
           repeat_interval: 3h
@@ -96,6 +101,9 @@ resource "helm_release" "kube_prometheus_stack" {
             # "undefined receiver null" reconcile error).
             - match: { alertname: Watchdog }
               receiver: "null"
+            # Only our own alerts reach the channel.
+            - match: { team: dcds }
+              receiver: chat
         receivers:
           - name: "null"
           - name: chat

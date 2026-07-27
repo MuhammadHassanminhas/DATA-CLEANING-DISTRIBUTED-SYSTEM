@@ -42,7 +42,7 @@ from app.config import (
 from app.db import engine, get_session
 from app.logging_config import configure_logging
 from app.metrics import MetricsMiddleware, metrics_endpoint
-from app.middleware import CorrelationIDMiddleware
+from app.middleware import CorrelationIDMiddleware, correlation_id_var
 from app.models import Worker
 from app.redis_client import redis_client
 from app.schemas import (
@@ -724,6 +724,16 @@ async def ws_connect(websocket: WebSocket) -> None:
             received=hello.get("protocol_version"),
         )
         return
+
+    # Bind the worker's session correlation id (from its `hello` envelope)
+    # to this coroutine's context so every subsequent log line for this
+    # session — worker_connected, heartbeat_received, ping/pong, disconnect,
+    # and the inherited ping/push/control tasks — carries it. The HTTP
+    # middleware only covers request scope; WebSocket sessions were logging
+    # correlation_id="-" without this (§11: one id, end to end, across replicas).
+    session_correlation_id = hello.get("correlation_id")
+    if session_correlation_id:
+        correlation_id_var.set(session_correlation_id)
 
     worker_id = str(worker_uuid)
     session_epoch = await redis_client.incr(f"worker:{worker_id}:session_epoch")

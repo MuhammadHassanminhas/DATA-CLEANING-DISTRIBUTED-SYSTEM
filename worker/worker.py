@@ -72,6 +72,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 import websockets
@@ -179,13 +180,19 @@ def _acquire_single_instance_lock() -> None:
     _lock_handle = handle  # holding the reference keeps the lock held
 
 
-def _post(path: str, payload: dict) -> tuple[int, dict]:
+def _post(path: str, payload: dict, correlation_id: str | None = None) -> tuple[int, dict]:
     ctx = _ssl_context()
     data = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    # Carries the session correlation id onto the HTTP leg (token refresh)
+    # so it shares one id with the WebSocket leg — the coordinator's
+    # CorrelationIDMiddleware reuses X-Correlation-ID when present (§11).
+    if correlation_id:
+        headers["X-Correlation-ID"] = correlation_id
     req = urllib.request.Request(
         f"{COORDINATOR_URL}{path}",
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -251,14 +258,23 @@ def _release_claim(worker_id: str, worker_credential: str) -> None:
         pass
 
 
-def _refresh_access_token(worker_id: str, worker_credential: str) -> tuple[str, int] | None:
+def _refresh_access_token(
+    worker_id: str, worker_credential: str, correlation_id: str | None = None
+) -> tuple[str, int] | None:
     status, body = _post(
-        "/workers/token/refresh", {"worker_id": worker_id, "worker_credential": worker_credential}
+        "/workers/token/refresh",
+        {"worker_id": worker_id, "worker_credential": worker_credential},
+        correlation_id=correlation_id,
     )
     if status != 200:
         _log("access_token_refresh_rejected", worker_id=worker_id, status=status, detail=body.get("detail"))
         return None
-    _log("access_token_refreshed", worker_id=worker_id, expires_in=body["expires_in"])
+    _log(
+        "access_token_refreshed",
+        worker_id=worker_id,
+        expires_in=body["expires_in"],
+        correlation_id=correlation_id,
+    )
     return body["access_token"], body["expires_in"]
 
 
@@ -266,7 +282,9 @@ def _ws_url() -> str:
     return COORDINATOR_URL.replace("https://", "wss://", 1) + "/ws/connect"
 
 
-async def _heartbeat_ws_loop(ws, identity: dict, send_lock: asyncio.Lock) -> None:
+async def _heartbeat_ws_loop(
+    ws, identity: dict, send_lock: asyncio.Lock, correlation_id: str
+) -> None:
     """Sends an application-level `heartbeat` envelope every
     `HEARTBEAT_INTERVAL_SECONDS`, separate from the transport-level
     ping/pong keepalive already handled inline in `_hold_connection`.
@@ -278,6 +296,7 @@ async def _heartbeat_ws_loop(ws, identity: dict, send_lock: asyncio.Lock) -> Non
         envelope = Envelope(
             message_type="heartbeat",
             worker_id=identity["worker_id"],
+            correlation_id=correlation_id,
             payload={
                 "sequence": sequence,
                 "uptime_seconds": round(time.monotonic() - _process_start, 1),
@@ -292,7 +311,9 @@ async def _heartbeat_ws_loop(ws, identity: dict, send_lock: asyncio.Lock) -> Non
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
-async def _hold_connection(identity: dict, access_token: str, established: dict) -> None:
+async def _hold_connection(
+    identity: dict, access_token: str, established: dict, correlation_id: str
+) -> None:
     """Open one WebSocket session and block until it closes, handling
     the ping/pong keepalive, the Phase 1.6 heartbeat loop, and any
     coordinator-pushed messages inline. Returns normally on a clean
@@ -308,6 +329,7 @@ async def _hold_connection(identity: dict, access_token: str, established: dict)
         hello = Envelope(
             message_type="hello",
             worker_id=identity["worker_id"],
+            correlation_id=correlation_id,
             payload={"agent_version": AGENT_VERSION},
         )
         async with send_lock:
@@ -326,15 +348,22 @@ async def _hold_connection(identity: dict, access_token: str, established: dict)
             "ws_connected",
             worker_id=identity["worker_id"],
             session_epoch=ack.get("session_epoch"),
+            correlation_id=correlation_id,
         )
 
-        heartbeat_task = asyncio.create_task(_heartbeat_ws_loop(ws, identity, send_lock))
+        heartbeat_task = asyncio.create_task(
+            _heartbeat_ws_loop(ws, identity, send_lock, correlation_id)
+        )
         try:
             async for raw in ws:
                 message = json.loads(raw)
                 message_type = message.get("message_type")
                 if message_type == "ping":
-                    pong = Envelope(message_type="pong", worker_id=identity["worker_id"])
+                    pong = Envelope(
+                        message_type="pong",
+                        worker_id=identity["worker_id"],
+                        correlation_id=correlation_id,
+                    )
                     async with send_lock:
                         await ws.send(json.dumps(pong.to_dict()))
                     continue
@@ -388,14 +417,23 @@ async def _run_ws_forever(identity: dict, stop_event: asyncio.Event) -> None:
     consecutive_failures = 0
     while not stop_event.is_set():
         established = {"value": False}
+        # One correlation id per session (= one connection lifetime). Shared
+        # by the token-refresh HTTP call and the WS hello/heartbeat/pong, so
+        # a session is traceable end to end by a single id — and across
+        # coordinator replicas, since the HTTP leg and the WS leg can land on
+        # different replicas behind the Service (§11, Step 1.5.6 C2).
+        session_correlation_id = str(uuid.uuid4())
         try:
             refreshed = await asyncio.to_thread(
-                _refresh_access_token, identity["worker_id"], identity["worker_credential"]
+                _refresh_access_token,
+                identity["worker_id"],
+                identity["worker_credential"],
+                session_correlation_id,
             )
             if refreshed is None:
                 raise RuntimeError("token refresh rejected")
             access_token, _ = refreshed
-            await _hold_connection(identity, access_token, established)
+            await _hold_connection(identity, access_token, established, session_correlation_id)
         except (ConnectionClosed, OSError, urllib.error.URLError) as exc:
             _log("ws_connection_lost", worker_id=identity["worker_id"], detail=str(exc))
         except Exception as exc:  # noqa: BLE001 — keep the retry loop alive
