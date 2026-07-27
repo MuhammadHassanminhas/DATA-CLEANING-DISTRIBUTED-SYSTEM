@@ -17,6 +17,11 @@ coordinator:
 config:
   logLevel: DEBUG
 
+# Observability ON for staging (Step 1.5.6) — this is the env the stack is
+# demoed against. Emits the coordinator ServiceMonitor + alert rules.
+observability:
+  enabled: true
+
 # Public ingress ON for staging (Step 1.5.5). host = Terraform's
 # `ingress_fqdn` output; set letsencryptEmail before the first deploy.
 ingress:

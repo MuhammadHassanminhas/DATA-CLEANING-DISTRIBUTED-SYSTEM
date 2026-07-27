@@ -33,9 +33,9 @@ variable "node_vm_size" {
 }
 
 variable "node_count" {
-  description = "Node count for the system pool. Single node, no autoscaling (Decision #57 cost discipline)."
+  description = "Node count for the system pool. Raised 1->2 for Step 1.5.6 (user-approved 2026-07-27): observability (Prometheus/Grafana/Loki/Alloy) does not fit alongside both full app stacks on one B2s_v2. Still no autoscaling; `az aks stop` between sessions keeps the extra node's cost bounded. Dial back to 1 after M1.5 if credit is tight."
   type        = number
-  default     = 1
+  default     = 2
 }
 
 variable "environments" {
@@ -97,4 +97,41 @@ variable "cert_manager_chart_version" {
   description = "cert-manager Helm chart version (charts.jetstack.io)."
   type        = string
   default     = "v1.16.2"
+}
+
+# --- Step 1.5.6 observability inputs -----------------------------------
+# UNVERIFIED chart versions — confirm against the repos on first apply
+# (same discipline as the ingress chart versions above).
+
+variable "kube_prometheus_stack_chart_version" {
+  description = "kube-prometheus-stack Helm chart version (prometheus-community). Bundles Prometheus + Grafana + Alertmanager + node-exporter + kube-state-metrics in one release."
+  type        = string
+  default     = "65.5.1"
+}
+
+variable "loki_chart_version" {
+  description = "grafana/loki Helm chart version. Deployed in SingleBinary mode (filesystem storage) for the single small cluster."
+  type        = string
+  default     = "6.18.0"
+}
+
+variable "alloy_chart_version" {
+  description = "grafana/alloy Helm chart version. DaemonSet that tails pod stdout and ships to Loki."
+  type        = string
+  default     = "0.9.2"
+}
+
+variable "loki_retention_hours" {
+  description = "Log retention window in Loki. RECOMMENDATION, not measured — short to bound disk on the single node. Documented log-retention value for Step 1.5.6 exit criterion."
+  type        = number
+  default     = 72
+}
+
+# Pre-created Secret (sealed-secret / bootstrap) holding the Alertmanager
+# Discord/Slack webhook URL. The URL itself is NEVER in Terraform state or
+# values (CLAUDE.md §12) — Alertmanager reads it from a mounted secret file.
+variable "alertmanager_webhook_secret_name" {
+  description = "Name of the Secret in the observability namespace holding key `webhook-url` (the Discord/Slack incoming webhook). Created out-of-band before apply."
+  type        = string
+  default     = "alertmanager-webhook"
 }

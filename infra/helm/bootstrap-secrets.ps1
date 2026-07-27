@@ -53,3 +53,17 @@ if ($LASTEXITCODE -ne 0) { throw "openssl passwd failed - is openssl on PATH?" }
 Apply-Secret @("dashboard-basic-auth", "--from-literal=auth=$dashUser`:$hash")
 
 Write-Host "Secrets app-secrets, postgres-secret, tls-certs, dashboard-basic-auth applied to namespace '$Namespace'."
+
+# --- Step 1.5.6 observability secrets (always the `observability` ns) ----
+# Grafana admin login + the Alertmanager Discord/Slack webhook URL. Read
+# from .env; never committed (§12). Discord: use the webhook URL with
+# `/slack` appended (Discord's Slack-compatible endpoint).
+function Apply-ObsSecret($secretArgs) {
+  kubectl create secret generic @secretArgs --namespace observability --dry-run=client -o yaml | kubectl apply -f -
+}
+$grafUser = Get-EnvVal "GRAFANA_ADMIN_USER"
+$grafPass = Get-EnvVal "GRAFANA_ADMIN_PASSWORD"
+$webhook  = Get-EnvVal "ALERTMANAGER_WEBHOOK_URL"
+Apply-ObsSecret @("grafana-admin", "--from-literal=admin-user=$grafUser", "--from-literal=admin-password=$grafPass")
+Apply-ObsSecret @("alertmanager-webhook", "--from-literal=webhook-url=$webhook")
+Write-Host "Secrets grafana-admin, alertmanager-webhook applied to namespace 'observability'."

@@ -4,3 +4,4 @@ sqlalchemy>=2.0,<3
 asyncpg>=0.29,<1
 alembic>=1.13,<2
 redis>=5.0,<6
+prometheus-client>=0.21,<1

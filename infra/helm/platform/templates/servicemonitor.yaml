@@ -1,0 +1,29 @@
+{{- if .Values.observability.enabled }}
+# Step 1.5.6: tells the kube-prometheus-stack Prometheus (installed by
+# Terraform, observability.tf) to scrape the coordinator's /metrics.
+# The endpoint is served over the same self-signed HTTPS port as the app
+# (TLS-everywhere, §3.8), so scrape scheme=https with insecureSkipVerify —
+# the pods present the dev-CA cert, not a public one.
+#
+# Requires the Prometheus Operator CRDs, which kube-prometheus-stack
+# installs before this chart is deployed (same CRD-ordering the ingress
+# ClusterIssuer relies on cert-manager for).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: coordinator
+  labels:
+    # release label so the stack's default serviceMonitorSelector picks it
+    # up regardless of namespace (Prometheus is configured cluster-wide).
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels: { app: coordinator }
+  endpoints:
+    - port: https
+      scheme: https
+      path: /metrics
+      interval: 30s
+      tlsConfig:
+        insecureSkipVerify: true
+{{- end }}
