@@ -8,7 +8,40 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## 2026-07-27 (session 6) — LATEST: Step 1.5.8 IN PROGRESS — non-Docker onboarding built + Windows worker verified live
+## 2026-07-27 (session 7) — LATEST: Step 1.5.8 DONE + APPROVED (CPU/mem gap fixed; rest waived by user)
+
+**Step 1.5.8 (Real Internet worker onboarding) — DONE, user-APPROVED 2026-07-27.** The one
+real gap left from session 6 — native Windows/macOS workers showing blank CPU/memory on the
+dashboard — is fixed.
+
+**Fix (Decision #77):** `worker/worker.py` now reads CPU/memory via `psutil`
+(`psutil.cpu_percent(interval=None)` / `psutil.virtual_memory().percent`), cross-platform,
+replacing the Linux-only `/proc/stat`+`/proc/meminfo` readers that returned `None` off-Linux.
+`psutil>=5.9,<7` added to `worker/requirements.txt` so the installer + published image carry it.
+**Verified on this native Windows host:** readers return real values (cpu 44.4/37.5, mem 65.4 —
+was `None`); worker test suite green (5 passed/1 skipped). **Shipped as PR #12**
+(`phase-1.5.8-worker-onboarding`→main) — CI running / to merge, CD then deploys.
+
+**User scope call:** the user directed 1.5.8 be closed after this fix and **explicitly not** to
+pursue the rest. So **WAIVED, not verified:** VPS-in-another-country, mobile-hotspot, and the
+simultaneous-multi-worker dashboard capture. Recorded honestly (§10) as a user discretion call,
+same family as #34–35. Machine types verified: 4 of 5 (#1 laptop Docker, #2 2nd PC, #3 native
+Windows no-Docker, #4 friend's PC own ISP).
+
+**State at session end:** node was already stopped at session start (offline work only); no
+`az aks start` needed for this fix — verified at the source on Windows. **Uncommitted:**
+`PHASE_STATE.md` + this file's DONE edits (about to commit to the PR branch). Untracked loose
+ends unchanged (`.claude.backup/`, `.playwright-mcp/`, screenshots, `demo-worker.yaml`,
+`infra/apply-*.ps1`). Loose ends from 1.5.6/1.5.7 (#7 alert route committed-not-applied) still
+left as-is per user.
+
+**Next step: Step 1.5.9 — M1.5 demo and verification — NOT STARTED.** Do NOT start without user
+go-ahead (§9). This is the M1.5 closeout phase (fresh-clone run, full demo). Merge PR #12 first
+so `main` carries the psutil fix.
+
+---
+
+## 2026-07-27 (session 6) — Step 1.5.8 IN PROGRESS — non-Docker onboarding built + Windows worker verified live
 
 **Step 1.5.8 (Real Internet worker onboarding) — IN PROGRESS.** Design sub-gate = Decision #76
 (A1 bootstrap installer + B1 keep shared `ENROLLMENT_SECRET`).
@@ -30,17 +63,42 @@ public `/health`=200). Ran the fixed worker in a venv against `https://dcds-stag
 server-side `status=ONLINE` on `/workers`. Recorded as machine #3 in PHASE_STATE's verified table.
 (cpu/mem = None on Windows — no `/proc`, expected.)
 
-**Remaining exit criteria (need the USER's physical machines + one shared dashboard window):**
-2nd laptop, VPS in another country, friend's PC (from docs only), mobile hotspot — all on one
-dashboard simultaneously, latency deltas visible, each recorded. User chose to do this in a **later
-focused session** and stop the node now.
+**Pipeline SHIPPED:** PR #11 (`phase-1.5.8-worker-onboarding`) merged to main (merge `42d8c4c`);
+CI green (incl. the new `test_worker_lock.py` on Linux); **CD deployed staging + production on SHA
+`42d8c4c`** (`/health` returns it); worker image published at that SHA. So the non-Docker installer
+now works from a clone (`git clone` main → the fixes are there).
 
-**Pipeline:** user approved committing the 3 portability fixes to main so the non-Docker installer
-works from a clone. Committed on branch `phase-1.5.8-worker-onboarding` → PR to main → CI → CD.
-(The Docker onboarding path already works from `main` today; only the non-Docker installer needed the push.)
+**Friend's PC VERIFIED (machine #4):** user's friend ran the documented `install-worker.ps1`
+one-liner unaided on their own ISP (native Windows, no Docker) → `registered`+`ws_connected`
+(epoch 1, `worker_id 8b735695…`, agent `0.1.0`); coordinator recorded it. Ended by Ctrl+C so it
+shows OFFLINE after — the connect itself succeeded. Satisfies "friend's computer, own ISP, from
+docs only."
 
-**Next step:** later node-up session — connect the 4 remaining machine types on one dashboard,
-record each, then user approval → 1.5.8 DONE. Loose ends from 1.5.6/1.5.7 still left as-is per user.
+**KNOWN GAP found this session (→ next step #1):** native Windows/macOS workers show **blank
+CPU/memory on the dashboard** — `_read_cpu_percent()`/`_read_memory_percent()` read `/proc/stat`
++ `/proc/meminfo` (Linux-only) and return `None` elsewhere. Real §6 GUI gap for non-Docker/non-Linux
+workers (Docker workers are fine — Linux inside). **Agreed fix = adopt `psutil`** (recommended over a
+stdlib `ctypes` per-OS branch: ~6 lines, deletes the `/proc` parsing, also covers macOS; supersedes
+the old Linux-only "no psutil" note), then push through the pipeline.
+
+**NEXT STEPS to finish 1.5.8 (next session, node up):**
+1. **Cross-platform CPU/mem via `psutil`** in `worker/worker.py` → commit → PR → CI → CD, so the
+   installer + published image carry it and the dashboard shows CPU/mem for every worker.
+2. Connect the last two machine types: **VPS in another country** (Docker one-liner, cross-region
+   latency) + **mobile hotspot** (tether a laptop).
+3. Capture the dashboard with **several workers running simultaneously**, region-latency deltas
+   visible (the "all on one dashboard at once" + latency criteria).
+4. User approval → **1.5.8 DONE**.
+Already verified toward the 5 types: laptop Docker + 2nd PC (1.5.5, #1/#2), native Windows no-Docker
+(#3), friend's PC from docs (#4). Loose ends from 1.5.6/1.5.7 still left as-is per user.
+
+**Cluster state at session end:** `az aks stop` issued (billing $0). `az aks start -g
+data-cleaning-distributed-system-rg -n data-cleaning-distributed-system` + `az aks get-credentials
+...` to resume; endpoint `https://dcds-staging.centralindia.cloudapp.azure.com` comes back ~1-2 min
+after start. Enrollment secret `dev-enrollment-secret-6f3a1c`; dashboard `operator` /
+`D68y1YIA6v9rF3g`. **Uncommitted at end:** PHASE_STATE.md + this file's next-step edits only (doc);
+untracked loose ends unchanged (`.claude.backup/`, `.playwright-mcp/`, screenshots,
+`demo-worker.yaml`, `infra/apply-*.ps1`).
 
 ---
 
