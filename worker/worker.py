@@ -61,7 +61,6 @@ winner and terminates the other).
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import json
 import logging
 import os
@@ -74,6 +73,14 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+
+try:  # POSIX (Docker/Linux/macOS worker)
+    import fcntl
+
+    msvcrt = None
+except ImportError:  # native Windows worker (no Docker) — Step 1.5.8 installer
+    fcntl = None
+    import msvcrt
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -96,8 +103,17 @@ AGENT_VERSION = os.environ.get("WORKER_AGENT_VERSION", "0.1.0")
 
 
 def _ssl_context() -> ssl.SSLContext:
-    # cafile set → trust exactly that CA (local dev). Empty → system roots.
-    return ssl.create_default_context(cafile=CA_FILE) if CA_FILE else ssl.create_default_context()
+    # Trust the private dev CA only if the file is actually present (local
+    # Docker mounts it at /certs). On every machine without it — non-Docker
+    # workers (Step 1.5.8), and anything reaching the public Let's Encrypt
+    # endpoint — fall back to the OS trust store. "Missing file" means "use
+    # system roots", never "fail": a self-signed coordinator cert won't
+    # validate against system roots, so this cannot silently downgrade trust.
+    # (Also dodges Windows PowerShell not propagating an empty env var to the
+    # child, which would otherwise leave CA_FILE at its dev-CA default.)
+    if CA_FILE and os.path.exists(CA_FILE):
+        return ssl.create_default_context(cafile=CA_FILE)
+    return ssl.create_default_context()
 WS_HELLO_ACK_TIMEOUT_SECONDS = 10
 # Full-jitter exponential backoff. Recommendations, not measured values.
 WS_BACKOFF_BASE_SECONDS = float(os.environ.get("WORKER_WS_BACKOFF_BASE_SECONDS", "1"))
@@ -171,9 +187,14 @@ def _log(event: str, **fields: object) -> None:
 def _acquire_single_instance_lock() -> None:
     global _lock_handle
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(LOCK_FILE, "w")
+    # "a" not "w": never truncate a file a first instance may have locked.
+    handle = open(LOCK_FILE, "a")
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:  # Windows: same "second instance fails fast" guarantee via msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
         _log("duplicate_local_instance_detected", lock_file=str(LOCK_FILE))
         sys.exit(1)
@@ -470,7 +491,13 @@ async def _async_main(identity: dict) -> None:
         _release_claim(identity["worker_id"], identity["worker_credential"])
         stop_event.set()
 
-    loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+    except NotImplementedError:
+        # Windows' Proactor loop has no add_signal_handler. The worker still
+        # runs; graceful claim-release on shutdown is skipped, and the
+        # short-TTL claim (Decision #11) expires on its own instead.
+        _log("signal_handler_unavailable", worker_id=identity["worker_id"])
 
     heartbeat_task = asyncio.create_task(_heartbeat_loop(stop_event))
     ws_task = asyncio.create_task(_run_ws_forever(identity, stop_event))

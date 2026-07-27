@@ -8,7 +8,43 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## 2026-07-27 (session 5) — LATEST: Step 1.5.7 BUILT + VERIFIED LIVE, awaiting approval
+## 2026-07-27 (session 6) — LATEST: Step 1.5.8 IN PROGRESS — non-Docker onboarding built + Windows worker verified live
+
+**Step 1.5.8 (Real Internet worker onboarding) — IN PROGRESS.** Design sub-gate = Decision #76
+(A1 bootstrap installer + B1 keep shared `ENROLLMENT_SECRET`).
+
+**Built:** cross-platform worker + two installers + onboarding doc + a lock self-check.
+- `worker/worker.py` — **three portability fixes** so the bare-Python worker runs on machines
+  without Docker (esp. native Windows): (1) single-instance lock `fcntl`→`fcntl`/`msvcrt`;
+  (2) `_ssl_context()` uses the dev-CA only if the file **exists**, else system trust — fixes the
+  Windows "empty env var not propagated" crash AND makes the public-endpoint path work with no CA
+  file; (3) `add_signal_handler(SIGTERM)` wrapped in `try/except NotImplementedError` (Windows
+  Proactor loop has none). All three found by actually running the worker on this Windows host.
+- `worker/install-worker.sh` + `install-worker.ps1` — clone→venv→run, config = 3 values.
+- `docs/onboarding-a-worker.md` — Docker/Linux/Windows onboarding + operator issue/revoke/rotate.
+- `tests/test_worker_lock.py` — passes on Windows (exercises the new msvcrt branch); full suite 5 passed/1 skipped.
+
+**Verified live (this session):** started the node, staging came up (3 coordinators on SHA `94ba53e`,
+public `/health`=200). Ran the fixed worker in a venv against `https://dcds-staging.centralindia.cloudapp.azure.com`
+(system-CA trust, no Docker): `registered`→`access_token_refreshed`→`ws_connected` (epoch 1),
+server-side `status=ONLINE` on `/workers`. Recorded as machine #3 in PHASE_STATE's verified table.
+(cpu/mem = None on Windows — no `/proc`, expected.)
+
+**Remaining exit criteria (need the USER's physical machines + one shared dashboard window):**
+2nd laptop, VPS in another country, friend's PC (from docs only), mobile hotspot — all on one
+dashboard simultaneously, latency deltas visible, each recorded. User chose to do this in a **later
+focused session** and stop the node now.
+
+**Pipeline:** user approved committing the 3 portability fixes to main so the non-Docker installer
+works from a clone. Committed on branch `phase-1.5.8-worker-onboarding` → PR to main → CI → CD.
+(The Docker onboarding path already works from `main` today; only the non-Docker installer needed the push.)
+
+**Next step:** later node-up session — connect the 4 remaining machine types on one dashboard,
+record each, then user approval → 1.5.8 DONE. Loose ends from 1.5.6/1.5.7 still left as-is per user.
+
+---
+
+## 2026-07-27 (session 5) — Step 1.5.7 BUILT + VERIFIED LIVE, awaiting approval
 
 **Step 1.5.7 (Coordinator horizontal scaling proof) — all 6 exit criteria met live on
 AKS staging; APPROVED by user 2026-07-27. Committed on branch `phase-1.5.7-scaling-proof`.**
@@ -47,12 +83,20 @@ reconnect to survivors + replacement pod → `connected` back to 6 in ~30s. 4. L
 - To query a pod's `/workers` (needs `x-admin-secret`), `kubectl exec ... python -c` with the
   script **base64-encoded** avoids all the PowerShell/quote breakage.
 
-**State at session end:** node RUNNING (user to `az aks stop`). Staging coordinator HPA back at
-3 (min), load Job deleted, demo-worker at 1, quota 1900m/3000m. Config changes **uncommitted**
-(no commit requested). Loose end from 1.5.6 (#7 alert route) still committed-not-applied — user
-said leave Discord alerts as-is, so untouched.
+**Merged + shipped through the pipeline (end of session):** PR #10 merged to `main`
+(merge commit `94ba53e15e264803b00d77b4633029184366f5d3`). CI green on `main`
+(run `30259092670`). **CD ran exactly per plan (Decision #67):** staging auto-deployed,
+production held at the `required_reviewers` gate → **user approved** → deployed. Both envs
+verified live on SHA `94ba53e`: `/health` version matches, `/ready` db+redis ok; **staging now
+runs HPA min 3/max 5 canonically via CD** (3 coordinator pods), production HPA min 2 unchanged
+(1.5.7 was staging-only). So the 1.5.7 config is durable on `main` — no revert-on-next-deploy.
 
-**Next step (after approval): Step 1.5.8 — Real Internet worker onboarding — NOT STARTED.**
+**State at session end:** the load Job is deleted, demo-worker at 1. Node was RUNNING at
+verification (CD needs it up; Option C never starts/stops it) — **user is stopping it now
+(`az aks stop`)** to halt billing. Loose end from 1.5.6 (#7 alert route) still
+committed-not-applied — user said leave Discord alerts as-is, so untouched.
+
+**Next step (after go-ahead): Step 1.5.8 — Real Internet worker onboarding — NOT STARTED.**
 Do NOT start without user go-ahead.
 
 ---
