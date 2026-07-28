@@ -8,6 +8,106 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## 2026-07-28 (session 10, part 3) — Step 2.2 APPROVED; Step 2.2.1 security fix shipped
+
+**Step 2.2 is DONE and approved**, including the `POST /tasks/dequeue`
+judgement call — kept as a queue *primitive* (the caller names the worker,
+it makes no scheduling decision), since Step 2.3's engine calls the same
+`task_queue.dequeue()` and without the endpoint the three-replica criterion
+could not be proven against real replicas at all.
+
+**That review found a real defect, which became Step 2.2.1.**
+
+### The defect (Decision #86)
+
+`verify_admin_secret` compared against `ENROLLMENT_SECRET` — the **shared**
+bootstrap credential every worker holds by design (Decision #76 B1). So
+every worker could enumerate the fleet, revoke or push to any peer, and
+after Step 2.2 **drain the entire task queue and self-assign all of it**.
+§12 says every worker is untrusted; that was not true of the admin surface.
+
+Pre-existing since Phase 1.4 — `/workers/{id}/revoke` had it and `config`'s
+own docstring flagged it as deferred. Step 2.2 is what made it worth fixing
+now: the blast radius went from griefing peers to taking all the work, and
+it stops being bounded at Step 2.4 when tasks become real work.
+
+### The fix
+
+`ADMIN_SECRET`, a distinct credential, never given to a worker. The
+dashboard carries it (operator tool); the worker does not, and neither does
+the migrate initContainer, which serves no request.
+
+**It falls back to `ENROLLMENT_SECRET` when unset — deliberately.** An
+image ships before a Secret can be applied to a namespace, and a hard
+requirement CrashLoops every replica in that gap. The fallback logs
+`admin_secret_fallback_in_use` at WARNING and exports
+`coordinator_admin_credential_separate 0`, so insecure-but-silent is not an
+available state. Neither secret is ever logged — only whether they differ.
+
+Merged as PR #19. CI green, **101 passed** (was 92). `main` at `fabb012`.
+
+### Verified live on staging — 37/37, all 6 exit criteria
+
+- Worker's enrollment secret → **401** on `/workers`, `/tasks/depth`,
+  `POST /tasks`, `/tasks/dequeue`, revoke and push. Operator secret → 200/201.
+- **The split cuts both ways:** the operator secret is rejected *for
+  enrollment* (401), and workers still enroll with theirs (201).
+- A real Internet worker with **no `ADMIN_SECRET` in its environment**
+  connected and went ONLINE with live CPU/memory/latency.
+- Dashboard still reads the fleet — 59 workers via `/api/workers`.
+- `coordinator_admin_credential_separate` = **1.0 on all three replicas**.
+- Fallback posture proven separately against a real coordinator: serves,
+  warns, gauge 0.
+- Concurrency re-run after the change: 400 tasks, **0 duplicates**,
+  130/135/135 across three replicas. Harness Job re-run with the new
+  two-credential wiring: **3,000 tasks, 0 duplicates**, 934/sec.
+- Neither secret appears in any log line; the committed sealed secrets
+  contain no plaintext.
+
+### ⚠️ Production is still vulnerable — one click fixes it
+
+Production runs the **pre-2.2.1** image `b27a139`. Measured, not assumed:
+the enrollment secret still returns **200** on production's
+`/tasks/depth`.
+
+CD run **`30361968699`** has its `production` gate `waiting`. Approving it
+is blocked from the agent by the permission classifier. **The
+`admin-secret` Secret has already been applied to the production
+namespace**, so approving that one gate completes the fix — there is no
+second manual step.
+
+### Things that had to change with it (each would have broken)
+
+- **The dashboard** read `ENROLLMENT_SECRET` as its admin credential
+  (`dashboard/app/main.py:31`). It now reads `ADMIN_SECRET` and the chart
+  gives it that Secret — without this the fleet view 401s.
+- **`infra/loadtest-queue.yaml`** pulled its admin secret from
+  `app-secrets`. Now takes `ADMIN_SECRET` from `admin-secret` *and*
+  `ENROLLMENT_SECRET` from `app-secrets`, because registering the worker
+  that claims are attributed to is a worker action.
+- **`scripts/queue_harness.py`** used one secret for both. Now takes two.
+- **CI** sets `ADMIN_SECRET` to a different value from `ENROLLMENT_SECRET`,
+  so it exercises the separated posture rather than the fallback.
+
+### Gotchas
+
+- **`kubeseal` was not installed**; the binary was fetched and sealing done
+  **offline** against the committed `infra/sealed-secrets/pub-cert.pem`, so
+  no cluster round trip was needed to produce the sealed files.
+- **The PowerShell tool's working directory drifts between calls.** A
+  `kubectl apply -f infra/...` failed with "path does not exist" while the
+  file was plainly there. Use absolute paths, or `Set-Location` first.
+- Applying a SealedSecret to the **production** namespace was allowed, even
+  though creating a ConfigMap/Job there was blocked earlier. The classifier
+  is not uniform across production writes — try, then fall back.
+
+### Next step
+
+**Step 2.2.1 awaits approval.** Then, and only with your go-ahead,
+**Step 2.3 — assignment engine — NOT STARTED.**
+
+---
+
 ## 2026-07-28 (session 10, part 2) — Step 2.2 SHIPPED and PROVEN ON REAL AKS PODS
 
 **`main` is at `2d9b686` (PR #16). CI green — 92 passed, no skips. Staging
