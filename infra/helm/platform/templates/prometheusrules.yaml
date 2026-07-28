@@ -31,18 +31,34 @@ spec:
           labels: { severity: critical, team: dcds }
           annotations:
             summary: "Coordinator is not scrapeable (all replicas down or unreachable)."
+        # These two deliberately do NOT get the `absent()` guard that
+        # CoordinatorDown has, and that is a correction to an earlier note
+        # which called the missing guard a gap "worth hardening in M3".
+        # It is not a gap. `_refresh_fleet_gauges` sets
+        # `coordinator_dependency_up` on *every* scrape — 1 on success, 0
+        # in its own except block — so the series is absent only when the
+        # coordinator is not being scraped at all, which is precisely the
+        # condition CoordinatorDown already alerts on.
+        #
+        # Adding `absent()` here would therefore fire "cannot reach
+        # Postgres" whenever the coordinator pods are gone, even with a
+        # perfectly healthy database: a false positive, duplicated across
+        # three alerts for one event. Detection is not lost without it —
+        # a full coordinator outage still pages, just as CoordinatorDown.
+        # What these two mean, exactly: *the coordinator is up and reports
+        # it cannot reach the dependency.*
         - alert: DatabaseDown
           expr: max(coordinator_dependency_up{dependency="database"}) == 0
           for: 2m
           labels: { severity: critical, team: dcds }
           annotations:
-            summary: "Coordinator cannot reach Postgres."
+            summary: "Coordinator is up but cannot reach Postgres."
         - alert: RedisDown
           expr: max(coordinator_dependency_up{dependency="redis"}) == 0
           for: 2m
           labels: { severity: critical, team: dcds }
           annotations:
-            summary: "Coordinator cannot reach Redis."
+            summary: "Coordinator is up but cannot reach Redis."
         # Fleet drop: connected workers fell sharply vs 10 min ago. Threshold
         # is a RECOMMENDATION, not measured — tune once real fleet size is known.
         - alert: WorkerFleetDrop

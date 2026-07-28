@@ -20,6 +20,7 @@ and must never be treated as such.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from contextvars import ContextVar
 from typing import Callable
@@ -32,39 +33,79 @@ correlation_id_var: ContextVar[str] = ContextVar("correlation_id", default="-")
 client_ip_var: ContextVar[str] = ContextVar("client_ip", default="-")
 
 
-def _client_ip(request: Request) -> str:
-    """The caller's apparent address.
+def _is_in_cluster(address: str) -> bool:
+    """Whether a socket peer is inside the cluster (or the loopback of a
+    local dev run) — i.e. whether an `X-Forwarded-For` it presents can be
+    believed.
 
-    Prefers the first entry of `X-Forwarded-For` — with ingress-nginx in
-    front and `externalTrafficPolicy: Local` preserving the source IP
-    (Step 1.5.5), that is the real external client rather than the
-    ingress pod. Falls back to the socket peer for in-cluster callers,
-    which have no proxy in between.
+    Anything that reaches the coordinator through the public endpoint
+    arrives from the ingress-nginx pod, which has a cluster-internal
+    address. A caller that reaches it from a globally routable address has
+    no proxy in front of it and so has no business setting the header.
 
-    **Deliberately NOT the same value as `source_ip` on the registration
-    path**, which is `request.client.host` — the raw socket peer. The two
-    names mean different things and both are correct for their purpose:
-
-      * `client_ip` (here, admin endpoints) is forward-aware, so it names
-        the real caller, and is used only for logging. It is spoofable,
-        which is acceptable for a hint and unacceptable for a control.
-      * `source_ip` (registration) is the unspoofable socket peer, because
-        it feeds `_rate_limited` — a control, where forgeability would let
-        a caller mint unlimited buckets and evade the limit entirely.
-
-    Behind the ingress that makes registration's `source_ip` the nginx
-    pod, so every external worker currently shares one rate-limit bucket.
-    That is a known consequence, recorded rather than silently changed
-    here: swapping it to the forwarded address would fix the bucketing and
-    simultaneously make the limit evadable, which is a trade-off for an
-    explicit decision, not a side effect of a logging change. The edge
-    `limit-rps` at nginx (Step 1.5.5) is the unspoofable primary control
-    either way.
+    Phrased as "not globally routable" rather than `is_private`, which is
+    narrower than it looks: `is_private` is True for the RFC 5737
+    documentation ranges too, so `203.0.113.x` — the address any example
+    reaches for — would have counted as trusted. `is_global` is the
+    predicate that actually means "reached us directly from the Internet".
     """
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return not parsed.is_global
+
+
+def _caller_ip(request: Request) -> str:
+    """The caller's real address — for logging *and* for rate limiting.
+
+    One function for both, deliberately. An earlier version had two: a
+    forward-aware `client_ip` for logs and the raw socket peer for the
+    registration rate limiter, on the reasoning that a forgeable value
+    must never feed a control. **That reasoning was wrong here, and the
+    check that settled it was a measurement, not an argument:** a request
+    to the public endpoint carrying `X-Forwarded-For: 9.9.9.9` was logged
+    by the coordinator as the sender's actual public address. ingress-nginx
+    runs with `use-forwarded-headers` at its default of false, so it
+    *overwrites* the header with the peer it observed rather than
+    appending to it. Behind this ingress the value is therefore not
+    forgeable, and using it as the rate-limit key is sound.
+
+    That fixes a real defect. Keying on the socket peer meant every
+    external worker shared one bucket — the nginx pod — so
+    `REGISTER_RATE_LIMIT_PER_MINUTE` was a *fleet-wide* cap rather than a
+    per-client one. A coordinated fleet restart, exactly what M3's
+    fault-tolerance work provokes, would have had most workers rate-limited
+    on reconnect. Note the Phase 1.10 result of 49 workers recovering in
+    18s was measured on Docker Compose, where every container had its own
+    address and the defect could not appear.
+
+    Two guards keep this honest:
+
+      * the header is trusted **only** when the socket peer is inside the
+        cluster (`_is_in_cluster`), so a direct caller cannot self-declare;
+      * the value must parse as an IP address, so a caller cannot mint
+        unlimited Redis buckets by sending junk.
+
+    Falls back to the socket peer whenever either guard fails, which is
+    also the normal path for in-cluster callers and local dev, where there
+    is no proxy at all.
+    """
+    peer = request.client.host if request.client else None
     forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "-"
+    if forwarded and peer and _is_in_cluster(peer):
+        candidate = forwarded.split(",")[0].strip()
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            return peer
+        return candidate
+    return peer or "-"
+
+
+# Retained name for the admin-log path, which reads more clearly as
+# "the client's IP" at its call sites.
+_client_ip = _caller_ip
 
 
 class CorrelationIDMiddleware(BaseHTTPMiddleware):
