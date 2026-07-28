@@ -37,6 +37,7 @@ from starlette.responses import Response
 from app.db import get_session
 from app.models import Worker
 from app.redis_client import redis_client
+from app.task_queue import queue_depth
 
 logger = logging.getLogger("coordinator")
 
@@ -50,6 +51,12 @@ WORKERS_CONNECTED = Gauge(
 DEPENDENCY_UP = Gauge(
     "coordinator_dependency_up", "External dependency reachable (1) or not (0).", ["dependency"]
 )
+# Phase 2.2. Same shape as the fleet gauges above: recomputed from
+# Postgres per scrape, identical across replicas, collapse with `max by`.
+# `QUEUED` here is the cheap index range count `task_queue.queue_depth`
+# performs; the per-status breakdown is a grouped scan and stays off the
+# scrape path until Step 2.7 needs it.
+TASKS_QUEUED = Gauge("coordinator_tasks_queued", "Tasks waiting in the queue.")
 
 # Per-instance request latency. Route template keeps label cardinality bounded.
 REQUEST_LATENCY = Histogram(
@@ -86,6 +93,7 @@ async def _refresh_fleet_gauges() -> None:
             result = await session.execute(select(Worker.status, func.count()).group_by(Worker.status))
             for status, count in result.all():
                 counts[status] = count
+            TASKS_QUEUED.set(await queue_depth(session))
         DEPENDENCY_UP.labels("database").set(1)
     except Exception as exc:  # noqa: BLE001 — a scrape must not raise
         logger.warning("metrics_db_unavailable", extra={"detail": str(exc)})

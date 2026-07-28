@@ -8,6 +8,154 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## 2026-07-28 (session 10) — Step 2.2 BUILT + VERIFIED LOCALLY, awaiting approval
+
+**First thing done this session: `az aks stop`.** Session 9 left the cluster
+running and billing. It is now stopped. Everything below was built and
+verified with the cluster down — no credit spent.
+
+**Nothing was committed, pushed, or run in CI.** All work sits uncommitted
+in the working tree on `main`.
+
+### Design sub-gate — Decisions #83–#85
+
+- **#83 — 2.2 ships a minimal HTTP surface**, not a module-only queue:
+  `POST /tasks`, `GET /tasks/depth`, `POST /tasks/dequeue`, all behind the
+  same stand-in admin credential as `/workers`. Step 2.6 still owns the
+  full operator surface; Step 2.3 still owns *choosing* the worker.
+  **The dequeue endpoint is the judgement call to confirm at approval** —
+  it is a queue primitive (the caller names the worker), but without it
+  the "three coordinator replicas dequeuing" criterion cannot be proven
+  against real replicas at all.
+- **#84 — the concurrency proof runs locally first, then on AKS.** The
+  harness reports *which* coordinator instance served each claim, so
+  "three replicas took part" is evidence, not an inference.
+- **#85 — keep migration 0002's index; do NOT add a partial index.**
+  Measured both. See below.
+
+### What was built
+
+No migration. Phase 2.1's schema and `ix_tasks_queue` were sufficient,
+which is exactly what reserving them was for.
+
+- `coordinator/app/task_queue.py` — enqueue / enqueue_batch / dequeue /
+  queue_depth / counts_by_status. The dequeue is one statement: a CTE
+  takes row locks with `FOR UPDATE SKIP LOCKED`, the UPDATE that consumes
+  it flips `QUEUED → ASSIGNED` and stamps the worker in the same
+  transaction. There is no window between "claimed" and "assigned".
+- **No requeue primitive and no lease stamp**, deliberately.
+  `ASSIGNED → QUEUED` is illegal in `task_states` (that is Phase 3's
+  `REASSIGNED`), and `lease_expires_at` / `attempt_count` must stay
+  written-by-nothing through all of M2. There is a test asserting the
+  dequeue leaves both alone.
+- Three endpoints in `main.py`, a `coordinator_tasks_queued` Prometheus
+  gauge, and `/tasks` added to the coordinator ingress paths — **without
+  that last one the queue endpoints would have fallen through to the
+  dashboard's catch-all `/` rule and 404'd.**
+- `tests/test_task_queue.py` — 11 tests, Postgres-gated like the existing
+  integration test, so they run in CI.
+- `scripts/queue_harness.py` — stdlib-only, so it runs in any Python
+  container with no install. `COORDINATOR_URL` accepts a comma-separated
+  list (several local processes) or one Service URL (real replicas).
+
+### Verified locally — three real coordinator processes, not three threads
+
+Three uvicorn coordinators over TLS on 18443/18444/18445, sharing one
+ephemeral Postgres, driven over HTTP by the harness.
+
+1. **10,000 enqueue/dequeue, no loss** — 0.798s to enqueue; 10,025
+   claimed / 10,025 unique / **0 duplicates**; depth back to 0; 1,106
+   tasks/sec. (The extra 25 were survivors of the restart test — itself
+   evidence they persisted.)
+2. **No double-assignment** — 0 duplicates across two 10,000-task drains,
+   work spread 3370/3305/3350 then 3330/3370/3300 across the three.
+3. **Depth cheap** — 2.4ms at 320,025 rows with 10,000 queued.
+4. **Restart loses nothing** — all three killed with `Stop-Process -Force`,
+   restarted, every count identical, and the queue then drained fully.
+5. **Ordering** — stated in the docstring and the phase doc, tested.
+
+Suite **92 passed / 1 warning** (pre-existing; baseline was 81).
+`ruff check` clean on the CI paths and on `scripts/`.
+
+### The one place a claim was written before it was measured
+
+`queue_depth`'s docstring originally asserted the depth read was "an
+index range count, not a table scan". `EXPLAIN (ANALYZE, BUFFERS)` said
+**Seq Scan**, 3.6ms, 560 buffers — because autovacuum had not yet updated
+the visibility map after the bulk load. Corrected in the code and
+recorded in PHASE_STATE. It recovers on its own after a vacuum (2.4ms,
+Bitmap Heap Scan). **Worth remembering: an `EXPLAIN` taken right after a
+bulk load is measuring an unvacuumed table, not the steady state.**
+
+A partial index (`... WHERE status = 'QUEUED'`) was built and measured as
+the fix: **17x smaller (88 kB vs 1552 kB) but no faster** (1.7ms vs
+2.4ms). Not adopted — schema churn for an unmeasured benefit. Recorded as
+Decision #85 in case Step 2.8 or real growth makes index bloat matter.
+
+### Gotchas hit this session
+
+- **`uvicorn app.main:app` needs the repo root on `PYTHONPATH` too**, not
+  just `coordinator/` — `main.py` imports `protocol`. Running from
+  `coordinator/` with only that directory on the path fails at import.
+- **`VACUUM` cannot run inside a transaction block**, so it fails via
+  `psql -c "...; VACUUM ...;"` (which wraps in one). Use the heredoc form.
+- The session-9 note holds: pipe non-trivial SQL into
+  `docker exec -i ... psql` with a `<<'SQL'` heredoc from the Bash tool.
+  PowerShell mangles quotes and `%`.
+- `python - <args>` reads a script from stdin and still passes argv —
+  which is how the harness runs in-cluster with no image build:
+  `kubectl run ... --command -- python - verify ... < scripts/queue_harness.py`.
+
+### Machine state at session end
+
+- **AKS stopped** (`az aks stop` at session start). Billing halted.
+- **Docker Desktop was started** this session for the ephemeral Postgres
+  and Redis, and containers `dcds-m22-pg` / `dcds-m22-redis` plus the
+  three local coordinator processes may still be running — see the
+  cleanup note in the next-step section.
+- Checked out on `main` at `2c50bae`, in sync with `origin/main`.
+- **Uncommitted:** all of Step 2.2, plus the session-9 doc edits to
+  `PHASE_STATE.md` / `SESSION_HANDOFF.md` that were deliberately left for
+  the next real commit. They should go in together.
+
+### Next step
+
+**Step 2.2 is NOT done — it needs approval and two remaining things.**
+
+1. **Approval of Decisions #83–#85**, particularly the `POST /tasks/dequeue`
+   endpoint (judgement call in #83).
+2. **Commit → PR → CI.** The 11 new tests run in CI against its ephemeral
+   Postgres, which is the second independent proof, exactly as 2.1's
+   migration got.
+3. **The criterion-2 run against three real AKS pods.** Needs `az aks start`.
+   Run it in-cluster — the public ingress rate-limits to ~5 rps, which
+   would measure nginx rather than the queue:
+   ```
+   kubectl -n staging run queue-harness --rm -i --restart=Never \
+     --image=python:3.12-slim \
+     --env=COORDINATOR_URL=https://coordinator:8443 \
+     --env=ADMIN_SECRET=<enrollment secret from .env> \
+     --command -- python - verify --count 10000 --dequeuers 3 --insecure \
+     < scripts/queue_harness.py
+   ```
+   Staging already runs coordinator HPA min 3 from Step 1.5.7, so three
+   replicas are there. Expect `by_coordinator_instance` to name three pods.
+4. **Local cleanup when done:** `docker rm -f dcds-m22-pg dcds-m22-redis`,
+   stop the three uvicorn processes on 18443–18445, and `docker desktop stop`
+   (note: `"Docker Desktop.exe" -Shutdown` does not work on this version).
+
+**Then Step 2.3 — assignment engine — NOT STARTED. Do not begin without
+the user's go-ahead (§9).**
+
+**Loose ends carried from M1.5, all still open and unchanged:**
+`GRAFANA_ADMIN_PASSWORD`/`POSTGRES_PASSWORD` still exposed and live by
+user decision; the 1.5.6 #7 Alertmanager route committed but never
+applied; `DatabaseDown`/`RedisDown` lacking the `absent()` guard; the old
+enrollment secret's post-CD rejection inferred but never measured; cost
+never tracked against estimate.
+
+---
+
 ## 2026-07-28 (session 9) — M2 OPENED: gate 2.0 and Step 2.1 both APPROVED
 
 **Nothing was committed, pushed, run in CI, or deployed this session.** The
@@ -73,11 +221,47 @@ environment reaching the same result. The single pytest warning is
 **pre-existing** — the last CI run on `main` (`4575097`) reported
 "9 passed, 1 warning" before any of this work.
 
-**STOPPED DELIBERATELY BEFORE MERGE.** Merging to `main` triggers CD
-(`cd.yml` fires on CI success on `main`), which needs the AKS cluster
-started and therefore **spends student credit**. That is the user's call,
-not an automatic next action. Nothing is deployed; staging and production
-are both still on `4575097`.
+### MERGED AND FULLY DEPLOYED to staging + production
+
+The user started the cluster (2 nodes, `Running`), then **PR #14 and PR
+#15 were both merged**. `main` is now **`2c50bae`**, CI green on it (run
+`30347586094`), images SHA-tagged and pushed. Both CD runs finished
+**success on both environments** — `30347488231` (`d41058e`) and
+`30347651705` (`2c50bae`) — after the user approved the `production`
+required-reviewer gates in the GitHub UI.
+
+**Verified live, not inferred:**
+- staging `/health` = `2c50baea029c80a102af123a3f23b02ad80a1ba0`
+- staging DB at **`alembic_version = 0002`**, tables `workers`, `tasks`,
+  `task_results`
+- production DB at **`0002`**, coordinator image `…:2c50bae…`
+
+**Migration `0002` has now applied in three independent environments** —
+the laptop upgrade/downgrade/upgrade run, CI's ephemeral Postgres via the
+app lifespan, and real AKS staging + production via the Kubernetes
+initContainer (Decision #55).
+
+**Sequencing gotcha worth keeping.** `cd.yml` sets `concurrency: group
+cd-main, cancel-in-progress: false`, so deploys are strictly serialised.
+Immediately after both merges, the `2c50bae` CD run sat **`pending` with
+zero jobs** — not failed, not misconfigured, just queued behind the
+earlier run's parked production gate. **A CD run showing `pending` with
+no jobs means "waiting its turn", not "broken".** Mid-merge this was
+briefly misread as a hard blocker; the queue drained on its own once the
+gates were approved.
+
+**PR #15 also did NOT auto-retarget when #14 merged.** GitHub only
+retargets a stacked PR when its base branch is *deleted*, and
+`docs/m15-signoff` still exists. Left alone, #15 would have merged into
+`docs/m15-signoff` rather than `main`. It needed an explicit
+`gh pr edit 15 --base main`, after which strict branch protection
+reported `BEHIND` and required `gh pr update-branch` plus a fresh CI run.
+**Expect the same for any future stacked PR.**
+
+**These doc edits are left uncommitted on `main` on purpose.** Any push
+to `main` starts another CI→CD cycle that needs a fresh production
+approval — not worth spending on a docs-only change. Commit them
+alongside the next real change.
 
 New: `coordinator/app/task_states.py`, `coordinator/app/task_types.py`,
 `Task`/`TaskResult` in `coordinator/app/models.py`, migration
@@ -132,8 +316,11 @@ check, not Step 2.2's 10,000-task criterion and not the 2.8 harness.**
 
 ### Machine state at session end
 
-- **AKS: still stopped**, untouched all session. Billing $0. Unchanged
-  from session 8 — `main` deployed at `4575097` in both environments.
+- **⚠️ AKS is RUNNING — 2 nodes, and it is BILLING.** The user started it
+  late in the session so the merges could deploy. It was **not** stopped
+  before the session ended. **First action next session, or sooner:**
+  `az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system`.
+  Both environments are deployed at `2c50bae`.
 - **Docker Desktop was started on the user's laptop this session** to run
   the migration verification, then **stopped again at session end** via
   `docker desktop stop` — the machine is back to how it started (the
@@ -144,30 +331,35 @@ check, not Step 2.2's 10,000-task criterion and not the 2.8 harness.**
   **Note for next time:** `"Docker Desktop.exe" -Shutdown` does **not**
   stop it on this version (it opens the dashboard instead); the working
   command is `docker desktop stop`.
-- **Uncommitted, on branch `docs/m15-signoff`** (note: this is M1.5's
-  branch — M2 work should almost certainly move to its own branch off
-  `main` before any commit):
-  - Modified: `PHASE_STATE.md`, `docs/phase-2-task-distribution.md`,
-    `coordinator/app/models.py`, `coordinator/migrations/env.py`,
-    `coordinator/requirements.txt`
-  - New: `conftest.py`, `coordinator/app/task_states.py`,
-    `coordinator/app/task_types.py`,
-    `coordinator/migrations/versions/0002_create_tasks_tables.py`,
-    `tests/test_task_states.py`, `tests/test_task_types.py`
+- **Checked out on `main` at `2c50bae`, in sync with `origin/main`.** All
+  Step 2.1 code, tests, migration and phase docs are **merged and
+  deployed** — nothing of the build is loose any more.
+- **Uncommitted: `PHASE_STATE.md` and `SESSION_HANDOFF.md` only**, and
+  deliberately so. They describe the merge and deploy outcome. Pushing a
+  docs-only commit to `main` starts another CI→CD cycle that needs a
+  fresh production approval, which is not worth spending. **Fold them
+  into the next real commit**, on a branch off `main`.
+- Branches `phase-2.1-task-model` and `docs/m15-signoff` are merged and
+  can be deleted whenever. Note `docs/m15-signoff` still existing is what
+  stopped PR #15 auto-retargeting — see the retarget note above.
 
 ### Next step
 
-**Merge PR #14, then PR #15, then let CD deploy — then Step 2.2, durable
-task queue.** Merging needs the cluster up (`az aks start …`) since CD
-runs on CI success on `main`. 2.2 is where the
-Decision #79 claims stop being reasoning and become measurements: 10,000
-tasks enqueue/dequeue with none lost (counted), three coordinator replicas
-dequeuing concurrently never double-assigning (under load), cheap queue
-depth, no queued task lost across a full replica restart, and a stated +
-tested ordering guarantee. Do not start without the user's go-ahead (§9).
+**Step 2.2 — durable task queue — NOT STARTED. Do not begin without the
+user's go-ahead (§9);** the user explicitly said not to proceed with 2.2
+when ending this session.
 
-**Working tree is clean** and the checked-out branch is
-`phase-2.1-task-model`, pushed and tracking `origin`.
+2.2 is where the Decision #79 claims stop being reasoning and become
+measurements: 10,000 tasks enqueue/dequeue with none lost (counted),
+three coordinator replicas dequeuing concurrently never double-assigning
+(under load), cheap queue depth, no queued task lost across a full
+replica restart, and a stated + tested ordering guarantee. Open its short
+design sub-gate first (§9) if the implementation needs one.
+
+Everything 2.2 builds on is already live: `tasks` and `task_results`
+exist at `alembic_version = 0002` in **both** staging and production, and
+`ix_tasks_queue` is in place. **Stop the cluster before doing anything
+else** — see machine state above.
 
 **Loose ends carried from M1.5, all still open and unchanged** (detail in
 the session-8 entry below): `GRAFANA_ADMIN_PASSWORD`/`POSTGRES_PASSWORD`
