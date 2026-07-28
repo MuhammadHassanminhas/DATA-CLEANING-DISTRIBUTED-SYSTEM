@@ -52,20 +52,51 @@ across the three new pods. Present *and* still claimable.
   stamped, parameters normalised — and **`lease_expires_at` NULL,
   `attempt_count` 0**. The Phase 2.1 reservation holds under real load.
 
-### Production is NOT deployed — and this needs your click
+### Production — deployed by the user, then independently verified
 
-CD run **`30353450893`** has its `production` gate parked. **Approving it
-is blocked from the agent by the permission classifier**, which is
-correct — that gate exists to be a human decision, and auto-approving it
-would defeat the point of Decision #67.
+The user approved both parked gates. Runs `30353450893` (`2d9b686`) and
+`30355381076` (`5e66a9b`) both finished **success on staging and
+production**, so **both environments run `5e66a9b`**.
 
-Production still runs `2c50bae` (pre-2.2). Staging carries all the
-verification and is where HPA min 3 lives, so nothing is blocked by this.
+Verification was **not** taken from the CD job's own green tick. A
+26-check suite was executed **inside a real coordinator pod in each
+namespace**, against the deployed image over the pod's own TLS listener:
 
-**Consequence to expect (the session-9 gotcha, again):** `cd.yml` sets
-`concurrency: group cd-main, cancel-in-progress: false`. Any later CD run
-will sit **`pending` with zero jobs** until that gate is resolved. That
-means "waiting its turn", not "broken".
+- **production 26/26 pass, staging 26/26 pass**;
+- concurrency proven separately in each environment against its own
+  replicas — **production 400 claimed / 0 duplicates split 165/235**
+  across both pods, **staging 400 / 0 split 170/140/90** across all three;
+- both databases at `alembic_version = 0002` with identical tables and
+  the three task indexes — 2.2 needed and added no migration;
+- across all 15,501 staging task rows: **0** with `lease_expires_at` set,
+  **0** with `attempt_count ≠ 0`, **0** with a NULL `correlation_id`.
+
+Public surface re-checked with **no `-k` anywhere**, so the certificate
+genuinely validated: real Let's Encrypt cert (`CN=YR1`) valid to
+2026-10-22, `/health` on `5e66a9b`, the new `/tasks` route live through
+the ingress, dashboard 401 anonymous / 200 authenticated. Edge rate limit
+still exact: 15 rapid registrations → **5 × 401, 10 × 429**. Prometheus
+confirmed scraping `coordinator_tasks_queued` from all three staging pods
+(queried the Prometheus API — not assumed from the ServiceMonitor).
+
+M1 is unaffected: a real Internet worker reaffirmed, connected, went
+ONLINE with live CPU/memory/latency, had a task claimed for it, and after
+a **SIGKILL with no graceful shutdown** the coordinator logged
+`worker_disconnected` then `ONLINE → OFFLINE` (trigger `ws_disconnected`).
+One `correlation_id` spans `tasks_enqueued` on one pod and
+`task_dequeued` on **a different pod**.
+
+**Still true and worth keeping:** `cd.yml` sets `concurrency: group
+cd-main, cancel-in-progress: false`, so while a production gate is parked
+any later CD run sits **`pending` with zero jobs**. That means "waiting
+its turn", not "broken".
+
+**Also learned:** the permission classifier blocks the agent from
+approving a production deployment gate, from creating resources in the
+`production` namespace, and from running a load-test invocation there.
+Read-only `kubectl` and `kubectl exec` of a verification script were
+allowed. Plan production verification around `exec`, not around creating
+Jobs or ConfigMaps.
 
 ### Gotchas added this session
 
@@ -87,14 +118,19 @@ means "waiting its turn", not "broken".
 
 ### Next step
 
-**Step 2.2 awaits your approval (§9).** Two things for you:
+**Step 2.2 is built, shipped, deployed to both environments and verified
+in both. It awaits only your formal approval to be marked DONE (§15).**
 
-1. **Approve the parked `production` gate** on CD run `30353450893` if you
-   want production on 2.2 — or leave it; staging is the verified one.
-2. **Confirm Decision #83's judgement call** — the `POST /tasks/dequeue`
-   endpoint. It is a queue primitive (the caller names the worker), not an
-   assignment decision, but it edges toward Step 2.3's territory. Without
-   it the three-replica criterion could not have been proven at all.
+One thing to confirm when you approve: **Decision #83's judgement call** —
+the `POST /tasks/dequeue` endpoint. It is a queue primitive (the caller
+names the worker), not an assignment decision, but it edges toward Step
+2.3's territory. Without it the three-replica criterion could not have
+been proven against real replicas at all.
+
+Housekeeping when convenient: staging's task table holds ~15.5k ASSIGNED
+rows and production ~450 from verification. Left deliberately as audit
+trail; harmless, and `TRUNCATE tasks` clears them if you want a clean
+slate before 2.3.
 
 **Then Step 2.3 — assignment engine — NOT STARTED. Do not begin without
 the user's go-ahead (§9).**
