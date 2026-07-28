@@ -1,0 +1,68 @@
+# Step 2.2 — durable task queue verification, run against real coordinator
+# replicas. Scripted + versioned per CLAUDE.md §4/§7.
+#
+# Hits the in-cluster Service (coordinator:8443), NOT the public ingress:
+# the edge limit-rps (Step 1.5.5) would throttle a drain to a few requests
+# per second, which measures nginx rather than the queue. Because the
+# Service load-balances, N concurrent dequeuers are genuinely N coordinator
+# *replicas* dequeuing — and the harness reports which pod served each
+# claim, so that is evidence rather than an inference from N pods Running.
+#
+# The harness itself lives in scripts/queue_harness.py — one source of
+# truth. It is mounted from a ConfigMap built out of that file, so this
+# manifest never carries a second copy to drift.
+#
+# ADMIN_SECRET comes from the existing app-secrets Secret. No credential
+# appears in this file (CLAUDE.md §12).
+#
+# Run:
+#   kubectl -n staging create configmap queue-harness \
+#     --from-file=queue_harness.py=scripts/queue_harness.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n staging apply -f infra/loadtest-queue.yaml
+#   kubectl -n staging logs -f job/queue-harness
+# Remove:
+#   kubectl -n staging delete -f infra/loadtest-queue.yaml
+#   kubectl -n staging delete configmap queue-harness
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: queue-harness
+  namespace: staging
+  labels: { app: queue-harness }
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: { app: queue-harness }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: harness
+          image: python:3.12-slim
+          command: ["python", "/harness/queue_harness.py"]
+          args:
+            - verify
+            - --count=10000
+            - --dequeuers=3
+            # In-cluster hop to the coordinator's self-signed pod cert —
+            # the same hop nginx already makes. TLS is never terminated in
+            # the clear (§3.8); this only skips verification of the dev CA.
+            - --insecure
+          env:
+            - name: COORDINATOR_URL
+              value: https://coordinator:8443
+            - name: ADMIN_SECRET
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: ENROLLMENT_SECRET }
+          volumeMounts:
+            - { name: harness, mountPath: /harness, readOnly: true }
+          # Explicit limits are mandatory: the namespace ResourceQuota
+          # counts limits.cpu/memory, so a pod without them is rejected.
+          # The harness is network-I/O bound, so this is ample.
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { cpu: 300m, memory: 256Mi }
+      volumes:
+        - name: harness
+          configMap: { name: queue-harness }
