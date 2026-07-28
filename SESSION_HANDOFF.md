@@ -64,17 +64,29 @@ Merged as PR #19. CI green, **101 passed** (was 92). `main` at `fabb012`.
 - Neither secret appears in any log line; the committed sealed secrets
   contain no plaintext.
 
-### ⚠️ Production is still vulnerable — one click fixes it
+### Production — fixed, and measured rather than assumed
 
-Production runs the **pre-2.2.1** image `b27a139`. Measured, not assumed:
-the enrollment secret still returns **200** on production's
-`/tasks/depth`.
+The user approved the parked CD gates. **Both environments run
+`6eb32ca`.**
 
-CD run **`30361968699`** has its `production` gate `waiting`. Approving it
-is blocked from the agent by the permission classifier. **The
-`admin-secret` Secret has already been applied to the production
-namespace**, so approving that one gate completes the fix — there is no
-second manual step.
+The decisive measurement was taken **inside a production pod**, not read
+off CD's green tick: the enrollment secret on production's
+`/tasks/depth` went from **200 before the fix to 401 after it**, and is
+401 on every other admin endpoint, while the operator credential returns
+200/201 and workers still enroll (201).
+
+- **Production 37/37, staging 37/37**, each re-run after the change with
+  its own concurrency proof — production 400 tasks / **0 duplicates**
+  split 190/210 across both pods, staging 400 / 0 across all three.
+- `coordinator_admin_credential_separate` is **1.0 on all five replicas
+  across both environments**, and every pod logged
+  `admin_credential_separate` at startup. **Not one is on the fallback.**
+- Public surface re-checked with no `-k`: worker secret 401 on
+  `/tasks/depth` through the ingress, dashboard 401 anonymous / 200
+  authenticated serving 65 workers, edge rate limit still admitting
+  exactly 5 before 429.
+
+**The defect is closed in every environment.**
 
 ### Things that had to change with it (each would have broken)
 
@@ -103,8 +115,19 @@ second manual step.
 
 ### Next step
 
-**Step 2.2.1 awaits approval.** Then, and only with your go-ahead,
-**Step 2.3 — assignment engine — NOT STARTED.**
+**Step 2.2.1 is built, shipped, deployed to BOTH environments and verified
+in both (37/37 each). It awaits only your formal approval to be marked
+DONE (§15).**
+
+Then, and only with your go-ahead, **Step 2.3 — assignment engine — NOT
+STARTED.**
+
+**The one thing 2.2.1 does NOT do**, stated so it is not mistaken for
+solved: it separates *operator* from *worker*, but it does not introduce
+operator *identity*. `ADMIN_SECRET` is still a single shared secret — no
+per-user attribution, no rotation story beyond re-sealing, no audit of
+which human acted. That is the remaining deferral, and it is now the only
+thing `config.admin_secret` defers rather than the vulnerability itself.
 
 ---
 
