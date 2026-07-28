@@ -45,7 +45,7 @@ from app.config import (
 from app.db import engine, get_session
 from app.logging_config import configure_logging
 from app.metrics import MetricsMiddleware, metrics_endpoint
-from app.middleware import CorrelationIDMiddleware, correlation_id_var
+from app.middleware import CorrelationIDMiddleware, client_ip_var, correlation_id_var
 from app.models import Worker
 from app.redis_client import redis_client
 from app.schemas import (
@@ -88,6 +88,22 @@ WS_HELLO_TIMEOUT_SECONDS = 10
 # socket (written into the Redis connection registry). Hostname is
 # already unique per container/pod with zero extra config.
 COORDINATOR_INSTANCE_ID = socket.gethostname()
+
+
+def _admin_log(**fields: object) -> dict[str, object]:
+    """Log extras for an admin-endpoint event, stamped with the caller's
+    apparent address.
+
+    `ADMIN_SECRET` is a single shared operator credential (Step 2.2.1), so
+    the coordinator can say *that* an operator acted but not *which human*.
+    The address is the closest thing to attribution that exists today —
+    a hint, deliberately not an identity, and never an authentication
+    input. See `middleware._client_ip` for why it can be spoofed. It is
+    stamped on the rejection paths too, which is where it earns its keep:
+    the Step 1.5.6 auth-spike alert is built on `*_rejected` log events,
+    and "where from" is what makes such an alert actionable.
+    """
+    return {"client_ip": client_ip_var.get(), **fields}
 
 
 def _run_migrations() -> None:
@@ -431,7 +447,7 @@ async def list_workers(response: Response, x_admin_secret: str = Header(default=
     one workers enroll with (see `config.admin_secret`)."""
     if not verify_admin_secret(x_admin_secret):
         response.status_code = 401
-        logger.warning("list_workers_rejected_invalid_admin_secret")
+        logger.warning("list_workers_rejected_invalid_admin_secret", extra=_admin_log())
         return {"detail": "invalid admin credential"}
 
     async with get_session() as session:
@@ -561,7 +577,7 @@ async def revoke_worker(worker_id: str, body: RevokeRequest, response: Response)
     """
     if not verify_admin_secret(body.admin_secret):
         response.status_code = 401
-        logger.warning("revoke_rejected_invalid_admin_secret")
+        logger.warning("revoke_rejected_invalid_admin_secret", extra=_admin_log(worker_id=worker_id))
         return {"detail": "invalid admin credential"}
 
     try:
@@ -580,7 +596,7 @@ async def revoke_worker(worker_id: str, body: RevokeRequest, response: Response)
         worker.status = "QUARANTINED"
         await session.commit()
 
-    logger.info("worker_revoked", extra={"worker_id": worker_id})
+    logger.info("worker_revoked", extra=_admin_log(worker_id=worker_id))
     logger.info(
         "worker_state_transition",
         extra={"worker_id": worker_id, "from": old_status, "to": "QUARANTINED", "trigger": "worker_revoked"},
@@ -867,7 +883,7 @@ async def push_to_worker(worker_id: str, body: PushRequest, response: Response) 
     """
     if not verify_admin_secret(body.admin_secret):
         response.status_code = 401
-        logger.warning("push_rejected_invalid_admin_secret")
+        logger.warning("push_rejected_invalid_admin_secret", extra=_admin_log(worker_id=worker_id))
         return {"detail": "invalid admin credential"}
 
     try:
@@ -878,7 +894,7 @@ async def push_to_worker(worker_id: str, body: PushRequest, response: Response) 
 
     envelope = Envelope(message_type=body.message_type, worker_id=worker_id, payload=body.payload or {})
     await redis_client.publish(f"worker:{worker_id}:push", json.dumps(envelope.to_dict()))
-    logger.info("push_published", extra={"worker_id": worker_id, "message_type": body.message_type})
+    logger.info("push_published", extra=_admin_log(worker_id=worker_id, message_type=body.message_type))
     return {"status": "published", "correlation_id": envelope.correlation_id}
 
 
@@ -907,7 +923,7 @@ async def enqueue_tasks(body: EnqueueTaskRequest, response: Response) -> dict[st
     """
     if not verify_admin_secret(body.admin_secret):
         response.status_code = 401
-        logger.warning("enqueue_rejected_invalid_admin_secret")
+        logger.warning("enqueue_rejected_invalid_admin_secret", extra=_admin_log())
         return {"detail": "invalid admin credential"}
 
     correlation_id = correlation_id_var.get()
@@ -929,13 +945,13 @@ async def enqueue_tasks(body: EnqueueTaskRequest, response: Response) -> dict[st
         response.status_code = 400
         logger.warning(
             "enqueue_rejected_invalid_task",
-            extra={"task_type": body.task_type, "detail": str(exc)},
+            extra=_admin_log(task_type=body.task_type, detail=str(exc)),
         )
         return {"detail": str(exc)}
 
     logger.info(
         "tasks_enqueued",
-        extra={"task_type": body.task_type, "count": len(task_ids), "priority": body.priority},
+        extra=_admin_log(task_type=body.task_type, count=len(task_ids), priority=body.priority),
     )
     # Ids are returned only for a single-task create. Echoing 10,000 UUIDs
     # back would make the response bigger than the request that caused it,
@@ -960,7 +976,7 @@ async def task_queue_depth(response: Response, x_admin_secret: str = Header(defa
     """
     if not verify_admin_secret(x_admin_secret):
         response.status_code = 401
-        logger.warning("task_depth_rejected_invalid_admin_secret")
+        logger.warning("task_depth_rejected_invalid_admin_secret", extra=_admin_log())
         return {"detail": "invalid admin credential"}
 
     async with get_session() as session:
@@ -986,7 +1002,7 @@ async def dequeue_tasks(body: DequeueTaskRequest, response: Response) -> dict[st
     """
     if not verify_admin_secret(body.admin_secret):
         response.status_code = 401
-        logger.warning("dequeue_rejected_invalid_admin_secret")
+        logger.warning("dequeue_rejected_invalid_admin_secret", extra=_admin_log())
         return {"detail": "invalid admin credential"}
 
     try:
@@ -1011,13 +1027,13 @@ async def dequeue_tasks(body: DequeueTaskRequest, response: Response) -> dict[st
     for task in claimed:
         logger.info(
             "task_dequeued",
-            extra={
-                "task_id": str(task["id"]),
-                "worker_id": body.worker_id,
-                "task_type": task["task_type"],
-                "correlation_id": task["correlation_id"],
-                "coordinator_instance": COORDINATOR_INSTANCE_ID,
-            },
+            extra=_admin_log(
+                task_id=str(task["id"]),
+                worker_id=body.worker_id,
+                task_type=task["task_type"],
+                correlation_id=task["correlation_id"],
+                coordinator_instance=COORDINATOR_INSTANCE_ID,
+            ),
         )
 
     return {

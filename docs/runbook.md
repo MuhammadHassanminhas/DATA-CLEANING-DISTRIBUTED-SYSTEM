@@ -251,6 +251,119 @@ endpoint. The output names which coordinator pod served each claim, and
 
 ---
 
+## Rotate the operator credential (`ADMIN_SECRET`)
+
+`ADMIN_SECRET` guards every admin endpoint: `GET /workers`, the task
+endpoints, revoke and push. It is **one shared secret with no per-user
+identity** — the system can record that an operator acted, not which
+human. So rotation is all-or-nothing: everyone who holds it is cut off at
+the same moment and must be given the new value. There is no way to
+revoke one person's access.
+
+**Rotate when:** someone who held it leaves; you suspect it leaked; or on
+whatever schedule you decide. Nothing rotates it automatically.
+
+**Before you start:** this cuts off the dashboard and any harness run
+mid-flight. Workers are unaffected — they hold `ENROLLMENT_SECRET`, a
+different credential, and never see this one.
+
+```powershell
+# 1. New value. Keep it out of your shell history if that matters to you.
+$new = python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# 2. Sanity check: it must NOT equal ENROLLMENT_SECRET, or you have
+#    silently reverted the Step 2.2.1 separation.
+$enroll = (Select-String -Path .env -Pattern '^ENROLLMENT_SECRET=' |
+           ForEach-Object { $_.Line -replace '^ENROLLMENT_SECRET=','' }).Trim()
+if ($new -eq $enroll) { throw "collision - generate again" }
+
+# 3. Re-seal for both namespaces. Offline against the committed public
+#    cert, so the cluster does not need to be running for this step.
+foreach ($ns in @('staging','production')) {
+  kubectl create secret generic admin-secret --namespace $ns `
+      --from-literal=ADMIN_SECRET=$new --dry-run=client -o yaml |
+    kubeseal --cert infra/sealed-secrets/pub-cert.pem --format yaml --scope strict |
+    Out-File -FilePath "infra/sealed-secrets/$ns-admin-secret.yaml" -Encoding ascii
+}
+
+# 4. Update your own .env (gitignored) so local tooling keeps working.
+(Get-Content .env) -replace '^ADMIN_SECRET=.*', "ADMIN_SECRET=$new" |
+  Set-Content .env -Encoding ascii
+
+# 5. Commit the re-sealed files. They are ciphertext; the plaintext is
+#    never committed. Verify that before pushing:
+git diff --cached | Select-String -SimpleMatch $new   # must print NOTHING
+
+# 6. Apply, then restart so the pods pick up the new env value. A Secret
+#    change does NOT restart pods on its own.
+kubectl apply -f infra/sealed-secrets/staging-admin-secret.yaml
+kubectl apply -f infra/sealed-secrets/production-admin-secret.yaml
+foreach ($ns in @('staging','production')) {
+  kubectl -n $ns rollout restart deploy/coordinator deploy/dashboard
+  kubectl -n $ns rollout status  deploy/coordinator --timeout=5m
+}
+```
+
+**Verify the rotation actually took** — do not trust the rollout alone:
+
+```powershell
+$b = "https://dcds-staging.centralindia.cloudapp.azure.com"
+# Old value must now be rejected.
+curl.exe -s -o /dev/null -w "%{http_code}`n" -H "x-admin-secret: $old" "$b/tasks/depth"   # expect 401
+# New value must work.
+curl.exe -s -o /dev/null -w "%{http_code}`n" -H "x-admin-secret: $new" "$b/tasks/depth"   # expect 200
+# Workers must be unaffected — they never held this credential.
+curl.exe -s -o /dev/null -w "%{http_code}`n" -X POST "$b/workers/register" `
+  -H 'Content-Type: application/json' `
+  -d "{`"enrollment_secret`":`"$enroll`",`"agent_version`":`"post-rotation`"}"           # expect 201
+```
+
+Then confirm no replica fell back to the shared secret:
+
+```powershell
+foreach ($ns in @('staging','production')) {
+  foreach ($p in (@((kubectl -n $ns get pods -l app=coordinator -o name)) -replace '^pod/','')) {
+    kubectl -n $ns exec $p -- python -c "import ssl,urllib.request;ctx=ssl._create_unverified_context();print([l for l in urllib.request.urlopen('https://localhost:8443/metrics',context=ctx).read().decode().splitlines() if l.startswith('coordinator_admin_credential_separate')][0])"
+  }
+}
+```
+
+Every replica must print `1.0`. A `0.0` means that pod is running on the
+`ENROLLMENT_SECRET` fallback — every worker can call the admin endpoints
+until it is fixed. The same pods log `admin_secret_fallback_in_use` at
+WARNING on startup when that happens.
+
+**If `kubeseal` is not installed**, fetch the binary and seal offline —
+no cluster round trip is needed, only the committed public cert:
+
+```powershell
+# https://github.com/bitnami-labs/sealed-secrets/releases
+# kubeseal-<version>-windows-amd64.tar.gz -> kubeseal.exe
+```
+
+**Who to tell:** anyone who runs the harness, anyone using the dashboard
+API directly, and any CI or automation holding the old value. The
+dashboard *deployment* picks it up automatically from the Secret; a human
+using `x-admin-secret` by hand does not.
+
+### Where the caller came from
+
+Admin endpoints log `client_ip` on both the success and the rejection
+path — `tasks_enqueued`, `task_dequeued`, `worker_revoked`,
+`push_published`, and every `*_rejected_invalid_admin_secret`. It is taken
+from `X-Forwarded-For` (ingress-nginx sets it; `externalTrafficPolicy:
+Local` preserves the real source IP) and falls back to the socket peer
+for in-cluster callers.
+
+**Treat it as a hint, never as identity.** The header is client-supplied
+on the hop before the ingress, so it can be forged, and one shared
+credential means it cannot tell you *who* acted. It is useful for exactly
+one thing: noticing that an admin call — or a burst of rejected ones —
+came from somewhere you do not recognise. Pair it with the Step 1.5.6
+auth-spike alert, which fires on `*_rejected` events.
+
+---
+
 ## Secrets
 
 Cluster Secrets are committed encrypted under `infra/sealed-secrets/`
