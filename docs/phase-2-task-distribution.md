@@ -34,9 +34,32 @@ Decide and record:
   change.
 
 **Exit criteria**
-- [ ] Both major decisions recorded with alternatives and reasoning.
-- [ ] Reuses the Phase 1 message envelope unchanged.
-- [ ] Approved before code.
+- [x] Both major decisions recorded with alternatives and reasoning.
+- [x] Reuses the Phase 1 message envelope unchanged.
+- [x] Approved before code.
+
+**DECIDED 2026-07-28 — Decisions #79–#82 in `PHASE_STATE.md`.**
+
+- **Queue technology → PostgreSQL `SELECT … FOR UPDATE SKIP LOCKED`** on
+  the task table. Redis was rejected on reliability, not preference:
+  `infra/helm/platform/templates/redis.yaml` runs Redis with no PVC and
+  no persistence by Decision #39, and unlike claims/registry/metrics a
+  lost queue is rebuilt by nothing. Adding AOF would not save it — a
+  Redis queue entry and a Postgres task row cannot commit in one
+  transaction, so the dual-write can lose or duplicate a task against
+  §3.7. Postgres makes dequeue + `QUEUED→ASSIGNED` + lease stamp one
+  transaction on one row, and gives M3 lease reclaim as plain SQL.
+- **Pull versus push → hybrid.** Worker declares `max_concurrent` at
+  `hello` and emits `capacity` when a slot frees; the coordinator pushes
+  only against a free credit, over the existing pub/sub push path. Pure
+  pull would make the worker choose its own work, contradicting §3.3 and
+  forcing a rewrite at M4.
+- **Result storage → separate `task_results` table**, recommended 64 KB
+  cap and 7-day body retention (recommendations, not measurements). Kept
+  off the task row because that row is now the queue's hot path.
+- **Task type extensibility → coordinator-side type registry.** Envelope
+  unchanged, `PROTOCOL_VERSION` stays `1.0`; new `message_type` values
+  only, per Decision #6.
 
 ---
 
@@ -64,7 +87,11 @@ Decide and record:
 
 ---
 
-## Step 2.2 — Redis-backed queue
+## Step 2.2 — Durable task queue
+
+> Renamed from "Redis-backed queue" after the Step 2.0 gate chose
+> PostgreSQL (Decision #79). The old title pre-judged a choice Step 2.0
+> explicitly left open.
 
 - Queue implementation per the Step 2.0 decision.
 - Atomic dequeue — two coordinator replicas must never hand out the same

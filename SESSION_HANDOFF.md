@@ -8,6 +8,176 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## 2026-07-28 (session 9) — M2 OPENED: gate 2.0 and Step 2.1 both APPROVED
+
+**Nothing was committed, pushed, run in CI, or deployed this session.** The
+AKS cluster was never started — it is still `az aks stop`'d from session 8.
+All work is local and sits uncommitted in the working tree.
+
+### Step 2.0 — design gate — DONE, user-approved (Decisions #79–#82)
+
+Four decisions. Detail and alternatives are in `PHASE_STATE.md`; the short
+version:
+
+- **(A) Queue = PostgreSQL `SELECT … FOR UPDATE SKIP LOCKED`**, on the
+  `tasks` table itself. The user asked for "reliable and fast" and both
+  point the same way. Redis was rejected on **reliability**, and the
+  reason is not Redis's speed: `infra/helm/platform/templates/redis.yaml`
+  runs Redis with **no PVC and no persistence** by Decision #39, and
+  unlike claims/registry/metrics — which workers rebuild on reconnect —
+  **nothing rebuilds a lost queue**. Adding AOF would not have saved it
+  either: a Redis queue entry and a Postgres task row cannot commit in
+  one transaction, so the dual-write can lose or duplicate a task against
+  §3.7. Postgres makes dequeue + `QUEUED→ASSIGNED` + lease stamp one
+  transaction on one row. On speed: Redis wins per-op, but that margin
+  lands entirely in headroom this system never uses, and the one real
+  Postgres deficit (no blocking pop) is cancelled by (B) making dequeue
+  event-driven rather than a poll loop.
+- **(B) Assignment = hybrid.** Worker advertises `max_concurrent` credits
+  at `hello` and emits `capacity` when a slot frees; coordinator pushes
+  only against a free credit, over the **existing** 1.5 pub/sub push path
+  (`main.py:617-627, 852-854`). Pure pull was rejected because it makes
+  the *worker* choose its work, contradicting §3.3 and guaranteeing a
+  rewrite at M4.
+- **(C) Results = separate `task_results` table.** Recommended 64 KB cap,
+  recommended 7-day body retention. Kept off the task row because that
+  row is now the queue's hot path.
+- **(D) Task types = coordinator-side registry.** Envelope untouched,
+  `PROTOCOL_VERSION` stays `"1.0"`, new `message_type` values only.
+
+**Consequence, flagged to the user as a §16 escalation before approval:**
+Step 2.2 was titled "Redis-backed queue", which pre-judged a choice Step
+2.0 explicitly left open. **Renamed to "Durable task queue"** in both
+`PHASE_STATE.md` and `docs/phase-2-task-distribution.md`, with the reason
+recorded in place.
+
+### Step 2.1 — DONE, user-APPROVED — committed, CI green, NOT MERGED
+
+Branch **`phase-2.1-task-model`** — 2 commits (`32dfb69` feature,
+`a676c24` docs). **PR #15**, CI **green on all 7 required checks** (run
+`30346617672`).
+
+**PR #15 is stacked on PR #14.** Its base is `docs/m15-signoff`, not
+`main`, because session 8's M1.5 sign-off commit (`d490cba`) is still
+sitting in the open **PR #14** and had never been merged — branching M2
+off `main` would have dropped it, and putting M2 into #14 would have
+mixed two concerns in one PR. **Merge order is #14 then #15**; GitHub
+retargets #15 to `main` automatically when #14 lands.
+
+**CI gave a second, independent proof of the migration.** The test job
+ran **81 passed with no skips**, so the integration test executed and
+drove `alembic upgrade head` — including `0002` — through the app's real
+FastAPI lifespan against CI's ephemeral Postgres. That is not the same
+evidence as the laptop `upgrade/downgrade/upgrade` run; it is a separate
+environment reaching the same result. The single pytest warning is
+**pre-existing** — the last CI run on `main` (`4575097`) reported
+"9 passed, 1 warning" before any of this work.
+
+**STOPPED DELIBERATELY BEFORE MERGE.** Merging to `main` triggers CD
+(`cd.yml` fires on CI success on `main`), which needs the AKS cluster
+started and therefore **spends student credit**. That is the user's call,
+not an automatic next action. Nothing is deployed; staging and production
+are both still on `4575097`.
+
+New: `coordinator/app/task_states.py`, `coordinator/app/task_types.py`,
+`Task`/`TaskResult` in `coordinator/app/models.py`, migration
+`0002_create_tasks_tables.py`, `tests/test_task_states.py`,
+`tests/test_task_types.py`, root `conftest.py`.
+
+All 5 exit criteria **measured, not asserted**. The migration criterion
+was proven against a **real ephemeral `postgres:16-alpine`**: `upgrade
+head` clean from empty (`-> 0001 -> 0002`), `downgrade 0001` dropped both
+tables leaving `workers` intact with **0 orphan indexes**, then `upgrade
+head` re-applied clean. 72 new unit tests cover the state machine and the
+four task types. Suite **77 passed / 1 skipped**, `ruff check` clean.
+
+Beyond the criteria: Decision #79's index was smoke-checked with 20,000
+rows (18,000 `QUEUED`) — the real dequeue plans as `Index Scan using
+ix_tasks_queue` with **no sort node**, 0.15ms. **That is a laptop smoke
+check, not Step 2.2's 10,000-task criterion and not the 2.8 harness.**
+
+**Two judgement calls, raised at review and covered by the approval:**
+1. `task_results` is created in *this* migration, not 2.5's, so 2.5 needs
+   no schema change — same reasoning as the reserved Phase 3 columns.
+2. `priority` is **lower-is-more-urgent** (Unix nice), so one ascending
+   index serves the whole `ORDER BY` instead of a mixed-direction index.
+
+### Gotchas hit this session
+
+- **PowerShell silently corrupted SQL and produced a false result.** An
+  inline `psql -c "insert … '{\"seconds\":1}'::jsonb … i %% 5 …"` was
+  mangled by PowerShell's quote and `%` handling; the insert failed, the
+  table stayed empty, and the follow-up `EXPLAIN` happily reported a
+  `Seq Scan` on **0 rows** — a plausible-looking plan that meant nothing.
+  **For any non-trivial SQL, use the Bash tool with a `<<'SQL'` heredoc
+  and pipe into `docker exec -i`.** Docker *is* reachable from the Bash
+  tool even though `kubectl`/`terraform`/`az` are not.
+- **Local `pytest` and CI disagreed on imports.** Coordinator modules
+  import each other as `app.*`, which works only because CI sets
+  `PYTHONPATH: <workspace>:<workspace>/coordinator`. A bare local
+  `pytest` could not resolve them. Fixed with a root `conftest.py` that
+  inserts `coordinator/` into `sys.path`. Note `conftest.py` is **not**
+  in CI's `ruff check` path list — it was linted manually this session.
+- **Neither Docker nor alembic was available at session start.** The
+  Docker daemon was down (started Docker Desktop — see below) and
+  `alembic` is not installed in the system Python; a throwaway venv was
+  created under the session scratchpad to drive the migration.
+- `migrations/env.py` imported only `Worker` "to register the table with
+  `Base.metadata`". Updated to import `Task` and `TaskResult` too —
+  functionally the same module import, but the file's stated intent
+  should not go stale.
+- `pydantic` was only a transitive fastapi dependency. Pinned explicitly
+  as `pydantic>=2,<3` in `coordinator/requirements.txt` now that task
+  parameter validation depends on v2 semantics directly.
+
+### Machine state at session end
+
+- **AKS: still stopped**, untouched all session. Billing $0. Unchanged
+  from session 8 — `main` deployed at `4575097` in both environments.
+- **Docker Desktop was started on the user's laptop this session** to run
+  the migration verification, then **stopped again at session end** via
+  `docker desktop stop` — the machine is back to how it started (the
+  daemon was down at session start). The ephemeral `dcds-m21-pg` Postgres
+  container was removed; no container or volume from this session
+  survives. The `postgres:16-alpine` image stays in the local image cache
+  — deliberately, since removing it would just force a re-pull.
+  **Note for next time:** `"Docker Desktop.exe" -Shutdown` does **not**
+  stop it on this version (it opens the dashboard instead); the working
+  command is `docker desktop stop`.
+- **Uncommitted, on branch `docs/m15-signoff`** (note: this is M1.5's
+  branch — M2 work should almost certainly move to its own branch off
+  `main` before any commit):
+  - Modified: `PHASE_STATE.md`, `docs/phase-2-task-distribution.md`,
+    `coordinator/app/models.py`, `coordinator/migrations/env.py`,
+    `coordinator/requirements.txt`
+  - New: `conftest.py`, `coordinator/app/task_states.py`,
+    `coordinator/app/task_types.py`,
+    `coordinator/migrations/versions/0002_create_tasks_tables.py`,
+    `tests/test_task_states.py`, `tests/test_task_types.py`
+
+### Next step
+
+**Merge PR #14, then PR #15, then let CD deploy — then Step 2.2, durable
+task queue.** Merging needs the cluster up (`az aks start …`) since CD
+runs on CI success on `main`. 2.2 is where the
+Decision #79 claims stop being reasoning and become measurements: 10,000
+tasks enqueue/dequeue with none lost (counted), three coordinator replicas
+dequeuing concurrently never double-assigning (under load), cheap queue
+depth, no queued task lost across a full replica restart, and a stated +
+tested ordering guarantee. Do not start without the user's go-ahead (§9).
+
+**Working tree is clean** and the checked-out branch is
+`phase-2.1-task-model`, pushed and tracking `origin`.
+
+**Loose ends carried from M1.5, all still open and unchanged** (detail in
+the session-8 entry below): `GRAFANA_ADMIN_PASSWORD`/`POSTGRES_PASSWORD`
+still exposed and live by user decision; the 1.5.6 #7 Alertmanager route
+committed but never applied; `DatabaseDown`/`RedisDown` lacking the
+`absent()` guard; the old enrollment secret's post-CD rejection inferred
+but never measured; cost never tracked against estimate.
+
+---
+
 ## 2026-07-28 (session 8) — MILESTONE 1.5 COMPLETE AND SIGNED OFF
 
 **M1.5 is DONE.** Signed off by the user 2026-07-28 on SHA

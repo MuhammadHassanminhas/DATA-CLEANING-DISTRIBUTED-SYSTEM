@@ -1,4 +1,9 @@
 fastapi>=0.115,<1
+# Arrives transitively with fastapi, pinned explicitly since Phase 2.1:
+# task parameter validation depends on pydantic v2 semantics directly
+# (`ConfigDict(extra="forbid")`, `field_validator`), not just on whatever
+# fastapi happens to pull in.
+pydantic>=2,<3
 uvicorn[standard]>=0.32,<1
 sqlalchemy>=2.0,<3
 asyncpg>=0.29,<1
