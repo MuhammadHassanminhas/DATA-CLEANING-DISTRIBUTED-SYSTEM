@@ -115,12 +115,19 @@ off CD's green tick: the enrollment secret on production's
 
 ### Next step
 
-**Step 2.2.1 is built, shipped, deployed to BOTH environments and verified
-in both (37/37 each). It awaits only your formal approval to be marked
-DONE (§15).**
+**Step 2.2.1 is DONE and APPROVED (2026-07-28).** 37/37 checks and all six
+exit criteria verified live in both environments. Approved on that
+evidence rather than a personally-run demo — the user was offered the
+three-command check and chose to approve on condition the step works as
+intended. Recorded as a **user scope call** on §15 items 3–4, same family
+as Decisions #34–35 and #77, not as a verified result.
 
-Then, and only with your go-ahead, **Step 2.3 — assignment engine — NOT
-STARTED.**
+The approval rests on a fact that was checked, not assumed:
+`git diff bdb556d..61ecc4c` touches only the two doc files, so the 37/37
+runs were executed against exactly the code that is deployed.
+
+**Step 2.3 — assignment engine — NOT STARTED. Do not begin without the
+user's go-ahead (§9).**
 
 **The one thing 2.2.1 does NOT do**, stated so it is not mistaken for
 solved: it separates *operator* from *worker*, but it does not introduce
@@ -153,6 +160,23 @@ each**. Suite **108 passed** (was 101).
    Internet both logged the caller's genuine public address, not a
    cluster-internal one. Only admin lines carry it; other log lines are
    unchanged. It is a hint, never authentication.
+
+### A CD run I broke, and how to avoid repeating it
+
+The CD run for `61ecc4c` **failed**: `staging / deploy` errored with
+"AKS unreachable — likely `az aks stop`'d" and production was skipped. I
+caused it by stopping the cluster immediately after merging a docs-only
+PR, before its CD run had started.
+
+**Nothing was wrong with the deployment.** The cluster-up guard did
+exactly its job. But it left a red run on `main` and a gap between the
+deployed SHA and `main`. Both environments continued serving `bdb556d`,
+which is the verified code — docs-only commits do not change behaviour.
+
+**Rule for next time: any merge to `main` starts a CD run. Do not stop
+the cluster until that run has finished, even for a docs-only change** —
+or accept a red run and re-run the workflow after the next
+`az aks start`.
 
 ### Finding recorded, deliberately not fixed
 
