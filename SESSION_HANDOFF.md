@@ -178,6 +178,61 @@ the cluster until that run has finished, even for a docs-only change** —
 or accept a red run and re-run the workflow after the next
 `az aks start`.
 
+### Loose ends cleared before 2.3 (SHA `35d21c8`, both environments)
+
+Four of the carried-forward items are now closed, and two of them were
+closed by *disproving* the note that described them. CI **115 passed**
+(was 108). Regression **37/37 in both environments**.
+
+1. **Registration rate-limit bucketing — FIXED and proven.** Keyed on the
+   socket peer, which behind the ingress is the nginx pod, so
+   `REGISTER_RATE_LIMIT_PER_MINUTE` was a *fleet-wide* cap. M3's mass
+   reconnects would have hit it. Now keyed on the real client.
+   **Measured on staging:** two distinct Redis keys —
+   `register:ratelimit:115.186.137.41` (me, over the Internet) and
+   `register:ratelimit:10.244.1.60` (in-cluster) — and exhausting mine did
+   not touch the other's budget.
+
+   The old note said this fix would make the limit evadable. **It was
+   wrong, and a test settled it:** a request carrying
+   `X-Forwarded-For: 9.9.9.9` was logged as my real public address —
+   ingress-nginx *overwrites* the header (`use-forwarded-headers` defaults
+   to false), so it is not forgeable here. Guards kept anyway: trusted
+   only from a non-globally-routable peer, and must parse as an IP.
+
+2. **`DatabaseDown`/`RedisDown` `absent()` guard — NOT a gap; note was
+   wrong.** `_refresh_fleet_gauges` sets the gauge on every scrape, so the
+   series is absent only when the coordinator isn't scraped — which
+   `CoordinatorDown` already covers. Adding `absent()` would have fired
+   "cannot reach Postgres" with a healthy database, tripling alerts on one
+   event. Left correct, and the reasoning is now in the file so nobody
+   "hardens" it again.
+
+3. **Alertmanager `team=dcds` route — APPLIED at last.** Was committed
+   since 1.5.6 and never applied. `terraform apply` succeeded; the live
+   config now shows default receiver `"null"` with only
+   `match: {team: dcds}` reaching `chat`. Discord no longer gets the
+   kube-prometheus built-ins — which matters before M3 starts firing real
+   alerts into the same channel.
+
+4. **Cost tracked against estimate — the 1.5.9 criterion that was never
+   met.** `az consumption usage list` over 40 days: **0.00** across 170
+   records. **Caveat:** that is pretax cost on a credit-covered
+   subscription, so it does not prove no credit was drawn, and the CLI
+   does not expose the student balance. `az aks stop` remains the control.
+
+### Still open, deliberately
+
+- **`GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` exposed** — your
+  explicit decision to leave them; both in-cluster only. Rotating Postgres
+  needs a coordinated `ALTER USER` or the coordinator loses its
+  connection.
+- **The old enrollment secret's post-CD rejection was never measured** —
+  and now cannot be: the pre-rotation value was never written down, which
+  is correct. Untestable rather than untested; treat it as closed.
+- **The rotation runbook is written but never exercised.** Not blocking
+  2.3. Run one real rotation when you want it trustworthy.
+
 ### Finding recorded, deliberately not fixed
 
 Registration's pre-existing `source_ip` is the **raw socket peer**,
@@ -463,12 +518,11 @@ Decision #85 in case Step 2.8 or real growth makes index bloat matter.
 **Then Step 2.3 — assignment engine — NOT STARTED. Do not begin without
 the user's go-ahead (§9).**
 
-**Loose ends carried from M1.5, all still open and unchanged:**
-`GRAFANA_ADMIN_PASSWORD`/`POSTGRES_PASSWORD` still exposed and live by
-user decision; the 1.5.6 #7 Alertmanager route committed but never
-applied; `DatabaseDown`/`RedisDown` lacking the `absent()` guard; the old
-enrollment secret's post-CD rejection inferred but never measured; cost
-never tracked against estimate.
+**Loose ends carried from M1.5 — MOSTLY CLEARED 2026-07-28**, see the
+"Loose ends cleared before 2.3" section above. Applied the Alertmanager
+route, fixed the rate-limit bucketing, disproved the `absent()` "gap", and
+recorded a real cost figure. Still open by choice: the two exposed
+in-cluster passwords, and the rotation runbook being unexercised.
 
 ---
 
