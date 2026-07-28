@@ -1,9 +1,14 @@
 # Creates the Secrets the platform chart references, in a target namespace,
-# from the gitignored .env and certs/ — for bootstrap use. Nothing here is
-# committed to Git (CLAUDE.md §12). Production path is sealed-secrets
-# (kubeseal), controller already installed in Step 1.5.1 — wiring deferred
-# to the CI/CD phase (1.5.3/1.5.4). Runs against whatever cluster kubectl's
-# current-context points at (AKS after `az aks get-credentials`).
+# from the gitignored .env and certs/. Nothing read here is committed to Git
+# (CLAUDE.md §12). Runs against whatever cluster kubectl's current-context
+# points at (AKS after `az aks get-credentials`).
+#
+# The normal path for an existing cluster is the committed sealed secrets:
+#   kubectl apply -f infra/sealed-secrets/
+# Use this script instead when bootstrapping a NEW cluster (whose
+# sealed-secrets controller has a different key), when working locally, or
+# after rotating a value — then re-seal from the live Secret. See
+# infra/sealed-secrets/README.md.
 #
 # Usage:  ./bootstrap-secrets.ps1 -Namespace staging
 param(
@@ -31,8 +36,14 @@ $dashPass = Get-EnvVal "DASHBOARD_PASSWORD"
 
 # apply pattern = create --dry-run | apply, so re-running is idempotent.
 # Note: param must NOT be named $args ($args is a reserved automatic var).
+#
+# The exit code MUST be checked explicitly. A native command failing inside a
+# PowerShell pipeline does not trip $ErrorActionPreference="Stop", so without
+# this the script printed "Secrets ... applied" after every single apply had
+# failed — which it did, silently, against a stopped cluster.
 function Apply-Secret($secretArgs) {
   kubectl create secret generic @secretArgs --namespace $Namespace --dry-run=client -o yaml | kubectl apply -f -
+  if ($LASTEXITCODE -ne 0) { throw "kubectl apply failed for $($secretArgs[0]) in namespace '$Namespace' (exit $LASTEXITCODE). Is the cluster running?" }
 }
 
 Apply-Secret @("app-secrets", "--from-literal=ENROLLMENT_SECRET=$enroll", "--from-literal=CREDENTIAL_PEPPER=$pepper")
@@ -48,8 +59,25 @@ Apply-Secret @(
 
 # htpasswd line via openssl apr1 (openssl is already a project dependency —
 # infra/dev-ca generates the dev CA with it). nginx-ingress accepts apr1.
-$hash = (& openssl passwd -apr1 $dashPass)
-if ($LASTEXITCODE -ne 0) { throw "openssl passwd failed - is openssl on PATH?" }
+#
+# On Windows, openssl ships with Git but only on the Git Bash PATH, not the
+# PowerShell one, so a bare `openssl` call fails here. Resolve it explicitly
+# and fall back to the Git-bundled copy before giving up.
+function Resolve-OpenSsl {
+  $cmd = Get-Command openssl -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  foreach ($p in @(
+      "$env:ProgramFiles\Git\usr\bin\openssl.exe",
+      "$env:ProgramFiles\Git\mingw64\bin\openssl.exe",
+      "${env:ProgramFiles(x86)}\Git\usr\bin\openssl.exe")) {
+    if (Test-Path $p) { return $p }
+  }
+  throw "openssl not found. Install it, or run this script from Git Bash."
+}
+
+$openssl = Resolve-OpenSsl
+$hash = (& $openssl passwd -apr1 $dashPass)
+if ($LASTEXITCODE -ne 0) { throw "openssl passwd failed (using $openssl)" }
 Apply-Secret @("dashboard-basic-auth", "--from-literal=auth=$dashUser`:$hash")
 
 Write-Host "Secrets app-secrets, postgres-secret, tls-certs, dashboard-basic-auth applied to namespace '$Namespace'."
@@ -60,6 +88,7 @@ Write-Host "Secrets app-secrets, postgres-secret, tls-certs, dashboard-basic-aut
 # `/slack` appended (Discord's Slack-compatible endpoint).
 function Apply-ObsSecret($secretArgs) {
   kubectl create secret generic @secretArgs --namespace observability --dry-run=client -o yaml | kubectl apply -f -
+  if ($LASTEXITCODE -ne 0) { throw "kubectl apply failed for $($secretArgs[0]) in namespace 'observability' (exit $LASTEXITCODE). Is the cluster running?" }
 }
 $grafUser = Get-EnvVal "GRAFANA_ADMIN_USER"
 $grafPass = Get-EnvVal "GRAFANA_ADMIN_PASSWORD"
