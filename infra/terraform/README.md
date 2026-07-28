@@ -1,23 +1,32 @@
 # Step 1.5.1 — Terraform base infrastructure (Microsoft Azure / AKS)
 
-Status: **written, NOT yet applied.** Files drafted 2026-07-24 under
-Decision #57 (Azure) and the Open Questions #3 sub-gate resolution
-(Option A "Terraform owns the cluster" + node size `Standard_B2s`). No
-`terraform init/plan/apply` has run against Azure yet — provider
-versions and the sealed-secrets chart version are UNVERIFIED drafts.
+Status: **applied and live.** Written 2026-07-24 under Decision #57
+(Azure) and the Open Questions #3 sub-gate resolution (Option A
+"Terraform owns the cluster"). Applied and verified live against Azure in
+Step 1.5.1, and extended since by Steps 1.5.5 (ingress) and 1.5.6
+(observability).
 
-## What this provisions (Decision #57, sub-gate A + B2s)
+Node size is **`Standard_B2s_v2`**, not the `Standard_B2s` originally
+chosen — a forced availability substitution recorded in Decision #62.
+
+## What this provisions
 
 One `terraform apply` goes from nothing to:
 
 - **`azurerm_resource_group`** — one RG holding everything.
 - **`azurerm_kubernetes_cluster`** — **Free-tier** control plane ($0),
-  a single **`Standard_B2s`** (2 vCPU / 4GB) node, **no autoscaling**
-  (the explicit cost discipline of Decision #57).
+  `Standard_B2s_v2` (2 vCPU / 8GB) nodes, **no autoscaling** (the
+  explicit cost discipline of Decision #57). `node_count` defaults to
+  **2**, raised from 1 in Step 1.5.6 to fit the observability stack.
 - **In-cluster** (kubernetes + helm providers, pointed at the AKS cluster
   just created): `staging` / `production` namespaces (Decision #40), a
   per-namespace ResourceQuota, and the sealed-secrets controller
   (Decision #41).
+- **Public ingress** (`ingress.tf`, Step 1.5.5): a static public IP with
+  a free `*.cloudapp.azure.com` FQDN, ingress-nginx, and cert-manager
+  issuing Let's Encrypt certificates over HTTP-01.
+- **Observability** (`observability.tf`, Step 1.5.6): kube-prometheus-stack
+  (Prometheus, Grafana, Alertmanager), Loki, and Alloy.
 
 Remote state stays **Terraform Cloud** (Decision #46) — never
 cloud-specific; still gives the real state-locking this step's exit
@@ -36,7 +45,7 @@ criteria require.
 3. **Environment variables** (nothing secret is written into any `.tf`):
    ```
    export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
-   export TF_TOKEN_app_terraform_io=<terraform_token from .env>
+   export TF_TOKEN_app_terraform_io=<TF_API_TOKEN from .env>
    export TF_CLOUD_ORGANIZATION=<your Terraform Cloud org>
    ```
    The Terraform Cloud **workspace must run in LOCAL execution mode** so
@@ -71,8 +80,8 @@ kubectl get ns          # staging, production, sealed-secrets present
 
 ## Cost discipline (Decision #57)
 
-- Free control plane = **$0**; the only compute cost is the single
-  `Standard_B2s` node while it runs.
+- Free control plane = **$0**; the only compute cost is the
+  `Standard_B2s_v2` node pool (`node_count`, currently 2) while it runs.
 - **Stop the node between test sessions** (billing halts):
   ```
   az aks stop  -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
@@ -87,10 +96,13 @@ kubectl get ns          # staging, production, sealed-secrets present
 
 ## What Terraform does NOT manage
 
-- **Postgres / Redis** — self-hosted in-cluster (Decision #39) as the
-  Helm chart in Step 1.5.2, not here.
-- **Public ingress / TLS / DNS** — Step 1.5.5 (real Azure
-  LoadBalancer/IP; Cloudflare Tunnel retired, Decision #57).
+- **Postgres / Redis / coordinator / dashboard** — the platform Helm
+  chart in `infra/helm/platform` (Decision #39), deployed by CD or by
+  `helm upgrade`, not by Terraform.
+- **Cluster Secrets** — Terraform installs the sealed-secrets
+  controller, but the Secrets themselves live encrypted in
+  `infra/sealed-secrets/` and are applied with `kubectl apply -f`.
+  See `infra/sealed-secrets/README.md`.
 - **Container images** — ghcr.io (Decision #45).
 - **Azure Container Registry / Key Vault / Storage backend** — NOT used
   (Decision #57 — each would burn student credit for no benefit).

@@ -6,22 +6,29 @@ status. Architecture reasoning and design decisions live in
 `docs/phase-1-reliable-worker-network.md` and `PHASE_STATE.md`'s
 Decisions Log — not repeated here.
 
-Phase 1.1 scope: repository, environment, and CI skeleton only. The
-coordinator and dashboard expose a bare `/health` endpoint and nothing
-else yet; the worker holds no coordinator connection. Registration,
-auth, the real transport, and the live dashboard arrive in Phases
-1.2–1.8.
+**Current scope: Milestone 1 complete, Milestone 1.5 in progress.**
+Workers register, authenticate, hold a persistent WebSocket session,
+heartbeat, and reconnect; the dashboard shows the fleet live. The
+platform runs on Azure AKS behind a public TLS ingress with CI/CD and an
+observability stack. `PHASE_STATE.md` is the authoritative status — this
+paragraph is a summary, not a substitute.
+
+Two ways to run it, both documented below: **Docker Compose** for local
+development, and **Azure AKS** for the deployed environments.
 
 ## Layout
 
 ```
-coordinator/   FastAPI coordinator service
-worker/        Worker agent
-dashboard/     Operator dashboard (placeholder page for now)
-protocol/      Shared wire-protocol definitions (coordinator + worker)
-infra/         Local dev CA / TLS certificate generation
-scripts/       Operational scripts (teardown, etc.)
-docs/          Phase specs and architecture docs
+coordinator/       FastAPI coordinator service
+worker/            Worker agent + bootstrap installers (Docker and native)
+dashboard/         Operator dashboard (live fleet view)
+protocol/          Shared wire-protocol definitions (coordinator + worker)
+infra/dev-ca/      Local dev CA / TLS certificate generation
+infra/terraform/   Azure resource group, AKS, ingress, observability
+infra/helm/        Platform chart (coordinator, dashboard, Postgres, Redis)
+scripts/           Operational scripts (teardown, etc.)
+docs/              Phase specs, runbook, worker onboarding
+.github/workflows/ CI and CD pipelines
 ```
 
 ## Prerequisites
@@ -67,6 +74,80 @@ bash scripts/teardown.sh
 
 Stops and removes all containers, networks, and volumes. Generated
 certs under `certs/` are left in place.
+
+## Fresh-clone sequence — Azure AKS (Milestone 1.5)
+
+The Compose sequence above is the local path. This is the deployed path,
+from a clone to a running cluster.
+
+### Additional prerequisites
+
+- Azure CLI, logged in (`az login`) against a subscription that can
+  create an AKS cluster
+- Terraform CLI, and an HCP Terraform (app.terraform.io) account whose
+  workspace is set to **LOCAL execution mode** — remote execution cannot
+  use your local `az` credentials
+- `kubectl` and `helm`
+
+```bash
+# 1. Secrets. Every key in section 3 and 4 of .env.example is required
+#    by infra/helm/bootstrap-secrets.ps1, which throws on a missing key.
+cp .env.example .env
+# fill in every replace-me value
+
+# 2. Register the Azure resource providers (once per subscription)
+az provider register --namespace Microsoft.ContainerService
+az provider register --namespace Microsoft.Compute
+az provider register --namespace Microsoft.Network
+
+# 3. Provision the cluster and in-cluster platform services
+export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+export TF_TOKEN_app_terraform_io=<TF_API_TOKEN from .env>
+export TF_CLOUD_ORGANIZATION=<TF_CLOUD_ORGANIZATION from .env>
+cd infra/terraform && terraform init && terraform apply
+```
+
+On a from-nothing run the kubernetes/helm providers cannot configure
+themselves against a cluster that does not exist yet. If the first apply
+fails that way, stage it once:
+
+```bash
+terraform apply -target=azurerm_kubernetes_cluster.main
+terraform apply
+```
+
+```powershell
+# 4. Point kubectl at the new cluster
+az aks get-credentials -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+
+# 5. Create the Secrets the platform chart expects. These are committed
+#    encrypted; the in-cluster sealed-secrets controller decrypts them.
+kubectl apply -f infra/sealed-secrets/
+```
+
+The sealed Secrets are encrypted against **this project's** controller
+key. Standing up an entirely new cluster gives you a new key, so seal
+your own from `.env` instead — see `infra/sealed-secrets/README.md`:
+
+```powershell
+./infra/helm/bootstrap-secrets.ps1 -Namespace staging
+./infra/helm/bootstrap-secrets.ps1 -Namespace production
+```
+
+```bash
+# 6. Deploy the platform chart
+helm upgrade --install platform infra/helm/platform \
+  -n staging -f infra/helm/platform/values-staging.yaml --atomic
+```
+
+After the first manual deploy, CD takes over: a merge to `main` runs CI,
+and on CI success `cd.yml` deploys the built SHA to staging
+automatically and to production behind an approval gate. CD requires the
+`ARM_*` and `TF_API_TOKEN` secrets to be configured on the GitHub
+repository — a fresh fork will not have them.
+
+Cost discipline, day-to-day operations, rollback, scaling, and teardown
+are all in **`docs/runbook.md`**.
 
 ## CI
 

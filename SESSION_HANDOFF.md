@@ -8,6 +8,43 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## 2026-07-28 — SECURITY: credentials were exposed in this file, now rotated
+
+**This file previously contained `ENROLLMENT_SECRET` and
+`DASHBOARD_PASSWORD` in plaintext** (6 occurrences). The repository is
+public, so both were published on GitHub together with the public
+coordinator endpoint and the public worker image — enough for anyone to
+enroll a worker into the fleet and log into the dashboard. A direct
+CLAUDE.md §12 violation.
+
+**Done:** both values rotated in `.env`, the plaintext scrubbed from this
+file, and the sealed manifests in `infra/sealed-secrets/` re-sealed
+against the new values.
+
+**NOT done — the old credentials are still live.** The cluster was
+stopped when the rotation ran, so the new values never reached the
+cluster Secrets. Until the steps below run, the leaked credentials still
+work:
+
+```powershell
+az aks start -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+az aks get-credentials -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+kubectl apply -f infra/sealed-secrets/
+kubectl -n staging rollout restart deploy/coordinator deploy/dashboard deploy/demo-worker
+kubectl -n production rollout restart deploy/coordinator deploy/dashboard
+```
+
+A rollout restart is required: `ENROLLMENT_SECRET` is injected as an env
+var at pod start, so running pods keep serving the old value until they
+are replaced.
+
+**Never put a credential in this file again.** Reference the `.env` key
+name instead. Scrubbing the working copy does not remove the old values
+from Git history — they remain in earlier commits and in any clone or
+fork. Rotation, not deletion, is what actually remediates this.
+
+---
+
 ## 2026-07-27 (session 7) — LATEST: Step 1.5.8 DONE + APPROVED (CPU/mem gap fixed; rest waived by user)
 
 **Step 1.5.8 (Real Internet worker onboarding) — DONE, user-APPROVED 2026-07-27.** The one
@@ -95,8 +132,8 @@ Already verified toward the 5 types: laptop Docker + 2nd PC (1.5.5, #1/#2), nati
 **Cluster state at session end:** `az aks stop` issued (billing $0). `az aks start -g
 data-cleaning-distributed-system-rg -n data-cleaning-distributed-system` + `az aks get-credentials
 ...` to resume; endpoint `https://dcds-staging.centralindia.cloudapp.azure.com` comes back ~1-2 min
-after start. Enrollment secret `dev-enrollment-secret-6f3a1c`; dashboard `operator` /
-`D68y1YIA6v9rF3g`. **Uncommitted at end:** PHASE_STATE.md + this file's next-step edits only (doc);
+after start. Enrollment secret `$ENROLLMENT_SECRET`; dashboard `operator` /
+`$DASHBOARD_PASSWORD`. **Uncommitted at end:** PHASE_STATE.md + this file's next-step edits only (doc);
 untracked loose ends unchanged (`.claude.backup/`, `.playwright-mcp/`, screenshots,
 `demo-worker.yaml`, `infra/apply-*.ps1`).
 
@@ -438,15 +475,17 @@ curl -s https://dcds-staging.centralindia.cloudapp.azure.com/health
 # criterion 3 — (re)start the 60-min soak if needed, then check an hour later
 docker run -d --name dcds-ext-worker --rm=false \
   -e COORDINATOR_URL=https://dcds-staging.centralindia.cloudapp.azure.com \
-  -e WORKER_CA_FILE= -e ENROLLMENT_SECRET=dev-enrollment-secret-6f3a1c \
+  -e WORKER_CA_FILE= -e ENROLLMENT_SECRET=$ENROLLMENT_SECRET \
   ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system-worker:69028dee1613923daed0c5da2fe4970ffd586e1f
 # ...60 min later:  docker logs dcds-ext-worker | tail -3   (epoch still 1 = pass)
 
 # criterion 6 — on a SEPARATE PC on a different network (copy exactly, do not retype):
-docker run --rm -e COORDINATOR_URL=https://dcds-staging.centralindia.cloudapp.azure.com -e WORKER_CA_FILE= -e ENROLLMENT_SECRET=dev-enrollment-secret-6f3a1c ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system-worker:69028dee1613923daed0c5da2fe4970ffd586e1f
+docker run --rm -e COORDINATOR_URL=https://dcds-staging.centralindia.cloudapp.azure.com -e WORKER_CA_FILE= -e ENROLLMENT_SECRET=$ENROLLMENT_SECRET ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system-worker:69028dee1613923daed0c5da2fe4970ffd586e1f
 ```
-Enrollment secret = `dev-enrollment-secret-6f3a1c` (all lowercase).
-Dashboard basic-auth login = `operator` / `D68y1YIA6v9rF3g` (in .env).
+Enrollment secret and dashboard basic-auth password both come from the
+gitignored `.env` (`ENROLLMENT_SECRET`, `DASHBOARD_USER`,
+`DASHBOARD_PASSWORD`). They are never written into this file — see the
+2026-07-28 credential-exposure note at the top.
 
 ### Terraform / secrets gotchas (so they don't bite again)
 - `TF_CLOUD_ORGANIZATION=DATA_CLEANING_DISTRIBUTED_SYS` is now saved in

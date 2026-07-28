@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: alertmanager-webhook
+  namespace: observability
+spec:
+  encryptedData:
+    webhook-url: AgAP18dWVmpZj71auhFsEwnUyC9Qgdw2BWaNqeU5YRPAdcnB7VYQMHW72qRTj0Svk8hyWPTmqRi90hq+Wic2swCg5+8jV9qeWhXjNSCqNXUG2mDEtacR1+tC6iFMOhsKFqb6nCvpV6fOPP8ECTXVdWVFtBcgH/HnhhXOHQxOQEe2TGYNLbQclyD03q6EvoGOS856wR1MB+1w9jAtYFJG+3WAF2xt/QKsPztL7doz/LgjoXSFMbCUHcm/4qpBr1Fwj5F2G9QZcqWA9CyfMzlvQgNhcAAna2EBr9SERCS3OUENabaPQlepRyjrZ/fIHqnQH2Pu81GnDMAbXHejnt5lP8HIRumW47NJOHPrAMvifnp/PzX0GlY8rhP7FI8RGq7b1b9PtE5AKSikxGBCxK8BUnDjJTW/lrXKx+IDWGEs774tM/115Qa/hePUxMSXyRe2XJMIfjUhUBFMcLc1HfH5GRyMl6e2l98L6LwQtm7goL0SSIoyzHO+BDay4IsslWOer6WDYbdnqnYcytt5BWsDGr6JPvRB5sA/XZ7PH3JXCBm8YLD4CpfE63EDJ8TL0nYfA8pn3wkqJqN5am+UAxSnEssQB7prAUVAxEflk4sqA5V0ecKqUz8sshYfLxBZdnsoudgW+nCpfhrBOmQxkiUuBzOkcSLnJV5DRDMKmbun3NzNg4ei6nSfbLNjXedjd6U6PEhutPW/YTu47Bfzuz6kgCHamxwbqYwrTjesCaBkuZearYw6toUksvN5rR3oTjpaHpt1So+54cNsNHzcD5gQ7r1DpzxFuKclXiJv9hzm7OH4WsT58p69BFH+UjqY7PqioP9rJ7nQDsl661ylhkkpFFF0ncq+z6nStCX1YicERcCU
+  template:
+    metadata:
+      name: alertmanager-webhook
+      namespace: observability
+    type: Opaque

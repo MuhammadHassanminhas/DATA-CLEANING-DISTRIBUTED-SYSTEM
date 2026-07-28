@@ -40,8 +40,18 @@ resource "azurerm_kubernetes_cluster" "main" {
 
   default_node_pool {
     name       = "system"
-    vm_size    = var.node_vm_size # Standard_B2s (sub-gate Open Questions #3)
-    node_count = var.node_count   # single node, autoscaling left disabled
+    vm_size    = var.node_vm_size # Standard_B2s_v2 (sub-gate Open Questions #3, forced substitution Decision #62)
+    node_count = var.node_count   # 2 nodes since Step 1.5.6; autoscaling left disabled
+
+    # Declared so it matches what AKS already set. Left undeclared, the API
+    # defaults (max_surge 10%) still get applied server-side but Terraform
+    # sees an undeclared block in state and plans to remove it on every run —
+    # a permanent phantom diff that made `plan` non-empty for no real change.
+    upgrade_settings {
+      max_surge                     = "10%"
+      drain_timeout_in_minutes      = 0
+      node_soak_duration_in_minutes = 0
+    }
   }
 
   identity {

@@ -1,0 +1,14 @@
+---
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: dashboard-basic-auth
+  namespace: staging
+spec:
+  encryptedData:
+    auth: AgAPllNs0zeT9ocM+Gzzn0mO70o5evpnkVijb9V3Ym2SYXIhLae/16VteiklAZ4gmbWkXyu+86+PaTSv+BjHRXiEE2QuOhRNj9+bQ3H6XPwBtQAG1TYthxG1r2lZUKdphbKp/a8lUmiVznMLZQouR+RlUdZuzWj1hqSV22tVMpWtM17jNgHmx35uh9Sk2NZbNlskTWaHpehwGDuKD351tQEfO+s14mtethWIim9LzH6P1ry4PxxbbwYqOL/26g851+at070WIKzZqtoI0tasE1sDPskJLymHoUyF+v7qHglAZIsM9xgu6Y4K32DUvwM7g5TXDPuASV03KKQxSPi8gb/s4c6qpXceD3SYBUSTBCQSi5qGKd6xRS024+kSk0he85vp8/wThBkPifgJydrFPXaQP02RacdJLAbmT/f1+xarT6yYULjuzFBm1P6IJVuYIs87bgyVmJ7bHB6PXwDjRmYzAq/sEPxf9UU31PIgOshkTIsb/u6jhERcZY4e2SCUx2r31/OhkjdSTZFB727cMC4OwDblwPuk0d9x3eDkpaFFuCHdubdzhs7xyV71Br+P5AeP9Sy9QQC5L67m35DZN6QHFUy796lGCKHaW/F0+offjw37+0RR6ohGEpA8s3XVODle8nFLSXBWL8g6UlzL0jX+zSorgPIlj2t9+2YiNm9O3YSmdkwls6AfYPzddtOivqEgDoS8JwmRGJ8XjBFPshUSrBS6qdWHTgrwsNp3VGnGQONaRdOiJNjnO7dkRGnZ
+  template:
+    metadata:
+      name: dashboard-basic-auth
+      namespace: staging
+    type: Opaque
