@@ -51,14 +51,33 @@ Step 2.2 was titled "Redis-backed queue", which pre-judged a choice Step
 `PHASE_STATE.md` and `docs/phase-2-task-distribution.md`, with the reason
 recorded in place.
 
-### Step 2.1 — DONE, user-APPROVED 2026-07-28 — but NOT YET SHIPPED
+### Step 2.1 — DONE, user-APPROVED — committed, CI green, NOT MERGED
 
-**Read this before building on it.** The step is approved, but the code
-was never committed, never ran in CI, and was never deployed — and it is
-sitting on `docs/m15-signoff`, which is M1.5's branch. **First action next
-session: branch off `main`, move this work onto it, PR → CI → CD**, the
-same path every step since 1.5.3 has taken. Step 2.2 builds directly on
-this schema, so shipping it first keeps `main` honest.
+Branch **`phase-2.1-task-model`** — 2 commits (`32dfb69` feature,
+`a676c24` docs). **PR #15**, CI **green on all 7 required checks** (run
+`30346617672`).
+
+**PR #15 is stacked on PR #14.** Its base is `docs/m15-signoff`, not
+`main`, because session 8's M1.5 sign-off commit (`d490cba`) is still
+sitting in the open **PR #14** and had never been merged — branching M2
+off `main` would have dropped it, and putting M2 into #14 would have
+mixed two concerns in one PR. **Merge order is #14 then #15**; GitHub
+retargets #15 to `main` automatically when #14 lands.
+
+**CI gave a second, independent proof of the migration.** The test job
+ran **81 passed with no skips**, so the integration test executed and
+drove `alembic upgrade head` — including `0002` — through the app's real
+FastAPI lifespan against CI's ephemeral Postgres. That is not the same
+evidence as the laptop `upgrade/downgrade/upgrade` run; it is a separate
+environment reaching the same result. The single pytest warning is
+**pre-existing** — the last CI run on `main` (`4575097`) reported
+"9 passed, 1 warning" before any of this work.
+
+**STOPPED DELIBERATELY BEFORE MERGE.** Merging to `main` triggers CD
+(`cd.yml` fires on CI success on `main`), which needs the AKS cluster
+started and therefore **spends student credit**. That is the user's call,
+not an automatic next action. Nothing is deployed; staging and production
+are both still on `4575097`.
 
 New: `coordinator/app/task_states.py`, `coordinator/app/task_types.py`,
 `Task`/`TaskResult` in `coordinator/app/models.py`, migration
@@ -138,18 +157,17 @@ check, not Step 2.2's 10,000-task criterion and not the 2.8 harness.**
 
 ### Next step
 
-**Ship the approved 2.1 work (branch off `main` → PR → CI → CD), then
-Step 2.2 — durable task queue.** 2.2 is where the
+**Merge PR #14, then PR #15, then let CD deploy — then Step 2.2, durable
+task queue.** Merging needs the cluster up (`az aks start …`) since CD
+runs on CI success on `main`. 2.2 is where the
 Decision #79 claims stop being reasoning and become measurements: 10,000
 tasks enqueue/dequeue with none lost (counted), three coordinator replicas
 dequeuing concurrently never double-assigning (under load), cheap queue
 depth, no queued task lost across a full replica restart, and a stated +
 tested ordering guarantee. Do not start without the user's go-ahead (§9).
 
-**Before committing any M2 code:** branch off `main` — the current branch
-`docs/m15-signoff` is M1.5 sign-off work. Nothing from session 9 is
-committed, so the 2.1 files are still loose in the working tree; moving
-them is a `git checkout -b` away, not a cherry-pick.
+**Working tree is clean** and the checked-out branch is
+`phase-2.1-task-model`, pushed and tracking `origin`.
 
 **Loose ends carried from M1.5, all still open and unchanged** (detail in
 the session-8 entry below): `GRAFANA_ADMIN_PASSWORD`/`POSTGRES_PASSWORD`
