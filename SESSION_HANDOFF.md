@@ -8,44 +8,95 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## 2026-07-28 — SECURITY: credentials were exposed in this file, now rotated
+## 2026-07-28 (session 8) — MILESTONE 1.5 COMPLETE AND SIGNED OFF
 
-**This file previously contained `ENROLLMENT_SECRET` and
-`DASHBOARD_PASSWORD` in plaintext** (6 occurrences). The repository is
-public, so both were published on GitHub together with the public
-coordinator endpoint and the public worker image — enough for anyone to
-enroll a worker into the fleet and log into the dashboard. A direct
-CLAUDE.md §12 violation.
+**M1.5 is DONE.** Signed off by the user 2026-07-28 on SHA
+`4575097157debe48d71b9f3aff86248c599d5b1e` (PR #13 merge), deployed by CD
+to **both** staging and production — `/health` returned that exact SHA in
+each. Full detail and the honest exit-criteria accounting are in
+`PHASE_STATE.md` (1.5.9 register row + Decision #78).
 
-**Done:** both values rotated in `.env`, the plaintext scrubbed from this
-file, and the sealed manifests in `infra/sealed-secrets/` re-sealed
-against the new values.
+**Next: M2 — Task Distribution, design gate 2.0. NOT STARTED. Do not
+begin without the user's go-ahead (§9).**
 
-**NOT done — the old credentials are still live.** The cluster was
-stopped when the rotation ran, so the new values never reached the
-cluster Secrets. Until the steps below run, the leaked credentials still
-work:
+### What this session did
 
-```powershell
-az aks start -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
-az aks get-credentials -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
-kubectl apply -f infra/sealed-secrets/
-kubectl -n staging rollout restart deploy/coordinator deploy/dashboard deploy/demo-worker
-kubectl -n production rollout restart deploy/coordinator deploy/dashboard
-```
+Started as "is M1.5 actually closeable?" and found four real problems.
 
-A rollout restart is required: `ENROLLMENT_SECRET` is injected as an env
-var at pod start, so running pods keep serving the old value until they
-are replaced.
+1. **Credential exposure (§12 violation).** This file held
+   `ENROLLMENT_SECRET` and `DASHBOARD_PASSWORD` in plaintext across six
+   occurrences, on a public repo, next to the public coordinator FQDN and
+   public worker image. **Both rotated and applied live. Verified: old
+   enrollment secret → 401, new → 201; old dashboard password → 401, new
+   → 200; anonymous → 401.**
+2. **Fresh-clone gap (§13).** Cluster Secrets lived only in the
+   gitignored `.env`. Nine Secrets now committed encrypted under
+   `infra/sealed-secrets/`, validated 9/9 from an actual fresh clone.
+3. **Terraform drift was undetectable.** CRLF-vs-LF made three
+   `helm_release` values diff against identical text, so the plan could
+   never come clean and real drift hid in the noise. Plan went **4 → 1**.
+4. **`bootstrap-secrets.ps1` reported success after every apply failed.**
+   Native command failures in a PowerShell pipeline do not trip
+   `$ErrorActionPreference="Stop"`. Fixed, plus openssl resolution.
 
-**Never put a credential in this file again.** Reference the `.env` key
-name instead. Scrubbing the working copy does not remove the old values
-from Git history — they remain in earlier commits and in any clone or
-fork. Rotation, not deletion, is what actually remediates this.
+Also newly proven, never tested before at any point: **database offline**
+→ readiness fails with 0 restarts, `DatabaseDown` fires to Discord at
+T+3m41s, full recovery 38s after restore, no data loss.
+
+### Still open — read before starting M2
+
+- **`GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD` are still exposed
+  and still live.** Both were public via `.env.example` history. The user
+  explicitly decided to leave them. Rotating Postgres needs a coordinated
+  `ALTER USER` or the coordinator loses its DB connection; Grafana stores
+  its admin user in its own database. Both are in-cluster only.
+- **Step 1.5.6 #7 Alertmanager route: committed, deliberately not
+  applied.** Discord still receives the noisy kube-prometheus built-ins.
+  This is the single change `terraform plan` reports. Apply with
+  `infra/apply-alertmanager-route.ps1` whenever wanted.
+- **`DatabaseDown`/`RedisDown` use `max(...)==0`** and fire only because
+  Prometheus still scrapes NotReady pods. Works today, but lacks the
+  `absent()` guard `CoordinatorDown` got in 1.5.6 C3. Worth hardening in
+  M3.
+- **A DB outage 503s the entire public surface, dashboard included** —
+  correct Kubernetes behaviour, but the debugging UI disappears exactly
+  when it is most wanted.
+- **Not verified:** that the old enrollment secret is still rejected
+  *after* the CD redeploy. The cluster was stopped before that check
+  finished. Indirect evidence is strong (9/9 SealedSecrets `synced=True`
+  post-CD, Secrets are SealedSecret-owned so Helm cannot revert them) but
+  it is inferred, not measured. Re-check on next cluster start.
+- **Cost was never tracked against estimate** — a 1.5.9 exit criterion
+  that was not met.
+- One stray `REGISTERED` worker row (`agent_version=rotation-check`) from
+  the rotation test; it will never connect.
+
+### Operational notes
+
+- Secrets now come from `kubectl apply -f infra/sealed-secrets/`, **not**
+  from `bootstrap-secrets.ps1`. Those Secrets are owned by their
+  SealedSecrets, so deleting a SealedSecret garbage-collects its Secret.
+- Adopting pre-existing Secrets needed the
+  `sealedsecrets.bitnami.com/managed=true` annotation **plus a controller
+  restart** — the controller refuses to take over Secrets it does not
+  own, and logs "giving up" without retrying.
+- `docs/runbook.md` now holds deploy, rollback, scale, teardown, health
+  checks, and every failure mode previous sessions hit.
+- **Never put a credential in this file again.** Reference the `.env` key
+  name. Scrubbing does not remove values from Git history — they persist
+  in earlier commits and in every clone and fork. Rotation, not deletion,
+  is the remediation.
+
+### Cluster state at session end
+
+**Stopped** (`az aks stop` by the user, billing $0). Resume with
+`az aks start` + `az aks get-credentials`; the public endpoint returns
+1–2 min after start. Working tree clean; `main` at `4575097`, everything
+pushed.
 
 ---
 
-## 2026-07-27 (session 7) — LATEST: Step 1.5.8 DONE + APPROVED (CPU/mem gap fixed; rest waived by user)
+## 2026-07-27 (session 7) — Step 1.5.8 DONE + APPROVED (CPU/mem gap fixed; rest waived by user)
 
 **Step 1.5.8 (Real Internet worker onboarding) — DONE, user-APPROVED 2026-07-27.** The one
 real gap left from session 6 — native Windows/macOS workers showing blank CPU/memory on the
