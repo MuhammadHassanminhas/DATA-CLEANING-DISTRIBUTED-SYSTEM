@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import database_url
 from app.db import Base
-from app.models import Worker  # noqa: F401  — registers the table with Base.metadata
+from app.models import Task, TaskResult, Worker  # noqa: F401  — registers the tables with Base.metadata
 
 config = context.config
 
