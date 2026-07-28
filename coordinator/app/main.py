@@ -34,6 +34,8 @@ from app.config import (
     heartbeat_sweep_interval_seconds,
     register_rate_limit_per_minute,
     run_migrations_on_startup,
+    task_dequeue_max_batch,
+    task_enqueue_max_batch,
     worker_claim_ttl_seconds,
     ws_ping_interval_seconds,
     ws_pong_timeout_seconds,
@@ -46,6 +48,8 @@ from app.middleware import CorrelationIDMiddleware, correlation_id_var
 from app.models import Worker
 from app.redis_client import redis_client
 from app.schemas import (
+    DequeueTaskRequest,
+    EnqueueTaskRequest,
     PushRequest,
     RegisterRequest,
     ReleaseRequest,
@@ -60,6 +64,14 @@ from app.security import (
     verify_credential,
     verify_enrollment_secret,
 )
+from app.task_queue import (
+    QueueLimitExceeded,
+    counts_by_status,
+    dequeue,
+    enqueue_batch,
+    queue_depth,
+)
+from app.task_types import InvalidTaskParameters, UnknownTaskType
 from protocol import PROTOCOL_VERSION, Envelope
 
 logger = logging.getLogger("coordinator")
@@ -853,3 +865,158 @@ async def push_to_worker(worker_id: str, body: PushRequest, response: Response) 
     await redis_client.publish(f"worker:{worker_id}:push", json.dumps(envelope.to_dict()))
     logger.info("push_published", extra={"worker_id": worker_id, "message_type": body.message_type})
     return {"status": "published", "correlation_id": envelope.correlation_id}
+
+
+# --------------------------------------------------------------------------
+# Task queue (Phase 2.2)
+#
+# Deliberately minimal: enqueue, depth, and the dequeue primitive. That is
+# what Step 2.2's own exit criteria need to be demonstrable, and no more.
+# The full operator surface — list, inspect, cancel, filter — is Step 2.6,
+# and the logic that *decides* which worker gets a task is Step 2.3.
+#
+# Guarded by the same stand-in admin credential as /workers and revoke
+# (see `config.enrollment_admin_secret`): there is still no real operator
+# auth model, and inventing one here would be out of scope.
+# --------------------------------------------------------------------------
+
+
+@app.post("/tasks", status_code=201)
+async def enqueue_tasks(body: EnqueueTaskRequest, response: Response) -> dict[str, object]:
+    """Create one or more queued tasks.
+
+    Every task carries the request's correlation ID from creation (§11 and
+    a Phase 2.1 exit criterion), so a task is traceable back to the call
+    that made it, and a bulk enqueue shares one ID across the batch.
+    """
+    if not verify_admin_secret(body.admin_secret):
+        response.status_code = 401
+        logger.warning("enqueue_rejected_invalid_admin_secret")
+        return {"detail": "invalid admin credential"}
+
+    correlation_id = correlation_id_var.get()
+
+    try:
+        async with get_session() as session:
+            task_ids = await enqueue_batch(
+                session,
+                task_type=body.task_type,
+                correlation_id=correlation_id,
+                count=body.count,
+                max_batch=task_enqueue_max_batch(),
+                parameters=body.parameters,
+                payload=body.payload,
+                priority=body.priority,
+            )
+            await session.commit()
+    except (UnknownTaskType, InvalidTaskParameters, QueueLimitExceeded) as exc:
+        response.status_code = 400
+        logger.warning(
+            "enqueue_rejected_invalid_task",
+            extra={"task_type": body.task_type, "detail": str(exc)},
+        )
+        return {"detail": str(exc)}
+
+    logger.info(
+        "tasks_enqueued",
+        extra={"task_type": body.task_type, "count": len(task_ids), "priority": body.priority},
+    )
+    # Ids are returned only for a single-task create. Echoing 10,000 UUIDs
+    # back would make the response bigger than the request that caused it,
+    # for no caller that needs them — a bulk enqueue is a load operation.
+    return {
+        "status": "queued",
+        "count": len(task_ids),
+        "task_ids": [str(task_id) for task_id in task_ids] if len(task_ids) == 1 else None,
+        "correlation_id": correlation_id,
+    }
+
+
+@app.get("/tasks/depth")
+async def task_queue_depth(response: Response, x_admin_secret: str = Header(default="")) -> dict[str, object]:
+    """Queue depth — the cheap read (Step 2.2 exit criterion) that backs
+    the dashboard's queue-size figure (§6).
+
+    `counts` is the fuller lifecycle breakdown for Step 2.7 and is a
+    grouped scan, not the cheap path; `depth` is the index range count.
+    Both are recomputed from Postgres per call — nothing is cached here,
+    so every replica answers identically (§3.9).
+    """
+    if not verify_admin_secret(x_admin_secret):
+        response.status_code = 401
+        logger.warning("task_depth_rejected_invalid_admin_secret")
+        return {"detail": "invalid admin credential"}
+
+    async with get_session() as session:
+        depth = await queue_depth(session)
+        counts = await counts_by_status(session)
+
+    return {"depth": depth, "counts": counts}
+
+
+@app.post("/tasks/dequeue")
+async def dequeue_tasks(body: DequeueTaskRequest, response: Response) -> dict[str, object]:
+    """Atomically claim queued tasks for a named worker.
+
+    A queue primitive, exposed so the "three coordinator replicas
+    dequeuing concurrently never double-assign" criterion can be proven
+    against real replicas rather than only against three local processes.
+    Step 2.3's assignment engine calls `task_queue.dequeue` directly and
+    is what will decide *which* worker to claim for; this endpoint stays
+    as the operator/harness entry point.
+
+    An empty `tasks` list is a normal answer, not an error — see
+    `task_queue.dequeue`.
+    """
+    if not verify_admin_secret(body.admin_secret):
+        response.status_code = 401
+        logger.warning("dequeue_rejected_invalid_admin_secret")
+        return {"detail": "invalid admin credential"}
+
+    try:
+        worker_uuid = uuid.UUID(body.worker_id)
+    except ValueError:
+        response.status_code = 400
+        return {"detail": "worker_id is not a valid UUID"}
+
+    try:
+        async with get_session() as session:
+            claimed = await dequeue(
+                session,
+                worker_id=worker_uuid,
+                limit=body.limit,
+                max_batch=task_dequeue_max_batch(),
+            )
+            await session.commit()
+    except QueueLimitExceeded as exc:
+        response.status_code = 400
+        return {"detail": str(exc)}
+
+    for task in claimed:
+        logger.info(
+            "task_dequeued",
+            extra={
+                "task_id": str(task["id"]),
+                "worker_id": body.worker_id,
+                "task_type": task["task_type"],
+                "correlation_id": task["correlation_id"],
+                "coordinator_instance": COORDINATOR_INSTANCE_ID,
+            },
+        )
+
+    return {
+        "count": len(claimed),
+        "tasks": [
+            {
+                "task_id": str(task["id"]),
+                "task_type": task["task_type"],
+                "parameters": task["parameters"],
+                "payload": task["payload"],
+                "priority": task["priority"],
+                "correlation_id": task["correlation_id"],
+                "assigned_at": task["assigned_at"].isoformat(),
+            }
+            for task in claimed
+        ],
+        "coordinator_instance": COORDINATOR_INSTANCE_ID,
+    }

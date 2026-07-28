@@ -3,8 +3,11 @@
 #
 # One public hostname, path-routed to two backends (the worker only ever
 # hits /workers and /ws, so there is no path collision with the dashboard):
-#   /workers /ws /health /ready  → coordinator (8443)
-#   /  /api                      → dashboard   (8444)
+#   /workers /ws /tasks /health /ready  → coordinator (8443)
+#   /  /api                             → dashboard   (8444)
+#
+# /tasks was added in Step 2.2. Without it the queue endpoints would fall
+# through to the catch-all `/` dashboard rule below and 404.
 #
 # Both backends already serve HTTPS with the in-cluster dev cert, so the
 # backend-protocol is HTTPS: ingress-nginx re-encrypts to the pod and TLS
@@ -37,7 +40,7 @@ spec:
     - host: {{ .Values.ingress.host | quote }}
       http:
         paths:
-          {{- range $p := list "/workers" "/ws" "/health" "/ready" }}
+          {{- range $p := list "/workers" "/ws" "/tasks" "/health" "/ready" }}
           - path: {{ $p }}
             pathType: Prefix
             backend:

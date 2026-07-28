@@ -62,6 +62,24 @@ def enrollment_admin_secret() -> str:
     return enrollment_secret()
 
 
+def task_enqueue_max_batch() -> int:
+    """Recommendation, not a measured value (Phase 2.2). Caps how many
+    tasks one `POST /tasks` call may create, so a single request cannot
+    hold a transaction open unboundedly. Set at 10,000 because that is
+    exactly the figure Step 2.2's own exit criterion names — the criterion
+    must be reachable in one call, since the public ingress rate-limits
+    requests per second (Step 1.5.5). Revise against Step 2.8's harness."""
+    return int(os.environ.get("TASK_ENQUEUE_MAX_BATCH", "10000"))
+
+
+def task_dequeue_max_batch() -> int:
+    """Recommendation, not a measured value (Phase 2.2). Caps how many
+    tasks one dequeue may claim at once. Small on purpose: a large claim
+    locks that many rows for the length of the transaction, which is the
+    one way `SKIP LOCKED` concurrency can be made to behave badly."""
+    return int(os.environ.get("TASK_DEQUEUE_MAX_BATCH", "100"))
+
+
 def ws_ping_interval_seconds() -> int:
     """Recommendation, not a measured value. How often the coordinator
     sends an application-level `ping` envelope over a live connection —
