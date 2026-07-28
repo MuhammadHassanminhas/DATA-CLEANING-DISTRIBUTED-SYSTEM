@@ -45,7 +45,12 @@ from app.config import (
 from app.db import engine, get_session
 from app.logging_config import configure_logging
 from app.metrics import MetricsMiddleware, metrics_endpoint
-from app.middleware import CorrelationIDMiddleware, client_ip_var, correlation_id_var
+from app.middleware import (
+    CorrelationIDMiddleware,
+    _caller_ip,
+    client_ip_var,
+    correlation_id_var,
+)
 from app.models import Worker
 from app.redis_client import redis_client
 from app.schemas import (
@@ -329,7 +334,12 @@ async def register_worker(request: Request, body: RegisterRequest, response: Res
     decided by whether the caller presents a fresh enrollment secret or
     an already-issued worker_id/worker_credential pair.
     """
-    source_ip = request.client.host if request.client else "unknown"
+    # The real caller, not the ingress pod. Keying the rate limiter on the
+    # socket peer put every external worker in one shared bucket, turning
+    # a per-client limit into a fleet-wide one — see `middleware._caller_ip`
+    # for the measurement that showed the forwarded value is trustworthy
+    # behind this ingress.
+    source_ip = _caller_ip(request)
 
     if await _rate_limited(source_ip):
         response.status_code = 429
