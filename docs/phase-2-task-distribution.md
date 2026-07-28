@@ -108,6 +108,46 @@ Decide and record:
 - [ ] Restarting all coordinator replicas loses no queued task.
 - [ ] Ordering guarantee stated and verified by test.
 
+**Ordering guarantee, as built.** A single dequeuer receives tasks in
+strict `(priority ASC, created_at ASC)` order — `priority` is
+lower-is-more-urgent, so both keys ascend and one index direction serves
+the whole clause. Under N concurrent dequeuers the order is *not*
+globally total: `SKIP LOCKED` is what buys the concurrency, so a
+dequeuer stepping over a locked row may claim a slightly later task
+first. What holds under concurrency is that no task is handed out twice,
+none is lost, and none is starved. Tasks enqueued inside one transaction
+share a `created_at` (Postgres `now()` is the transaction timestamp) and
+have no defined order among themselves.
+
+**How to verify it yourself.** `scripts/queue_harness.py` is the
+versioned harness; it decides pass/fail itself rather than leaving
+numbers to be eyeballed.
+
+```bash
+# Local — three coordinator processes against one Postgres.
+export COORDINATOR_URL=https://127.0.0.1:18443,https://127.0.0.1:18444,https://127.0.0.1:18445
+export ADMIN_SECRET=$ENROLLMENT_SECRET
+python scripts/queue_harness.py verify --count 10000 --dequeuers 3 --insecure
+
+# AKS staging — one Service URL, so the replicas are real pods. Run it
+# in-cluster: the public ingress rate-limits to a few requests per second,
+# which would measure nginx rather than the queue.
+kubectl -n staging run queue-harness --rm -i --restart=Never \
+  --image=python:3.12-slim \
+  --env=COORDINATOR_URL=https://coordinator:8443 \
+  --env=ADMIN_SECRET=<enrollment secret> \
+  --command -- python - verify --count 10000 --dequeuers 3 --insecure \
+  < scripts/queue_harness.py
+```
+
+`by_coordinator_instance` in the output names the pods that served the
+claims — that is the evidence three replicas took part, rather than an
+assumption drawn from three pods being Running. Locally the processes
+share a hostname, so `by_target` carries the same evidence instead.
+
+Restart criterion: read `python scripts/queue_harness.py depth`, kill
+every coordinator, bring them back, read depth again.
+
 ---
 
 ## Step 2.3 — Assignment engine

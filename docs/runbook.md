@@ -215,6 +215,42 @@ kubectl -n observability port-forward svc/kube-prometheus-stack-prometheus 9090:
 
 ---
 
+## Task queue (Phase 2.2)
+
+Queue depth, and the per-status lifecycle breakdown behind it:
+
+```powershell
+curl.exe -s -H "x-admin-secret: $env:ENROLLMENT_SECRET" `
+  https://dcds-staging.centralindia.cloudapp.azure.com/tasks/depth
+```
+
+Also exported to Prometheus as `coordinator_tasks_queued`. Every replica
+reports the same figure — collapse with `max by (...)` in queries, like
+the other fleet gauges.
+
+To load the queue or verify it end to end, run the versioned harness
+**in-cluster**. The public ingress rate-limits to a few requests per
+second (Step 1.5.5), so driving a drain through it measures nginx rather
+than the queue:
+
+```powershell
+kubectl -n staging run queue-harness --rm -i --restart=Never `
+  --image=python:3.12-slim `
+  --env=COORDINATOR_URL=https://coordinator:8443 `
+  --env=ADMIN_SECRET=$env:ENROLLMENT_SECRET `
+  --command -- python - verify --count 10000 --dequeuers 3 --insecure `
+  < scripts/queue_harness.py
+```
+
+`python -` reads the script from stdin and still receives the arguments
+after it, so there is nothing to build or copy into the cluster.
+`--insecure` covers the in-cluster hop to the self-signed pod cert, the
+same hop nginx already makes; it is never needed against the public
+endpoint. The output names which coordinator pod served each claim, and
+`verify` decides pass/fail itself.
+
+---
+
 ## Secrets
 
 Cluster Secrets are committed encrypted under `infra/sealed-secrets/`
