@@ -36,6 +36,9 @@ services:
       REDIS_PORT: 6379
       ENROLLMENT_SECRET: ${ENROLLMENT_SECRET}
       CREDENTIAL_PEPPER: ${CREDENTIAL_PEPPER}
+      # Operator credential (Step 2.2.1) — a different value from
+      # ENROLLMENT_SECRET, and never given to the worker service below.
+      ADMIN_SECRET: ${ADMIN_SECRET}
     ports:
       - "${COORDINATOR_PORT}:8443"
     volumes:
@@ -54,6 +57,9 @@ services:
       LOG_LEVEL: ${LOG_LEVEL}
       COORDINATOR_URL: https://coordinator:8443
       ENROLLMENT_SECRET: ${ENROLLMENT_SECRET}
+      # The dashboard is an operator tool, so it gets the operator
+      # credential (Step 2.2.1). The worker service below does not.
+      ADMIN_SECRET: ${ADMIN_SECRET}
     ports:
       - "${DASHBOARD_PORT}:8444"
     volumes:

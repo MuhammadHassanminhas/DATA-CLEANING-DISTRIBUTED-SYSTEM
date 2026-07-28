@@ -54,12 +54,39 @@ def access_token_ttl_seconds() -> int:
     return int(os.environ.get("ACCESS_TOKEN_TTL_SECONDS", "60"))
 
 
-def enrollment_admin_secret() -> str:
-    """Reuses ENROLLMENT_SECRET as a stand-in admin credential for the
-    revoke endpoint. No real operator/admin auth model exists yet — that's
-    an undesigned, out-of-scope feature, not invented here. Revisit when
-    one is."""
-    return enrollment_secret()
+def admin_secret() -> str:
+    """The operator credential for the admin endpoints.
+
+    Step 2.2.1. Until now this returned `enrollment_secret()`, which meant
+    **every worker in the fleet held a credential that could drive every
+    admin endpoint** — list the fleet, revoke or push to any peer, and,
+    once Step 2.2 landed, drain the entire task queue and self-assign all
+    of it. `ENROLLMENT_SECRET` is by design a *shared* bootstrap secret
+    handed to every worker (Decision #76 B1), so that made operator
+    authority fleet-wide. CLAUDE.md §12 says every worker is untrusted;
+    this is what makes that true of the admin surface.
+
+    **Falls back to `ENROLLMENT_SECRET` when `ADMIN_SECRET` is unset**, and
+    that is a deliberate rollout affordance, not an oversight: the
+    coordinator image ships before the new Secret is applied to a cluster,
+    and a hard requirement would CrashLoop every replica in the gap. The
+    fallback is announced loudly at startup (`admin_secret_fallback_in_use`,
+    WARNING) so a deployment still running on it is visible in the logs
+    rather than silently insecure. `admin_secret_is_separate()` is what a
+    test or a live check asserts against.
+    """
+    return os.environ.get("ADMIN_SECRET") or enrollment_secret()
+
+
+def admin_secret_is_separate() -> bool:
+    """True when the operator credential is genuinely distinct from the
+    shared worker enrollment secret.
+
+    False means the fallback above is active — the deployment is still in
+    the pre-2.2.1 posture where any worker can call the admin endpoints.
+    """
+    configured = os.environ.get("ADMIN_SECRET")
+    return bool(configured) and configured != enrollment_secret()
 
 
 def task_enqueue_max_batch() -> int:

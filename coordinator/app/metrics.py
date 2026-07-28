@@ -34,6 +34,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.config import admin_secret_is_separate
 from app.db import get_session
 from app.models import Worker
 from app.redis_client import redis_client
@@ -57,6 +58,17 @@ DEPENDENCY_UP = Gauge(
 # performs; the per-status breakdown is a grouped scan and stays off the
 # scrape path until Step 2.7 needs it.
 TASKS_QUEUED = Gauge("coordinator_tasks_queued", "Tasks waiting in the queue.")
+
+# Step 2.2.1 security posture. 1 = the operator credential is distinct
+# from the shared worker enrollment secret; 0 = the fallback is active and
+# every worker can call the admin endpoints. Exposed as a metric so the
+# posture is alertable and visible per replica, rather than only knowable
+# by reading a startup log line. Reveals whether the two secrets differ,
+# never either value (§12).
+ADMIN_CREDENTIAL_SEPARATE = Gauge(
+    "coordinator_admin_credential_separate",
+    "1 when ADMIN_SECRET is set and differs from ENROLLMENT_SECRET, else 0.",
+)
 
 # Per-instance request latency. Route template keeps label cardinality bounded.
 REQUEST_LATENCY = Histogram(
@@ -113,5 +125,8 @@ async def _refresh_fleet_gauges() -> None:
 
 
 async def metrics_endpoint() -> Response:
+    # Re-read per scrape rather than latch at import, so a Secret rollout
+    # is reflected without needing a restart to notice it.
+    ADMIN_CREDENTIAL_SEPARATE.set(1 if admin_secret_is_separate() else 0)
     await _refresh_fleet_gauges()
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

@@ -60,6 +60,9 @@ spec:
             - configMapRef: { name: app-config }
             - secretRef: { name: {{ .Values.secretNames.app }} }
             - secretRef: { name: {{ .Values.secretNames.postgres }} }
+          # The migrate initContainer deliberately does NOT get the admin
+          # secret (Step 2.2.1): it runs alembic and serves no request, so
+          # handing it operator authority would be privilege for nothing.
           resources: {{ toYaml .Values.coordinator.resources | nindent 12 }}
       containers:
         - name: coordinator
@@ -77,6 +80,12 @@ spec:
             - configMapRef: { name: app-config }
             - secretRef: { name: {{ .Values.secretNames.app }} }
             - secretRef: { name: {{ .Values.secretNames.postgres }} }
+            # Step 2.2.1 — the operator credential, deliberately NOT in
+            # app-secrets: that Secret is the worker-facing one. `optional`
+            # so the image can roll out before the Secret is applied to a
+            # cluster; the coordinator then falls back to ENROLLMENT_SECRET
+            # and says so loudly at startup (see config.admin_secret).
+            - secretRef: { name: {{ .Values.secretNames.admin }}, optional: true }
           volumeMounts:
             - name: tls
               mountPath: /certs

@@ -29,6 +29,7 @@ from sqlalchemy import select, text
 
 from app.config import (
     access_token_ttl_seconds,
+    admin_secret_is_separate,
     heartbeat_offline_threshold_seconds,
     heartbeat_suspect_threshold_seconds,
     heartbeat_sweep_interval_seconds,
@@ -98,6 +99,20 @@ def _run_migrations() -> None:
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
     logger.info("coordinator starting")
+    # Step 2.2.1. Announced at startup rather than left to be discovered:
+    # while the fallback is active, every worker holds a credential that
+    # opens the admin endpoints (see `config.admin_secret`). Never logs
+    # either secret — only whether they are the same one (§12).
+    if admin_secret_is_separate():
+        logger.info("admin_credential_separate")
+    else:
+        logger.warning(
+            "admin_secret_fallback_in_use",
+            extra={
+                "detail": "ADMIN_SECRET is unset or equal to ENROLLMENT_SECRET; "
+                "every worker can call the admin endpoints"
+            },
+        )
     if run_migrations_on_startup():
         await asyncio.to_thread(_run_migrations)
         # Alembic's fileConfig (invoked inside _run_migrations via env.py)
@@ -411,9 +426,9 @@ async def list_workers(response: Response, x_admin_secret: str = Header(default=
     (Phase 1.6/1.5) for a live view, reflecting CLAUDE.md §3.9: no
     authoritative state lives in coordinator memory, so this reaches
     both stores fresh on every call rather than caching anything here.
-    Same stand-in admin credential as `/revoke` and `/push` (see
-    `config.enrollment_admin_secret`'s docstring) — no dedicated
-    operator auth model exists yet."""
+    Same operator credential as `/revoke`, `/push` and the task endpoints
+    — since Step 2.2.1 that is `ADMIN_SECRET`, a different secret from the
+    one workers enroll with (see `config.admin_secret`)."""
     if not verify_admin_secret(x_admin_secret):
         response.status_code = 401
         logger.warning("list_workers_rejected_invalid_admin_secret")
@@ -533,10 +548,10 @@ async def verify_token(response: Response, authorization: str = Header(default="
 
 @app.post("/workers/{worker_id}/revoke")
 async def revoke_worker(worker_id: str, body: RevokeRequest, response: Response) -> dict[str, str]:
-    """Revoke a worker ID. No dedicated operator/admin auth model exists
-    yet (that's an undesigned, out-of-scope feature) — reuses
-    `ENROLLMENT_SECRET` as a stand-in admin credential; see
-    `config.enrollment_admin_secret`'s docstring.
+    """Revoke a worker ID. Guarded by the operator credential, which since
+    Step 2.2.1 is `ADMIN_SECRET` and is deliberately NOT the secret workers
+    enroll with — otherwise any worker could revoke its peers (see
+    `config.admin_secret`).
 
     Effect is immediate on every enforcement point that exists today:
     register/reaffirm and token refresh both check `revoked` and reject
@@ -875,9 +890,10 @@ async def push_to_worker(worker_id: str, body: PushRequest, response: Response) 
 # The full operator surface — list, inspect, cancel, filter — is Step 2.6,
 # and the logic that *decides* which worker gets a task is Step 2.3.
 #
-# Guarded by the same stand-in admin credential as /workers and revoke
-# (see `config.enrollment_admin_secret`): there is still no real operator
-# auth model, and inventing one here would be out of scope.
+# Guarded by the operator credential, same as /workers and revoke. Since
+# Step 2.2.1 that is `ADMIN_SECRET` rather than the shared enrollment
+# secret — these endpoints are exactly why that split had to happen, since
+# otherwise any worker could drain the queue (see `config.admin_secret`).
 # --------------------------------------------------------------------------
 
 

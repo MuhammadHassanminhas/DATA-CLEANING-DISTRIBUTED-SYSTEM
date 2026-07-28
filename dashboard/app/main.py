@@ -28,7 +28,12 @@ from fastapi import FastAPI, Response
 from fastapi.responses import FileResponse
 
 COORDINATOR_URL = os.environ["COORDINATOR_URL"]
-ADMIN_SECRET = os.environ["ENROLLMENT_SECRET"]
+# Step 2.2.1: the dashboard is an operator tool, so it carries the operator
+# credential — not the shared worker enrollment secret it used to reuse.
+# Same fallback as the coordinator (`config.admin_secret`) so the image can
+# roll out before the Secret exists; both must resolve to the same value or
+# the coordinator answers 401.
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET") or os.environ["ENROLLMENT_SECRET"]
 CA_FILE = os.environ.get("DASHBOARD_CA_FILE", "/certs/dev-ca.crt")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 

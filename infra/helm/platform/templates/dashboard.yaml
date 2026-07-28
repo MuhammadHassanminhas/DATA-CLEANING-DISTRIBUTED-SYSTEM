@@ -26,6 +26,10 @@ spec:
           envFrom:
             - configMapRef: { name: app-config }
             - secretRef: { name: {{ .Values.secretNames.app }} }
+            # Step 2.2.1 — the dashboard is an operator tool and needs the
+            # operator credential to read /workers. Optional for the same
+            # rollout reason as the coordinator's.
+            - secretRef: { name: {{ .Values.secretNames.admin }}, optional: true }
           volumeMounts:
             - name: tls
               mountPath: /certs
