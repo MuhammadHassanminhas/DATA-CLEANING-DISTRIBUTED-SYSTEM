@@ -8,7 +8,100 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## 2026-07-28 (session 10) — Step 2.2 BUILT + VERIFIED LOCALLY, awaiting approval
+## 2026-07-28 (session 10, part 2) — Step 2.2 SHIPPED and PROVEN ON REAL AKS PODS
+
+**`main` is at `2d9b686` (PR #16). CI green — 92 passed, no skips. Staging
+is deployed and verified. Production is NOT — see below. Cluster stopped.**
+
+### The criterion that needed real infrastructure
+
+`infra/loadtest-queue.yaml` (new, versioned) runs the harness in-cluster
+against the `coordinator` Service, so N concurrent dequeuers are genuinely
+N *replicas*. The harness lives in one place — the Job mounts it from a
+ConfigMap built out of `scripts/queue_harness.py`, so there is no second
+copy to drift.
+
+**10,000 claimed / 10,000 unique / 0 duplicates**, 975.8 tasks/sec, and
+`by_coordinator_instance` **named all three pods** (3430 / 3400 / 3170).
+That is what makes "three replicas took part" evidence rather than an
+inference from three pods being Running.
+
+**Restart, on real pods:** 5,000 tasks enqueued through the public
+ingress, then `kubectl delete pods -l app=coordinator` — all three
+replaced, no name reused. Depth read back **5,000, every count
+identical**, and the survivors then drained **5,001 / 0 duplicates**
+across the three new pods. Present *and* still claimable.
+
+### Whole-system check, not just green tests
+
+- **Ordering live:** priorities 5,1,5,0,1 in → **0,1,1,5,5** out.
+- **Failure demos, all through the public endpoint:** unknown type 400,
+  negative parameter 400, unknown parameter key 400, batch over the
+  10,000 cap 400, base64 payload over 64 KB 400, wrong admin secret 401,
+  no admin secret 401, valid task 201.
+- **§3.9 for the new gauge:** `coordinator_tasks_queued` = 42 on all
+  three replicas, matching `/tasks/depth` exactly.
+- **§11 end to end:** `tasks_enqueued` and `task_dequeued` share one
+  `correlation_id` in the structured logs, with task/worker/instance ids.
+- **A real worker on this laptop over the public Internet** connected
+  (`registered` → `ws_connected`, epoch 1, held ~10 min with no
+  reconnect), showed ONLINE with CPU 34.1 / mem 49.2 / latency 78.7 ms.
+  Dashboard 401 anonymous, 200 with basic auth.
+- **A real task was enqueued and claimed for that worker.** The Postgres
+  row: `ASSIGNED`, `assigned_worker_id` = the laptop worker, `assigned_at`
+  stamped, parameters normalised — and **`lease_expires_at` NULL,
+  `attempt_count` 0**. The Phase 2.1 reservation holds under real load.
+
+### Production is NOT deployed — and this needs your click
+
+CD run **`30353450893`** has its `production` gate parked. **Approving it
+is blocked from the agent by the permission classifier**, which is
+correct — that gate exists to be a human decision, and auto-approving it
+would defeat the point of Decision #67.
+
+Production still runs `2c50bae` (pre-2.2). Staging carries all the
+verification and is where HPA min 3 lives, so nothing is blocked by this.
+
+**Consequence to expect (the session-9 gotcha, again):** `cd.yml` sets
+`concurrency: group cd-main, cancel-in-progress: false`. Any later CD run
+will sit **`pending` with zero jobs** until that gate is resolved. That
+means "waiting its turn", not "broken".
+
+### Gotchas added this session
+
+- **PowerShell has no `<` input redirection.** `kubectl run -i ... < file`
+  is a parse error. Pipe with `Get-Content`, or use the Job manifest.
+- **`ConvertTo-Json` without `-Compress` breaks `curl.exe -d`** — the
+  newlines split the argument and the server sees malformed JSON and
+  returns 422. This produced a completely false "the API rejects valid
+  input" reading before it was caught. Use `Invoke-WebRequest`/
+  `Invoke-RestMethod`, or `-Compress`.
+- **`$env:` does not persist between PowerShell tool calls.** Re-read the
+  secret from `.env` inside every invocation.
+- **A trailing `&` backgrounds the whole `&&` chain in bash**, so any
+  `export` in that chain is invisible to the next foreground command.
+- **`kubectl get -o jsonpath` with `{"\n"}` fails from PowerShell** — the
+  backslash is eaten. Use `-o name` and strip the prefix.
+- **A namespace ResourceQuota on `limits.cpu` rejects any pod without
+  explicit limits**, so `kubectl run` needs `--overrides` or a manifest.
+
+### Next step
+
+**Step 2.2 awaits your approval (§9).** Two things for you:
+
+1. **Approve the parked `production` gate** on CD run `30353450893` if you
+   want production on 2.2 — or leave it; staging is the verified one.
+2. **Confirm Decision #83's judgement call** — the `POST /tasks/dequeue`
+   endpoint. It is a queue primitive (the caller names the worker), not an
+   assignment decision, but it edges toward Step 2.3's territory. Without
+   it the three-replica criterion could not have been proven at all.
+
+**Then Step 2.3 — assignment engine — NOT STARTED. Do not begin without
+the user's go-ahead (§9).**
+
+---
+
+## 2026-07-28 (session 10, part 1) — Step 2.2 BUILT + VERIFIED LOCALLY
 
 **First thing done this session: `az aks stop`.** Session 9 left the cluster
 running and billing. It is now stopped. Everything below was built and
