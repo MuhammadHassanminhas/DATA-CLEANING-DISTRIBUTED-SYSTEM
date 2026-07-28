@@ -22,22 +22,43 @@ its PATH.
 
 ---
 
-## Start and stop the cluster (cost control)
+## Start and stop the cluster (daily cycle)
 
 The node pool is the only thing that costs money; the AKS control plane
-is Free tier. Stop the nodes whenever you are not actively testing.
+is Free tier.
+
+**Run it on a daily rhythm: start once when you begin work, stop once
+when you finish.** Earlier practice was to stop between individual test
+sessions, which meant repeatedly waiting 3–5 minutes for nodes before any
+live check. With the credit budget comfortable that traded real time for
+very little money, so the cycle is now per-day rather than per-task
+(Decision #88).
 
 ```powershell
-az aks stop  -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+# Beginning of the working day
 az aks start -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
 az aks get-credentials -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+
+# End of the working day
+az aks stop  -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
 ```
 
-Check before you walk away — a cluster left running overnight is the
-single easiest way to burn the credit:
+**Two rules that have both been broken in practice:**
+
+1. **Stop it at the end of every day.** A per-day cycle is still a cycle.
+   A cluster left running overnight is the single easiest way to burn the
+   credit, and it has happened.
+2. **Do not stop it while a CD run is in flight.** Any merge to `main`
+   triggers CD; stopping the cluster underneath it fails the deploy with
+   "AKS unreachable — likely `az aks stop`'d". That is the cluster-up
+   guard behaving correctly, but it leaves a red run and a gap between
+   `main` and the deployed SHA. Check the run finished, then stop.
+
+Confirm the state either way:
 
 ```powershell
 az aks show -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system --query powerState.code -o tsv
+gh run list --workflow=cd.yml --limit 1
 ```
 
 The public endpoint returns roughly 1–2 minutes after `az aks start`.

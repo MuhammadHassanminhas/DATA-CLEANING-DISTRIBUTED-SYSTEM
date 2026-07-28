@@ -126,6 +126,10 @@ The approval rests on a fact that was checked, not assumed:
 `git diff bdb556d..61ecc4c` touches only the two doc files, so the 37/37
 runs were executed against exactly the code that is deployed.
 
+**Tomorrow, in order:** `az aks start` → merge the open docs PR if one is
+still pending → the two scheduled items in "START HERE TOMORROW" above →
+then ask before beginning Step 2.3.
+
 **Step 2.3 — assignment engine — NOT STARTED. Do not begin without the
 user's go-ahead (§9).**
 
@@ -221,17 +225,91 @@ closed by *disproving* the note that described them. CI **115 passed**
    subscription, so it does not prove no credit was drawn, and the CLI
    does not expose the student balance. `az aks stop` remains the control.
 
-### Still open, deliberately
+### ⇒ START HERE TOMORROW — two items scheduled, then 2.3
 
-- **`GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` exposed** — your
-  explicit decision to leave them; both in-cluster only. Rotating Postgres
-  needs a coordinated `ALTER USER` or the coordinator loses its
-  connection.
+Both were left open by choice, and the user has scheduled them for the
+next session. **Do them before Step 2.3**, and get the user's go-ahead
+before starting 2.3 itself (§9).
+
+**1. Rotate `GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`.**
+Both have been exposed since `.env.example` history and are still live by
+an earlier explicit user decision. Both are in-cluster only, which is why
+it was deferred rather than urgent. Two different jobs:
+
+- **Grafana** is the easy one: it stores its admin user in its own
+  database, and the chart reads the password from the `grafana-admin`
+  Secret (`admin.existingSecret` in `observability.tf`). Re-seal the
+  Secret, apply, restart the Grafana pod. Verify by logging in with the
+  new password and confirming the old one fails.
+- **Postgres is NOT a re-seal-and-restart.** The password lives in two
+  places that must change together: the `postgres-secret` Secret *and*
+  the role inside the database. Change only the Secret and the coordinator
+  loses its connection at the next restart; change only the role and it
+  loses it immediately. The order that works:
+  `ALTER USER coordinator WITH PASSWORD '<new>'` inside the running
+  postgres pod → apply the re-sealed `postgres-secret` → restart the
+  coordinator and dashboard → confirm `/ready` reports `database: ok`.
+  Do staging first, confirm, then production. Expect a brief readiness
+  blip; the pods go NotReady rather than crash-looping, and a DB outage
+  503s the whole public surface including the dashboard (learned in
+  1.5.9), so do not panic at that.
+
+**2. Exercise the `ADMIN_SECRET` rotation runbook for real.**
+`docs/runbook.md` has the procedure and its trickiest step — offline
+sealing against the committed public cert — is proven, but the end-to-end
+run has never happened. A written-but-never-run runbook is a hypothesis.
+Running one turns it into a fact, and it also rotates a credential this
+session generated. The runbook's own verification block is the acceptance
+test: old value rejected, new value works, workers unaffected, and
+`coordinator_admin_credential_separate` still `1.0` on every replica.
+
+Neither blocks Step 2.3. Both are cheap with the cluster already up.
+
+### Closed, not merely deferred
+
 - **The old enrollment secret's post-CD rejection was never measured** —
   and now cannot be: the pre-rotation value was never written down, which
-  is correct. Untestable rather than untested; treat it as closed.
-- **The rotation runbook is written but never exercised.** Not blocking
-  2.3. Run one real rotation when you want it trustworthy.
+  is correct behaviour. Untestable rather than untested. Treat as closed;
+  do not carry it forward again.
+
+### Operating model from 2026-07-29 — cluster up for the working day
+
+**The user has confirmed the credit budget is comfortable, and has
+changed how we run the cluster to move faster.**
+
+Previously (Decision #57) the rule was `az aks stop` between *test
+sessions*, which meant start/stop cycles inside a single day and a
+3–5 minute wait before any live verification. That cost more in wall-clock
+delay than it saved in credit.
+
+**New rhythm — start the cluster once at the beginning of the working day
+and stop it once at the end:**
+
+```powershell
+# first thing
+az aks start -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+az aks get-credentials -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+
+# last thing, AFTER any in-flight CD run has finished
+az aks stop  -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+```
+
+Two things this does **not** change:
+
+- **The cluster still gets stopped at the end of every day.** This is a
+  change of rhythm, not an abandonment of cost discipline — leaving it
+  running overnight is still a mistake, and this session started by
+  cleaning up exactly that.
+- **Still wait for CD before stopping.** A merge to `main` starts a CD
+  run; stopping the cluster under it produces the "AKS unreachable"
+  failure that happened to run `61ecc4c` earlier today.
+
+**Honest note on "enough credits" (§10):** this is the user's call based
+on their view of the balance, not something measured here. The figure this
+session *did* measure is 0.00 pretax cost over 40 days / 170 usage
+records — which on a credit-covered subscription does not reveal the
+remaining balance, and the CLI does not expose it. Recorded as a user
+decision, not as a verified budget.
 
 ### Finding recorded, deliberately not fixed
 
