@@ -1,0 +1,28 @@
+# Line-ending policy.
+#
+# Why this file exists: with `core.autocrlf=true` on Windows, Git stores LF
+# but checks these files out as CRLF. Terraform then reads the CRLF working
+# copy into its heredoc string values while the remote state holds LF, so
+# `terraform plan` reported every line of three helm_release values as
+# changed — identical text on both sides. That made the plan permanently
+# non-empty, which meant "plan is clean" could never be used as a drift
+# signal and real drift (the Step 1.5.6 #7 Alertmanager route) hid inside
+# the whitespace noise.
+#
+# Anything consumed by Terraform, Kubernetes, Helm, or a Linux shell is
+# pinned to LF regardless of host OS. PowerShell scripts stay CRLF.
+
+*.tf      text eol=lf
+*.tfvars  text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.sh      text eol=lf
+
+# Windows-native scripts keep CRLF.
+*.ps1     text eol=crlf
+*.bat     text eol=crlf
+
+# Never munge binaries.
+*.png     binary
+*.jpg     binary
+*.gz      binary
