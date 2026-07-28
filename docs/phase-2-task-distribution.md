@@ -150,6 +150,66 @@ every coordinator, bring them back, read depth again.
 
 ---
 
+## Step 2.2.1 — Operator credential separation
+
+Inserted between 2.2 and 2.3 rather than folded into either. It is a
+security fix with its own failure demo, and burying it inside the
+assignment engine would put two unrelated concerns in one change.
+
+**The problem.** `verify_admin_secret` compared against
+`ENROLLMENT_SECRET` — the *shared* bootstrap credential every worker holds
+by design (Decision #76 B1). So every worker could call every admin
+endpoint: list the whole fleet, revoke or push to any peer, and, once
+Step 2.2 landed, drain the entire task queue and self-assign all of it.
+CLAUDE.md §12 says every worker is untrusted; that was not true of the
+admin surface.
+
+This predates Step 2.2 — `/workers/{id}/revoke` has had it since Phase
+1.4, and `config`'s own docstring flagged it as deferred. Step 2.2 is what
+made it matter enough to fix: the blast radius went from "grief your
+peers" to "take all the work", and it stops being bounded once Step 2.4
+executes real work.
+
+- Distinct `ADMIN_SECRET`, never given to a worker.
+- Falls back to `ENROLLMENT_SECRET` when unset, so an image can roll out
+  before the Secret is applied, but announces the fallback at WARNING and
+  exports the posture as a metric — insecure-but-silent is not an option.
+- The dashboard is an operator tool and carries the operator credential;
+  the worker does not.
+- Sealed Secrets committed for both namespaces (§13, Decision #78).
+
+**Exit criteria**
+- [ ] A worker's enrollment secret is rejected by every admin endpoint.
+- [ ] The operator credential is accepted by every admin endpoint.
+- [ ] Workers can still enroll, connect, and heartbeat — the split does
+      not lock the fleet out.
+- [ ] The dashboard still reads the fleet.
+- [ ] A deployment without `ADMIN_SECRET` still serves, and says so.
+- [ ] The posture is observable without reading a log line.
+
+**How to verify it yourself**
+
+```bash
+# Must be 401 — this is the whole point of the step.
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "x-admin-secret: $ENROLLMENT_SECRET" "$BASE/tasks/depth"
+
+# Must be 200.
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "x-admin-secret: $ADMIN_SECRET" "$BASE/tasks/depth"
+
+# Must still be 201 — workers are not locked out.
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE/workers/register" \
+  -H 'Content-Type: application/json' \
+  -d "{\"enrollment_secret\":\"$ENROLLMENT_SECRET\",\"agent_version\":\"check\"}"
+```
+
+Posture, per replica, without touching a log:
+`coordinator_admin_credential_separate` — 1 means separated, 0 means the
+fallback is active and every worker can still call the admin endpoints.
+
+---
+
 ## Step 2.3 — Assignment engine
 
 - Assignment logic per the Step 2.0 pull/push decision.

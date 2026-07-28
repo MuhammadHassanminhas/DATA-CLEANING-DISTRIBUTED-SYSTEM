@@ -16,7 +16,7 @@ import hashlib
 import hmac
 import secrets
 
-from app.config import credential_pepper, enrollment_admin_secret, enrollment_secret
+from app.config import admin_secret, credential_pepper, enrollment_secret
 
 
 def generate_worker_credential() -> str:
@@ -43,4 +43,7 @@ def verify_enrollment_secret(provided: str) -> bool:
 
 
 def verify_admin_secret(provided: str) -> bool:
-    return hmac.compare_digest(provided, enrollment_admin_secret())
+    """Operator authority, deliberately a different credential from the
+    worker enrollment secret since Step 2.2.1 — see `config.admin_secret`
+    for why that separation matters and what happens before it is set."""
+    return hmac.compare_digest(provided, admin_secret())

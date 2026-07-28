@@ -21,7 +21,9 @@ queued tasks survive a restart, and is the ordering what the code claims.
 Usage
 -----
     export COORDINATOR_URL=https://coordinator:8443
-    export ADMIN_SECRET=...          # = ENROLLMENT_SECRET (stand-in admin creds)
+    export ADMIN_SECRET=...       # operator credential — drives the queue
+    export ENROLLMENT_SECRET=...  # worker credential — registers the worker
+                                  # that claims are attributed to
 
     python scripts/queue_harness.py enqueue --count 10000
     python scripts/queue_harness.py depth
@@ -98,7 +100,7 @@ def depth(base: str, secret: str) -> dict:
     return result
 
 
-def register_worker(base: str, secret: str) -> str:
+def register_worker(base: str, enrollment: str) -> str:
     """Get a real worker identity for claims to point at.
 
     `tasks.assigned_worker_id` is a foreign key, so a dequeue needs a
@@ -106,11 +108,16 @@ def register_worker(base: str, secret: str) -> str:
     enrollment endpoint keeps the harness honest: it uses the same
     identity path a real worker does, rather than inserting a synthetic
     row behind the coordinator's back.
+
+    Takes the **enrollment** secret, not the admin one. Since Step 2.2.1
+    those are different credentials: enrolling is a worker action, driving
+    the queue is an operator action, and the coordinator rejects each
+    credential on the other's endpoints.
     """
     result = _request(
         f"{base}/workers/register",
         "POST",
-        {"enrollment_secret": secret, "agent_version": "queue-harness"},
+        {"enrollment_secret": enrollment, "agent_version": "queue-harness"},
     )
     return result["worker_id"]
 
@@ -192,7 +199,12 @@ def main() -> int:
     # A comma-separated COORDINATOR_URL targets several coordinator
     # processes directly; a single URL targets a load-balanced Service.
     bases = [url.strip().rstrip("/") for url in os.environ.get("COORDINATOR_URL", "").split(",") if url.strip()]
+    # Two credentials since Step 2.2.1: ADMIN_SECRET drives the queue
+    # endpoints, ENROLLMENT_SECRET registers the worker that claims are
+    # attributed to. Each falls back to the other so this still runs
+    # against a deployment that has not been split yet.
     secret = os.environ.get("ADMIN_SECRET") or os.environ.get("ENROLLMENT_SECRET", "")
+    enrollment = os.environ.get("ENROLLMENT_SECRET") or secret
     if not bases or not secret:
         print("set COORDINATOR_URL and ADMIN_SECRET (or ENROLLMENT_SECRET)", file=sys.stderr)
         return 2
@@ -214,7 +226,7 @@ def main() -> int:
         return 0
 
     if args.mode == "drain":
-        worker_id = register_worker(base, secret)
+        worker_id = register_worker(base, enrollment)
         print(json.dumps(drain(bases, secret, worker_id, args.dequeuers, args.limit), indent=2))
         return 0
 
@@ -223,7 +235,7 @@ def main() -> int:
     before = depth(base, secret)
     enqueue_seconds = enqueue(base, secret, args.count, args.task_type, args.priority)
     after_enqueue = depth(base, secret)
-    worker_id = register_worker(base, secret)
+    worker_id = register_worker(base, enrollment)
     result = drain(bases, secret, worker_id, args.dequeuers, args.limit)
     after_drain = depth(base, secret)
 

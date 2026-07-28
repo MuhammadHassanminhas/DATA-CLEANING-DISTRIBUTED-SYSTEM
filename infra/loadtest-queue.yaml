@@ -52,7 +52,17 @@ spec:
           env:
             - name: COORDINATOR_URL
               value: https://coordinator:8443
+            # Step 2.2.1: the operator credential, from admin-secret — NOT
+            # app-secrets/ENROLLMENT_SECRET, which the admin endpoints now
+            # reject. The harness is an operator tool, so it gets operator
+            # credentials.
             - name: ADMIN_SECRET
+              valueFrom:
+                secretKeyRef: { name: admin-secret, key: ADMIN_SECRET }
+            # Registering the worker the claims are attributed to still
+            # needs the enrollment secret — a different credential for a
+            # different job, which is the entire point of the split.
+            - name: ENROLLMENT_SECRET
               valueFrom:
                 secretKeyRef: { name: app-secrets, key: ENROLLMENT_SECRET }
           volumeMounts:

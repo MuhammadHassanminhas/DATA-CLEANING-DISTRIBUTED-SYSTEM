@@ -53,6 +53,10 @@ jobs:
       REDIS_PORT: "6379"
       ENROLLMENT_SECRET: ci-enrollment-secret
       CREDENTIAL_PEPPER: ci-credential-pepper
+      # Step 2.2.1 — deliberately a DIFFERENT value from ENROLLMENT_SECRET,
+      # so CI runs in the separated posture the deployment targets rather
+      # than in the fallback. The fallback path has its own unit tests.
+      ADMIN_SECRET: ci-admin-secret
       PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/coordinator
     steps:
       - uses: actions/checkout@v4

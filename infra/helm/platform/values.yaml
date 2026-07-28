@@ -83,6 +83,7 @@ observability:
 # sealed-secrets in CI/CD Step 1.5.3/1.5.4). The chart references, never
 # defines, them.
 secretNames:
-  app: app-secrets          # ENROLLMENT_SECRET, CREDENTIAL_PEPPER
+  app: app-secrets          # ENROLLMENT_SECRET, CREDENTIAL_PEPPER — worker-facing
+  admin: admin-secret       # ADMIN_SECRET — operator only, never given to a worker (Step 2.2.1)
   postgres: postgres-secret # POSTGRES_PASSWORD
   tls: tls-certs            # coordinator.crt/key, dashboard.crt/key, dev-ca.crt
