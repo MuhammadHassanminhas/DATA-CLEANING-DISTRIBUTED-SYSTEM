@@ -11,3 +11,10 @@ certs/
 *.tfstate.*
 *.tfplan
 
+# Local tooling caches. Not project code — these have shown up as untracked
+# noise in every session's `git status` since Phase 1.5.0.
+.claude.backup/
+.playwright-mcp/
+.pytest_cache/
+.ruff_cache/
+
