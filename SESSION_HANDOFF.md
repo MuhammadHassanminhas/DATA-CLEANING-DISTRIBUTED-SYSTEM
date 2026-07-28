@@ -125,9 +125,49 @@ STARTED.**
 **The one thing 2.2.1 does NOT do**, stated so it is not mistaken for
 solved: it separates *operator* from *worker*, but it does not introduce
 operator *identity*. `ADMIN_SECRET` is still a single shared secret — no
-per-user attribution, no rotation story beyond re-sealing, no audit of
-which human acted. That is the remaining deferral, and it is now the only
-thing `config.admin_secret` defers rather than the vulnerability itself.
+per-user attribution, no audit of which human acted. That is the remaining
+deferral, and it is now the only thing `config.admin_secret` defers rather
+than the vulnerability itself.
+
+### Two follow-ups shipped (PR #22, `main` at `bdb556d`)
+
+Both deployed to staging and production; regression re-run **37/37 in
+each**. Suite **108 passed** (was 101).
+
+1. **`ADMIN_SECRET` rotation is written down** — `docs/runbook.md`. The
+   capability existed; the steps did not. Covers the collision check
+   against `ENROLLMENT_SECRET` (a collision silently reverts the whole
+   separation), the no-plaintext-in-the-commit check, `rollout restart`
+   (a Secret change does **not** restart pods by itself), and the
+   post-rotation verification that the old value is rejected, workers are
+   unaffected, and no replica fell back.
+   **Honest limit: documented, not yet exercised as a real rotation.**
+   Its trickiest step — offline sealing against the committed public cert
+   — *is* proven, since that is how the secret was created
+   (`Synced=True` in both namespaces). Run a real rotation when you want
+   the doc to be trustworthy rather than plausible.
+
+2. **`client_ip` on every admin call**, accepted and rejected alike, from
+   `X-Forwarded-For` with a socket-peer fallback. **Verified through the
+   real ingress** — a rejected and an accepted admin call from the public
+   Internet both logged the caller's genuine public address, not a
+   cluster-internal one. Only admin lines carry it; other log lines are
+   unchanged. It is a hint, never authentication.
+
+### Finding recorded, deliberately not fixed
+
+Registration's pre-existing `source_ip` is the **raw socket peer**,
+because it feeds `_rate_limited` — a control, where a forgeable value
+would let a caller mint unlimited buckets. Behind the ingress that makes
+it the nginx pod, so **every external worker currently shares one
+registration rate-limit bucket** (`REGISTER_RATE_LIMIT_PER_MINUTE`,
+default 5).
+
+Switching it to the forwarded address would fix the bucketing *and* make
+the limit evadable. That is a trade-off to decide on purpose, not a side
+effect of a logging change, so it is documented in `middleware.py` and
+left for you. The edge `limit-rps` at nginx (Step 1.5.5) is the
+unspoofable primary control either way.
 
 ---
 
