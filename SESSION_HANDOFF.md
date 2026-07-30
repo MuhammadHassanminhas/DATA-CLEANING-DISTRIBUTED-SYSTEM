@@ -8,37 +8,181 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## ⇒ 2026-07-30 (session 12) — Step 2.4 DESIGN SUB-GATE decided, awaiting approval
+
+**Nothing was implemented. No application code changed.** The sub-gate was
+decided and its premises measured; Step 2.4 itself has not begun and must
+not begin without an explicit go-ahead (§9).
+
+**Decisions #93–#100 in `PHASE_STATE.md`.** The design in one line each:
+execution in `asyncio.to_thread` (#93), chunked executors with a progress
+slot and cooperative cancel flag (#94), an explicit `task_started` message
+driving `ASSIGNED -> RUNNING` (#95), concurrency enforced by a semaphore
+plus a pool sized to `WORKER_MAX_CONCURRENT` (#96), in-flight work
+surviving a reconnect with over-commit refused rather than queued (#97),
+results computed and discarded until 2.5 (#98).
+
+**Everything was measured, not argued**, in the deployed base image
+(`python:3.12-slim`) at `--cpus=1`, via the new versioned
+`scripts/exec_isolation_bench.py`:
+
+- **Inline execution is disqualified:** the heartbeat gap becomes the
+  *entire task duration* — a 24.58s task sent **one** heartbeat where 4.9
+  were due, breaching the 12s SUSPECT threshold. A healthy worker would be
+  declared dead.
+- **`asyncio.to_thread` holds the gap at 5.01 / 5.19 / 5.47 / 5.65s** at
+  1 / 4 / 4×`count_to_n` / 8 concurrent tasks — never closer than 6.3s to
+  SUSPECT.
+- **`ProcessPoolExecutor` was measured and lost:** 68.32s vs threads'
+  58.04s (0.85x — *slower*), no heartbeat gain. On a CPU-limited container
+  there is no parallelism to win. The textbook answer was the wrong one,
+  which is exactly why it was measured.
+- Cooperative cancel stops a thread in **0.04–0.11s**; progress is
+  readable from a GIL-atomic list slot with no thread-safety machinery;
+  chunking costs nothing measurable; 300 sequential tasks moved RSS
+  **28.4 → 28.4 MB**.
+- **Honest ceiling recorded with #93:** threads buy heartbeat survival,
+  **not throughput** — 4 concurrent CPU tasks on one core measured
+  **1.03x** versus serial, i.e. nothing.
+
+### The one §16 escalation is RESOLVED — Decision #100, option (c)
+
+**The "10-minute task" exit criterion cannot be met by a CPU workload at
+the declared parameter ceilings.** Measured: `count_to_n` at its
+100,000,000 ceiling runs **8.4s**; `hash_rounds` at its 10,000,000 ceiling
+runs **15.4s**. Ten minutes of CPU needs **~388,000,000 rounds — ~38x the
+ceiling** (38–63x across runs). Only `sleep` (ceiling 3600s) reaches ten
+minutes, and a sleeping task is the workload that proves *least* about
+heartbeat survival, since it occupies a slot without using CPU.
+
+**The user chose option (c) on 2026-07-30.** The criterion is now two
+required parts, recorded as Decision #100 and written into the exit
+criteria in `docs/phase-2-task-distribution.md`:
+
+1. **The letter** — one `sleep` task with `seconds: 600` runs to
+   completion, heartbeats uninterrupted.
+2. **The substance** — the worker is additionally held **CPU-saturated for
+   ≥600s** by repeated `hash_rounds` tasks at the existing 10,000,000
+   ceiling, heartbeats uninterrupted throughout.
+
+**Pass condition for both:** ≥600s continuous execution, **zero**
+transitions out of `ONLINE` in `worker_state_transition`, and no observed
+heartbeat gap over the 12s SUSPECT threshold. No parameter ceiling is
+raised; no Step 2.1 artefact is touched.
+
+**Sizing caveat:** ~40 ceiling tasks covers 600s *as measured on this
+laptop's Docker at one CPU*. Re-derive it on the AKS worker from a fresh
+measurement — **do not copy 40**, it is a property of the machine.
+
+**No open questions remain on this sub-gate.**
+
+### Session state at close
+
+**Committed and pushed on branch `docs/phase-2.4-design-gate`, PR opened
+against `main`. NOT merged** — merging starts a CD run, and there was no
+reason to deploy a docs-and-harness change at end of day.
+
+Two commits, one concern each:
+
+1. the versioned sub-gate harness `scripts/exec_isolation_bench.py`;
+2. the sub-gate record — `docs/phase-2-task-distribution.md`,
+   `PHASE_STATE.md`, `SESSION_HANDOFF.md` — **which also carries session
+   11's closing edits, including Step 2.3's approval.** Those had been
+   deliberately left uncommitted across two sessions; they are in now, so
+   `main` stops showing 2.3 as awaiting approval once this merges.
+
+- `ruff check` clean across `scripts coordinator worker dashboard protocol
+  tests`. No application code changed this session, so there was nothing
+  for the test suite to regress.
+- **⚠ The AKS cluster is RUNNING and billing.** It was left up by session
+  11 and was *not* started by this session — every measurement here was
+  taken locally in Docker, so no credit was spent on the work itself, but
+  the cluster has been up regardless. **Nothing is in flight, so it is
+  safe to stop right now:**
+
+  ```powershell
+  az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+  ```
+
+  If you merge the PR first, wait for its CD run to finish before
+  stopping — that ordering is what produced the red `61ecc4c` run.
+- Reproduce the evidence: `docker run --rm -i --cpus=1 -v "$PWD:/bench:ro"
+  python:3.12-slim python /bench/scripts/exec_isolation_bench.py all`
+  (add `pip install 'psutil>=5.9,<7'` first or the RSS figures read `NaN`).
+
+### Next session, in order
+
+1. `az aks start` + `az aks get-credentials` (if stopped).
+2. Merge PR for `docs/phase-2.4-design-gate` if still open, let CD finish,
+   then delete the branch local and remote — a surviving base branch is
+   what stopped PR #15 auto-retargeting in session 9.
+3. **Approve or amend the Step 2.4 design sub-gate (Decisions #93–#100).**
+   It is decided with no open questions, but §9 needs the approval
+   recorded before implementation.
+4. **Step 2.4 — worker execution runtime — NOT STARTED. Do not begin
+   without an explicit go-ahead (§9).**
+
+### Still deferred, unchanged
+
+Neither gates Step 2.4:
+
+1. **Rotate `GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`** — still the
+   only outstanding item with actual known exposure (both public via
+   `.env.example` history, both live, both in-cluster only).
+2. **Exercise the `ADMIN_SECRET` rotation runbook** — still unexercised,
+   still a hypothesis. `kubeseal` not on PATH; `docs/runbook.md` step 1
+   uses a `python` that is the WindowsApps stub here.
+
+---
+
 ## ⇒ SESSION CLOSED 2026-07-30 — read this block first
 
-**Where the project actually is:** `main` at **`5cad07f`**, both staging
+**Where the project actually is:** `main` at **`2f616f9`**, both staging
 and production deployed and verified on it. **Step 2.3 (assignment
-engine) has all six exit criteria objectively verified and is AWAITING
-YOUR APPROVAL.** It is deliberately *not* marked DONE anywhere.
+engine) is DONE and APPROVED by the user 2026-07-30** — all six exit
+criteria objectively verified.
 
-### Two things left in flight
+The approval covers both judgement calls raised at review: delivery goes
+straight down the worker's socket rather than through the
+`worker:{id}:push` channel Decision #80's wording named, and an
+acknowledgement does **not** imply `RUNNING`. It was given on the
+recorded evidence rather than on a demo the user ran personally — **a
+user scope call on §15 items 3–4, recorded as such and not as a verified
+result** (§10), same family as Decisions #34–35, #77 and the 2.2.1
+approval.
 
-1. **PR #29 is OPEN and NOT MERGED** — docs only, `MERGEABLE` / `CLEAN`,
-   all 7 checks green. **It carries the `PHASE_STATE.md` and
-   `SESSION_HANDOFF.md` entries recording 2.3's live verification**, so
-   until it merges, `main`'s docs still describe 2.3 as unverified. The
-   code on `main` is correct and deployed; only the write-up is behind.
-2. **⚠️ THE CLUSTER IS STILL RUNNING AND BILLING.** It was left up for
-   the Internet-worker test and never stopped.
+**Step 2.4 (worker execution runtime) is NOT STARTED and must not begin
+without an explicit go-ahead (§9).**
 
-**These two interact — pick one order and do not mix them:**
+### Nothing is left in flight
 
-- **Stop now, merge tomorrow** (recommended if you are done for the day):
-  `az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system`,
-  then merge #29 tomorrow after `az aks start`.
-- **Merge now, then stop:** merging #29 starts a CD run, and stopping the
-  cluster underneath it fails the deploy with "AKS unreachable" — the
-  exact failure that hit run `61ecc4c`. Wait for CD to finish first.
+**PR #29 was merged** (`2f616f9`), CI green, and **CD run completed
+`success` on BOTH `staging / deploy` and `production / deploy`.**
+Re-checked afterwards rather than trusted: public `/health` returns
+`2f616f90edd9126fc6de0dd6058a58fbbd1a52df` with no `-k`, all three
+staging coordinator replicas are `Running`/ready, and **each logged
+`assignment_engine_started` again after the rollout.** Docs and deployed
+reality now agree.
+
+**The cluster was still running when the session ended, and the user
+said they would stop it themselves.** The CD run has finished, so there
+is nothing left for a stop to interrupt:
+
+```powershell
+az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+```
 
 ### Session state, for a clean resume
 
-- Working tree **clean**, checked out on `docs/phase-2.3-verified`
-  (PR #29's branch). Nothing uncommitted, nothing stranded.
-- Branch `phase-2.3-assignment-engine` is merged and can be deleted.
+- Checked out on **`main` at `2f616f9`**, in sync with `origin/main`.
+- **Uncommitted: `PHASE_STATE.md` and `SESSION_HANDOFF.md` only** — these
+  closing edits, which describe #29's own merge and therefore could not
+  be inside it. Left uncommitted on purpose: `main` is branch-protected,
+  so committing them means another PR, another CI run and another CD
+  deploy at the end of the day, for a paragraph. **Fold them into the
+  next real commit** — the same call sessions 9 and 10 made.
+- Branches `docs/phase-2.3-verified` and `phase-2.3-assignment-engine`
+  are merged and **deleted**, local and remote.
 - Cluster left as found otherwise: `demo-worker` restored to 1 replica
   after being scaled to 0 for the Internet test; the local worker process
   stopped and its identity file deleted; all local Docker verification
@@ -65,23 +209,25 @@ Both were deferred earlier today and **neither gates Step 2.4**:
 
 ### Next session, in order
 
-1. `az aks start` + `az aks get-credentials`.
-2. Merge PR #29 if it is still open; let its CD run finish.
-3. **Approve or reject Step 2.3.** Two judgement calls to confirm:
-   (a) delivery goes straight down the socket rather than through the
-   `worker:{id}:push` channel Decision #80's wording named;
-   (b) an acknowledgement does **not** move a task to `RUNNING` — that
-   transition is Step 2.4's.
-4. **Step 2.4 — worker execution runtime — NOT STARTED. Do not begin
-   without an explicit go-ahead (§9).**
+1. `az aks start` + `az aks get-credentials` (if the user stopped it).
+2. Commit the two closing doc edits noted above alongside the first real
+   change of the session. **They now include Step 2.3's approval**, so
+   until they land, `main` still shows 2.3 as awaiting approval.
+3. **Step 2.4 — worker execution runtime — NOT STARTED. Do not begin
+   without an explicit go-ahead (§9).** It opens with a short design
+   sub-gate: the executor for all four dummy types, execution isolated
+   from the connection loop so heartbeats survive a long task, progress
+   reporting, and worker-side concurrency. Note 2.4 is what finally emits
+   the `capacity` message the coordinator already handles, and what owns
+   the `ASSIGNED -> RUNNING` transition 2.3 deliberately left alone.
 
 ---
 
-## 2026-07-30 (session 11, part 2) — Step 2.3 SHIPPED; all 6 criteria verified; AWAITING APPROVAL
+## 2026-07-30 (session 11, part 2) — Step 2.3 SHIPPED, VERIFIED and APPROVED
 
-**PR #28 merged. `main` at `5cad07f`. CI green — 136 passed, no skips.
-Deployed to staging AND production. All six exit criteria objectively
-verified. NOT YET APPROVED — that is yours (§9/§15).**
+**PR #28 merged. `main` at `5cad07f` (docs then `2f616f9`). CI green —
+136 passed, no skips. Deployed to staging AND production. All six exit
+criteria objectively verified. APPROVED by the user 2026-07-30.**
 
 ### The design, in four decisions (#89–#92)
 
@@ -160,11 +306,10 @@ and declares neither capability field. The coordinator gave it the
 Decision #92 default — 4 credits, all four types — so the
 backwards-compatibility path was exercised by a genuinely old worker.
 
-**Step 2.3 is therefore complete on evidence and AWAITS ONLY YOUR
-APPROVAL (§9/§15).** Two judgement calls to confirm: (a) delivery goes
-straight down the socket, not through the `worker:{id}:push` channel
-Decision #80's wording named; (b) an ack does **not** move a task to
-`RUNNING` — that is Step 2.4's.
+**Step 2.3 was APPROVED on this evidence 2026-07-30**, including both
+judgement calls: (a) delivery goes straight down the socket, not through
+the `worker:{id}:push` channel Decision #80's wording named; (b) an ack
+does **not** move a task to `RUNNING` — that is Step 2.4's.
 
 ### Cluster state left behind
 
