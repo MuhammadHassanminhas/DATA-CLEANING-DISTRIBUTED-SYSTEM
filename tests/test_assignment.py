@@ -246,13 +246,20 @@ def test_a_superseded_session_cleanup_does_not_evict_the_winner():
 # --------------------------------------------------------------------------
 
 
+# Step 2.4 note: a credit is a `credited` entry keyed by task id, not a
+# counter (Decision #101 made release-once structural rather than clamped).
+# These tests therefore seed `credited` where they used to set `in_flight`;
+# what they assert about the *behaviour* is unchanged, and `in_flight` still
+# reads the same way.
+
+
 def test_an_accepted_ack_clears_the_pending_entry_but_holds_the_slot():
     """Receipt is not completion. The credit stays consumed until the
     worker releases it, which is Step 2.4's `capacity` message."""
 
     async def body():
         session = make_session(uuid.uuid4())
-        session.in_flight = 1
+        session.credited["t1"] = "corr-1"
         session.pending_acks["t1"] = "corr-1"
 
         await handle_task_ack(session, {"payload": {"task_id": "t1", "accepted": True}})
@@ -266,7 +273,7 @@ def test_an_accepted_ack_clears_the_pending_entry_but_holds_the_slot():
 def test_a_refusal_frees_the_credit():
     async def body():
         session = make_session(uuid.uuid4())
-        session.in_flight = 1
+        session.credited["t1"] = "corr-1"
         session.pending_acks["t1"] = "corr-1"
 
         await handle_task_ack(
@@ -285,7 +292,7 @@ def test_a_duplicate_ack_is_a_harmless_noop():
 
     async def body():
         session = make_session(uuid.uuid4())
-        session.in_flight = 1
+        session.credited["t1"] = "corr-1"
         session.pending_acks["t1"] = "corr-1"
 
         await handle_task_ack(session, {"payload": {"task_id": "t1", "accepted": False}})
@@ -299,12 +306,12 @@ def test_a_duplicate_ack_is_a_harmless_noop():
 def test_capacity_releases_slots_without_going_negative():
     async def body():
         session = make_session(uuid.uuid4(), max_concurrent=4)
-        session.in_flight = 2
+        session.credited = {"t1": "corr-1", "t2": "corr-2"}
 
-        await handle_capacity(session, {"payload": {"freed": 1}})
+        await handle_capacity(session, {"payload": {"task_id": "t1", "freed": 1}})
         assert session.in_flight == 1
 
-        await handle_capacity(session, {"payload": {"freed": 99}})
+        await handle_capacity(session, {"payload": {"task_id": "t2", "freed": 99}})
         assert session.in_flight == 0
         assert session.free_credits == 4
 

@@ -102,6 +102,24 @@ ASSIGNMENTS_IN_FLIGHT = Gauge(
     "Tasks assigned by this instance and not yet acknowledged or released.",
 )
 
+# Phase 2.4 execution. Per-instance for the same reason as the series above:
+# a task is started, progressed and failed against the socket this replica
+# holds. `started` minus `failed` is not "completed" — Step 2.5 owns
+# completion, and in M2 a task that finishes successfully stays RUNNING.
+TASKS_STARTED = Counter(
+    "coordinator_tasks_started_total",
+    "Tasks moved ASSIGNED -> RUNNING on a worker's task_started report.",
+)
+TASKS_FAILED = Counter(
+    "coordinator_tasks_failed_total",
+    "Tasks moved to FAILED after a worker's executor raised.",
+)
+TASK_PROGRESS_REPORTS = Counter(
+    "coordinator_task_progress_reports_total",
+    "Progress samples received, by outcome.",
+    ["outcome"],
+)
+
 # Per-instance request latency. Route template keeps label cardinality bounded.
 REQUEST_LATENCY = Histogram(
     "coordinator_request_duration_seconds",

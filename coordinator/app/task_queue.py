@@ -41,7 +41,12 @@ from sqlalchemy import bindparam, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Task
-from app.task_states import ASSIGNED, QUEUED, check_transition
+from app.task_states import (
+    ASSIGNED,
+    QUEUED,
+    InvalidTaskTransition,
+    check_transition,
+)
 from app.task_types import validate_parameters
 
 # Recommendations, not measured values (CLAUDE.md §10). They bound how
@@ -254,6 +259,83 @@ async def dequeue(
 
     result = await session.execute(statement, params)
     return [dict(row) for row in result.mappings().all()]
+
+
+# Outcomes of a worker-reported state move. Returned rather than raised
+# because none of them is exceptional: a worker is untrusted (§12), so
+# "that task is not yours" and "that task is already finished" are ordinary
+# inputs the coordinator must answer without dropping the connection.
+TRANSITIONED = "transitioned"
+NOOP = "noop"
+NOT_FOUND = "not_found"
+NOT_OWNER = "not_owner"
+ILLEGAL = "illegal"
+
+
+async def mark_status(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    worker_id: uuid.UUID | str,
+    new_status: str,
+) -> str:
+    """Move one task to `new_status` on behalf of the worker holding it.
+
+    Phase 2.4's only new write path. Every guard here exists because the
+    request comes from a worker, and **every worker is untrusted** (§12):
+
+    * The id must parse as a UUID. A worker can send anything.
+    * The row is locked `FOR UPDATE` before it is read, so two messages
+      about the same task cannot interleave.
+    * `assigned_worker_id` must be the worker reporting. Without this check
+      any worker could move any other worker's task — the same class of
+      defect Step 2.2.1 fixed on the admin surface.
+    * The move goes through `task_states.check_transition`, so the state
+      machine stays the single authority. A same-state report is a no-op
+      rather than an error, which is what makes duplicate reports harmless
+      (§3.7).
+
+    Writes `status` and `updated_at`, and nothing else. In particular it
+    does not touch `lease_expires_at` or `attempt_count` — a Phase 2.1 exit
+    criterion holds those untouched through all of M2 — and it does not
+    stamp `completed_at`, even on `FAILED`: that column belongs to Step
+    2.5's completion path, and `updated_at` already records when the
+    transition happened.
+    """
+    try:
+        parsed = uuid.UUID(str(task_id))
+    except (ValueError, AttributeError):
+        return NOT_FOUND
+
+    row = (
+        await session.execute(
+            text(
+                "SELECT status, assigned_worker_id FROM tasks "
+                "WHERE id = CAST(:id AS uuid) FOR UPDATE"
+            ),
+            {"id": str(parsed)},
+        )
+    ).mappings().one_or_none()
+    if row is None:
+        return NOT_FOUND
+    if str(row["assigned_worker_id"]) != str(worker_id):
+        return NOT_OWNER
+
+    try:
+        should_write = check_transition(row["status"], new_status)
+    except InvalidTaskTransition:
+        return ILLEGAL
+    if not should_write:
+        return NOOP
+
+    await session.execute(
+        text(
+            "UPDATE tasks SET status = :status, updated_at = now() "
+            "WHERE id = CAST(:id AS uuid)"
+        ),
+        {"status": new_status, "id": str(parsed)},
+    )
+    return TRANSITIONED
 
 
 async def queue_depth(session: AsyncSession) -> int:
