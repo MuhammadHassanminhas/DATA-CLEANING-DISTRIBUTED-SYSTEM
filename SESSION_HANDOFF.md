@@ -8,6 +8,75 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## ⇒ SESSION CLOSED 2026-07-30 — read this block first
+
+**Where the project actually is:** `main` at **`5cad07f`**, both staging
+and production deployed and verified on it. **Step 2.3 (assignment
+engine) has all six exit criteria objectively verified and is AWAITING
+YOUR APPROVAL.** It is deliberately *not* marked DONE anywhere.
+
+### Two things left in flight
+
+1. **PR #29 is OPEN and NOT MERGED** — docs only, `MERGEABLE` / `CLEAN`,
+   all 7 checks green. **It carries the `PHASE_STATE.md` and
+   `SESSION_HANDOFF.md` entries recording 2.3's live verification**, so
+   until it merges, `main`'s docs still describe 2.3 as unverified. The
+   code on `main` is correct and deployed; only the write-up is behind.
+2. **⚠️ THE CLUSTER IS STILL RUNNING AND BILLING.** It was left up for
+   the Internet-worker test and never stopped.
+
+**These two interact — pick one order and do not mix them:**
+
+- **Stop now, merge tomorrow** (recommended if you are done for the day):
+  `az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system`,
+  then merge #29 tomorrow after `az aks start`.
+- **Merge now, then stop:** merging #29 starts a CD run, and stopping the
+  cluster underneath it fails the deploy with "AKS unreachable" — the
+  exact failure that hit run `61ecc4c`. Wait for CD to finish first.
+
+### Session state, for a clean resume
+
+- Working tree **clean**, checked out on `docs/phase-2.3-verified`
+  (PR #29's branch). Nothing uncommitted, nothing stranded.
+- Branch `phase-2.3-assignment-engine` is merged and can be deleted.
+- Cluster left as found otherwise: `demo-worker` restored to 1 replica
+  after being scaled to 0 for the Internet test; the local worker process
+  stopped and its identity file deleted; all local Docker verification
+  containers and volumes removed.
+- Staging's `tasks` table holds ~20.6k `ASSIGNED` rows of cumulative
+  verification history. Harmless audit trail; `TRUNCATE tasks` clears it
+  if you want a clean slate before 2.4.
+
+### Still deferred, unchanged and not forgotten
+
+Both were deferred earlier today and **neither gates Step 2.4**:
+
+1. **Rotate `GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`** — not
+   attempted, deferred by your explicit decision. **Of everything
+   outstanding this is the only item with actual known exposure** (both
+   public via `.env.example` history, both still live, both in-cluster
+   only).
+2. **Exercise the `ADMIN_SECRET` rotation runbook** — attempted, blocked
+   by the harness permission classifier. Two real prerequisite defects
+   were found and are recorded below: `kubeseal` is not on PATH, and the
+   runbook's step-1 `python -c "import secrets…"` does not run on this
+   machine because `python` on PATH is the WindowsApps stub.
+   `docs/runbook.md` was deliberately left uncorrected.
+
+### Next session, in order
+
+1. `az aks start` + `az aks get-credentials`.
+2. Merge PR #29 if it is still open; let its CD run finish.
+3. **Approve or reject Step 2.3.** Two judgement calls to confirm:
+   (a) delivery goes straight down the socket rather than through the
+   `worker:{id}:push` channel Decision #80's wording named;
+   (b) an acknowledgement does **not** move a task to `RUNNING` — that
+   transition is Step 2.4's.
+4. **Step 2.4 — worker execution runtime — NOT STARTED. Do not begin
+   without an explicit go-ahead (§9).**
+
+---
+
 ## 2026-07-30 (session 11, part 2) — Step 2.3 SHIPPED; all 6 criteria verified; AWAITING APPROVAL
 
 **PR #28 merged. `main` at `5cad07f`. CI green — 136 passed, no skips.
