@@ -8,7 +8,88 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-07-30 (session 13) — Step 2.4 BUILT, VERIFIED LOCALLY, AWAITING APPROVAL
+## ⇒ SESSION CLOSED 2026-07-30 (session 13) — Step 2.4 DONE and APPROVED
+
+**Step 2.4 (worker execution runtime) is DONE and APPROVED by the user
+2026-07-30.** `main` at **`23736fb`**, CI green, CD `success` on **both**
+staging and production. Staging `/health` returns
+`23736fb69fb485a4ce11fbd51934b243bc91eefd` **with no `-k`**, so the
+certificate genuinely validated.
+
+**This approval is stronger than the four before it.** §15 items 3–4 were
+satisfied by **the user running the demo and the failure demo personally** —
+2.2, 2.2.1, 2.3 and 2.4's own design sub-gate were each approved on recorded
+evidence as a user scope call instead. This one was not.
+
+Two parts were accepted on recorded measurement rather than re-run in the
+demo, recorded rather than blurred (§10): the 13-minute two-part endurance
+run, and the injected-fault crash path.
+
+### ⚠ DO THIS FIRST NEXT SESSION — rotate `ADMIN_SECRET`
+
+**The live `ADMIN_SECRET` was echoed back in plaintext during this session**
+by a FastAPI validation error, after a placeholder bug in a demo helper sent
+the value under the wrong field name. It is now in that session transcript.
+
+**Nothing else was exposed** — it never reached a log line, a commit, an
+image or the GUI. But this is the same value the sealed cluster secret
+carries, so treat it as compromised and rotate it. `docs/runbook.md` has the
+procedure, and **this finally forces the rotation that has been deferred
+across three sessions.** Two known prerequisite defects still apply:
+`kubeseal` is not on PATH (a working v0.38.4 binary survives in a temp
+scratchpad), and the runbook's step-1 `python -c "import secrets…"` needs
+the .NET RNG substitute recorded in the session-11 entry below.
+
+**Rotating it is also how the runbook finally gets exercised for real** —
+two deferred items closed by one action.
+
+### Cluster and local state at close
+
+- **⚠ The AKS cluster is RUNNING and billing.** Left up at the user's
+  explicit instruction earlier in the session. **Both CD runs have
+  finished, so nothing is in flight and a stop is safe right now:**
+  ```powershell
+  az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+  ```
+- All local Docker verification resources were torn down: compose project
+  `dcds24` (`down -v`), the standalone `dcds24-cpu1` / `dcds24-faulty` /
+  `dcds-internet-worker` containers, and the `dcds24-pg` / `dcds24-redis`
+  test containers on network `dcds24-net`. **`.env` was read for the demo
+  but never modified.**
+- Working tree clean, `main` in sync with `origin/main`, **every branch
+  merged and deleted** local and remote (PRs #31, #32, #33, #34).
+
+### Next step
+
+**Step 2.5 — result submission and completion — NOT STARTED. Do not begin
+without an explicit go-ahead (§9).** It opens with a short design sub-gate.
+It is also what finally makes a task reach `COMPLETED`: 2.4 leaves every
+successful task `RUNNING` by design (Decision #105), so `tasks` will keep
+accumulating `RUNNING` rows until 2.5 lands.
+
+2.5 owns the result envelope (task id, attempt number, session epoch,
+status, payload, duration, idempotency token), persistence into the
+`task_results` table 2.1 already created, submission retry with backoff, and
+the documented retention period.
+
+### Still open, in priority order
+
+1. **Rotate `ADMIN_SECRET`** — now urgent, see above.
+2. **Rotate `GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`** — both public
+   via `.env.example` history since M1.5, both still live, both in-cluster
+   only. Postgres needs a coordinated `ALTER USER` *and* Secret update or
+   the coordinator drops its connection; the ordering is in the session-10
+   entry below.
+3. **`demo-worker` image drift** — it runs worker image `b1963f90`
+   (pre-2.3), measured with `kubectl`, because `demo-worker.yaml` is a
+   hand-applied manifest with a hardcoded tag living outside
+   `infra/helm/platform/` and therefore outside CD. It acks tasks and parks
+   them forever. **Fix before Step 2.9**, whose criteria count tasks end to
+   end.
+
+---
+
+## 2026-07-30 (session 13, earlier) — Step 2.4 built and verified
 
 **Step 2.4 (worker execution runtime) is implemented and all 8 exit
 criteria are met locally.** Implementation Decisions **#105–#108**. Suite
@@ -19,6 +100,12 @@ dashboard protocol tests scripts`.
 **`fc33815`**, CI green on all 7 checks, `staging / deploy` succeeded and
 public `/health` returns `fc33815d…` **with no `-k`** — the certificate
 genuinely validated, not taken off CD's green tick.
+
+> **Both statements below were true when written and are now SUPERSEDED by
+> the session-close block at the top of this file.** The production gate was
+> approved and CD reached `success` on both environments; the demo was then
+> run by the user and **Step 2.4 is DONE and APPROVED**. Kept for the record,
+> not as current status.
 
 **⚠ `production / deploy` is PARKED on its required-reviewer gate** — yours
 to approve; the agent is blocked from approving production gates. The
@@ -332,7 +419,11 @@ Neither gates Step 2.4:
 
 ---
 
-## ⇒ SESSION CLOSED 2026-07-30 — read this block first
+## 2026-07-30 (session 12 close) — was "read this block first", now historical
+
+> **Superseded.** The current resume pointer is the session-close block at
+> the top of this file. This one described the state at `2f616f9`, three
+> merges ago.
 
 **Where the project actually is:** `main` at **`2f616f9`**, both staging
 and production deployed and verified on it. **Step 2.3 (assignment

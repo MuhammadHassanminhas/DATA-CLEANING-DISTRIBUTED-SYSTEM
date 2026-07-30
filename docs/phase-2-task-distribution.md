@@ -301,11 +301,29 @@ the measurements should be read that way (§10).
 - Local task state deleted after submission.
 - Refusal path for an unsupported task type.
 
-**Exit criteria** — all verified locally in Docker 2026-07-30, and then
-re-verified on staging **over the public Internet** with the shipped ghcr
-image (§8). The figures are in `PHASE_STATE.md`'s 2.4 register row.
-**Still outstanding: the user's own demo and failure demo (§15 items
-3–4).**
+**Exit criteria** — all verified locally in Docker 2026-07-30, re-verified
+on staging **over the public Internet** with the shipped ghcr image (§8),
+and then **demonstrated by the user personally**. The figures are in
+`PHASE_STATE.md`'s 2.4 register row.
+
+**Step 2.4 is DONE and APPROVED by the user 2026-07-30.** §15 items 3–4
+were satisfied by the user running the demo and the failure demo
+themselves — worth noting because 2.2, 2.2.1, 2.3 and this step's own
+design sub-gate were each approved on recorded evidence as a user scope
+call instead (§10). This one was not.
+
+The demo covered: assigning all four workload types with live progress on
+the dashboard, result correctness checked against independently computed
+fingerprints, the concurrency limit holding at 2 slots against 6 queued
+jobs, four classes of malformed submission rejected before dispatch, and a
+**coordinator restart mid-execution** after which the in-flight work
+completed, the reconnecting worker declared `tasks_in_flight: 2`, and
+queued work resumed automatically.
+
+Two parts of the evidence were **not** re-run in that session and were
+accepted on the recorded measurements instead, which is recorded rather
+than blurred (§10): the 13-minute two-part endurance run, and the
+injected-fault crash path.
 
 - [x] All four task types execute correctly and return correct results.
       Known-answer vectors in `tests/test_executors.py`, and live runs whose
