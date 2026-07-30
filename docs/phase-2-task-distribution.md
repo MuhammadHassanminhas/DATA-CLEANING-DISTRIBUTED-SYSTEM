@@ -230,7 +230,7 @@ fallback is active and every worker can still call the admin endpoints.
       silently dropped.
 - [x] A worker disconnecting between assignment and acknowledgement is
       logged. Recovery is Phase 3; detection exists now.
-- [ ] Assignment works identically for local Docker workers and remote
+- [x] Assignment works identically for local Docker workers and remote
       Internet workers.
 
 **DECIDED 2026-07-30 — Decisions #89–#92 in `PHASE_STATE.md`.**

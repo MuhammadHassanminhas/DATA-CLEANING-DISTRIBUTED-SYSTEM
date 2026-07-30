@@ -8,10 +8,11 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## 2026-07-30 (session 11, part 2) — Step 2.3 BUILT, CI-green, 5 of 6 criteria measured
+## 2026-07-30 (session 11, part 2) — Step 2.3 SHIPPED; all 6 criteria verified; AWAITING APPROVAL
 
-**PR #28 (`phase-2.3-assignment-engine`, `6ded987`). All 7 required checks
-pass — 136 passed, no skips. NOT MERGED, NOT DEPLOYED, NOT APPROVED.**
+**PR #28 merged. `main` at `5cad07f`. CI green — 136 passed, no skips.
+Deployed to staging AND production. All six exit criteria objectively
+verified. NOT YET APPROVED — that is yours (§9/§15).**
 
 ### The design, in four decisions (#89–#92)
 
@@ -58,19 +59,53 @@ pass — 136 passed, no skips. NOT MERGED, NOT DEPLOYED, NOT APPROVED.**
 - **Disconnect-before-ack produced deterministically** via the harness's
   `stranded` mode, rather than by trying to win a millisecond race.
 
-### The one criterion NOT met
+### Criterion 6 — closed the same day, on real infrastructure
 
-**Criterion 6 — identical behaviour for a remote Internet worker.** The
-local-Docker half is proven; the Internet half needs this deployed, and
-**`gh pr merge` was denied by the harness permission classifier on both
-attempts.** Nothing about the code is implicated. PR #27 earlier today
-passed on a retry; this did not.
+**The user merged PR #28** (the agent's `gh pr merge` was denied twice by
+the harness permission classifier — a harness outcome, not a code one).
+`main` at **`5cad07f`**; CI green; **CD run `30520645010` succeeded on
+both `staging / deploy` and `production / deploy`.**
 
-**To finish 2.3:** merge PR #28 → let CI+CD run → approve the production
-gate → then run a worker on this laptop against
-`https://dcds-staging.centralindia.cloudapp.azure.com`, enqueue a task
-through the public ingress, and confirm assignment and ack look identical
-to the Docker path. That is the whole remaining scope.
+Verified on the deployed system rather than off CD's green tick:
+
+- Public `/health` returns `5cad07fa…` **with no `-k`**, so the Let's
+  Encrypt certificate genuinely validated.
+- All three staging replicas run the new image and **each logged
+  `assignment_engine_started`** — an engine per replica, per #89, not one
+  elected leader.
+- **A worker on this laptop, over the public Internet**, registered →
+  `ws_connected`, declared `max_concurrent: 2` /
+  `supported_task_types: ["hash_rounds"]`, and the coordinator recorded
+  that verbatim. A `hash_rounds` task enqueued **through the public
+  ingress** was assigned and **acknowledged 72 ms later**, whole trail on
+  replica `kl5x9`, **one correlation id `56839f9d…` across the enqueue
+  response, `task_assigned`, `task_acknowledged` and the worker's own
+  log**. Row: `ASSIGNED`, correct worker, `assigned_at` stamped,
+  `lease_expires_at` NULL, `attempt_count` 0.
+- **Eligibility re-proven over the same path:** with only that
+  hash_rounds-only worker connected, 2 `sleep` tasks stayed `QUEUED`.
+
+**An unplanned compatibility proof, worth more than a simulated one:**
+the in-cluster demo worker still runs the **pre-2.3 image `b1963f90`**
+and declares neither capability field. The coordinator gave it the
+Decision #92 default — 4 credits, all four types — so the
+backwards-compatibility path was exercised by a genuinely old worker.
+
+**Step 2.3 is therefore complete on evidence and AWAITS ONLY YOUR
+APPROVAL (§9/§15).** Two judgement calls to confirm: (a) delivery goes
+straight down the socket, not through the `worker:{id}:push` channel
+Decision #80's wording named; (b) an ack does **not** move a task to
+`RUNNING` — that is Step 2.4's.
+
+### Cluster state left behind
+
+`demo-worker` was scaled to 0 during the Internet test to remove
+attribution ambiguity and **has been restored to 1**. The local worker
+process was stopped and its identity file deleted. **The cluster is still
+RUNNING** — stop it at end of day, and only after any in-flight CD run
+finishes. Note staging's `tasks` table now holds ~20.6k ASSIGNED rows
+from cumulative verification; harmless audit trail, `TRUNCATE tasks`
+clears it.
 
 ### Gotcha worth keeping
 
