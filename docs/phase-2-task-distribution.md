@@ -304,12 +304,122 @@ the measurements should be read that way (§10).
 **Exit criteria**
 - [ ] All four task types execute correctly and return correct results.
 - [ ] A 10-minute task runs to completion while heartbeats continue
-      uninterrupted — verified on the dashboard.
+      uninterrupted — verified on the dashboard. **Two parts, both
+      required (Decisions #99–#100, option (c), user-chosen 2026-07-30):**
+  - [ ] **(1) The letter.** One `sleep` task with `seconds: 600` runs to
+        completion, holding a slot for the full ten minutes, heartbeats
+        uninterrupted.
+  - [ ] **(2) The substance.** The worker is additionally held
+        **CPU-saturated for ≥600s** by repeated `hash_rounds` tasks at the
+        existing 10,000,000 ceiling, heartbeats uninterrupted throughout.
+        A sleeping task consumes no CPU, so part (1) alone cannot show
+        that a *busy* worker keeps heartbeating — which is the only thing
+        this criterion is really about.
+  - **Pass condition for both:** ≥600s of continuous execution, **zero**
+    transitions out of `ONLINE` in the coordinator's
+    `worker_state_transition` log (no SUSPECT, no OFFLINE), and no
+    observed heartbeat gap above the 12s SUSPECT threshold.
+  - **Sizing:** ~40 ceiling-parameter tasks covers 600s *as measured on
+    this laptop's Docker at one CPU* (15.4s each). **Re-derive the count
+    on the AKS worker from a fresh measurement — do not copy 40**, since
+    it is a property of the machine, not of the criterion.
+  - No parameter ceiling is raised and no Step 2.1 artefact is changed.
 - [ ] Progress updates appear during execution.
 - [ ] Concurrency limit is respected and configurable.
 - [ ] Worker deletes temporary state after submission — verified.
 - [ ] Unsupported task type is refused cleanly, not crashed on.
 - [ ] Worker memory stays flat across 1,000 sequential tasks — no leak.
+
+### Design sub-gate — DECIDED 2026-07-30, AWAITING APPROVAL
+
+Decisions #93–#100 in `PHASE_STATE.md`. **No implementation has begun.**
+The one §16 escalation this gate raised (#99, the 10-minute criterion) is
+**resolved** — the user chose option (c) on 2026-07-30, recorded as #100
+and folded into the exit criteria above. **No open questions remain.**
+
+Every figure below was measured with `scripts/exec_isolation_bench.py`
+inside `python:3.12-slim` — the worker's actual base image — constrained
+to **one CPU**, because that is the shape of a CPU-limited container on
+the `Standard_B2s_v2` node. Nothing here is a recommendation dressed as a
+measurement (§10); the values that *are* recommendations say so.
+
+- **Execution runs in `asyncio.to_thread`, one thread per running task**
+  (#93). The problem is real and was measured, not assumed: run a
+  CPU-bound task inline on the event loop and **the heartbeat gap becomes
+  the entire task duration** — a 24.58s task emitted exactly *one*
+  heartbeat where 4.9 were due, breaching the 12s SUSPECT threshold, and
+  any CPU task over 25s breaches OFFLINE too. The coordinator would
+  declare a healthy worker dead. With `to_thread` the gap held at
+  **5.01s** (1 task), **5.19s** (4 tasks), **5.47s** (4 × `count_to_n`,
+  the harsher pure-Python case that holds the GIL between bytecodes) and
+  **5.65s** at 8 tasks — never closer than 6.3s to SUSPECT.
+- **`ProcessPoolExecutor` was measured and lost** (#93). It is the
+  textbook answer for CPU-bound Python and it is the wrong one here:
+  **68.32s against the threads' 58.04s** for the same 4 × 15s of work
+  (0.85x; a second run gave 0.75x), with no heartbeat advantage. A
+  CPU-limited container has no parallelism to win, so all it buys is IPC,
+  pickling and four extra interpreters.
+- **Honest ceiling, stated because it is easy to oversell threads:** this
+  buys heartbeat survival, **not throughput**. Four concurrent CPU tasks
+  on one core measured **1.03x** against running them serially — that is
+  nothing. In V1 throughput comes from more workers, not more threads per
+  worker.
+- **Executors are chunked loops carrying a progress slot and a cooperative
+  cancel flag** (#94). A Python thread cannot be killed, so cancellation
+  is cooperative or it does not exist; measured, the flag stops a running
+  task in **0.04–0.11s**. Progress needs no cross-thread machinery at
+  all — a one-slot list written by the thread and read by the loop is
+  atomic under the GIL, and gave 20 distinct monotonic samples. Chunking
+  is free: sizes from 1,000 to 500,000 all landed inside run-to-run noise
+  (−5.5% to +3.2%), so that spread is noise and **not** a speedup from
+  chunking.
+- **`ASSIGNED -> RUNNING` is driven by an explicit `task_started`
+  message** (#95), not inferred from the first progress report. A state
+  transition and a telemetry sample have to stay separable, because Phase
+  3 will want to throttle or drop progress under load and must never drop
+  a state transition.
+- **Concurrency is enforced worker-side by an explicit semaphore and a
+  `ThreadPoolExecutor` sized to `WORKER_MAX_CONCURRENT`** (#96) — never
+  the default `to_thread` pool. A measured trap: `os.cpu_count()`
+  returned **4 inside a `--cpus=1` container**, so a cgroup quota is
+  invisible to it, and the default pool is `min(32, cpu_count+4)` = **8**,
+  smaller than the 64 `WORKER_MAX_CONCURRENT_CEILING` allows. A worker
+  accepting 64 tasks would silently queue 56 *inside the executor* —
+  acknowledged, apparently running, not started.
+- **In-flight work survives a reconnect; over-commit is refused, never
+  queued locally** (#97). Invariant: **the worker never holds a task it is
+  not executing.** A local backlog would be the worker making a
+  scheduling decision, against §3.2/§3.3.
+- **2.4 computes results and discards them** (#98). Step 2.5 owns the
+  result envelope, persistence and retry; a buffer built now would be half
+  of 2.5 with none of its design, and a buffer is exactly what breaks the
+  flat-memory criterion. Measured: 300 sequential tasks moved RSS
+  **28.4 → 28.4 MB (+0.1)**.
+
+**New wire messages.** `task_started` and `task_progress` (worker to
+coordinator). `capacity` already exists and is already handled — Step 2.3
+built the coordinator side, and 2.4 is what finally emits it. The envelope
+is untouched and `PROTOCOL_VERSION` stays `"1.0"`.
+
+**Progress cadence.** One reporter task **per worker, not per task**,
+emitting one `task_progress` per running task every
+`WORKER_PROGRESS_INTERVAL_SECONDS` (recommended 10s, not measured) and
+suppressing unchanged values. The coordinator keeps the latest sample in
+Redis beside the existing worker-metrics hash rather than writing
+Postgres per sample: a DB write per task per interval would put avoidable
+write load on the `tasks` table, which under Decision #79 *is* the queue's
+hot path. The dashboard reads it for §6's "current task".
+
+**Reproducing the evidence:**
+
+```bash
+docker run --rm -i --cpus=1 -v "$PWD:/bench:ro" python:3.12-slim \
+  python /bench/scripts/exec_isolation_bench.py all
+```
+
+`psutil` is absent from the bare image, so the RSS figures report `NaN`
+unless it is installed first; the memory number above came from a run with
+`pip install 'psutil>=5.9,<7'` ahead of it.
 
 ---
 
