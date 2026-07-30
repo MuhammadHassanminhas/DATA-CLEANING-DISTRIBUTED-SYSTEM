@@ -330,12 +330,48 @@ the measurements should be read that way (§10).
 - [ ] Unsupported task type is refused cleanly, not crashed on.
 - [ ] Worker memory stays flat across 1,000 sequential tasks — no leak.
 
-### Design sub-gate — DECIDED 2026-07-30, AWAITING APPROVAL
+### Design sub-gate — ACCEPTED WITH AMENDMENTS 2026-07-30
 
-Decisions #93–#100 in `PHASE_STATE.md`. **No implementation has begun.**
-The one §16 escalation this gate raised (#99, the 10-minute criterion) is
-**resolved** — the user chose option (c) on 2026-07-30, recorded as #100
-and folded into the exit criteria above. **No open questions remain.**
+Decisions #93–#104 in `PHASE_STATE.md`. **Implementation is authorised but
+has NOT begun** — held by explicit user instruction.
+
+The §16 escalation this gate raised (#99, the 10-minute criterion) is
+resolved as option (c), recorded as #100 and folded into the exit criteria
+above.
+
+**Review outcome (#104): accepted with amendments, not as-is.** The
+approval was delegated to the agent by the user, so — stated plainly
+because it limits what the approval is worth — **this is self-review, not
+independent validation.** It was run against the shipped code rather than
+against the gate's own prose, and it found one real defect and one
+omission:
+
+- **#101 supersedes #97, which was wrong.** #97 let a worker refuse an
+  assignment it had no local capacity for. But Step 2.3 built the refusal
+  path for a *rare* cause (unsupported type, which the eligibility filter
+  makes nearly unreachable), and it **frees the credit and rings the
+  doorbell** (`assignment.py:287-298`), while `assign_once` picks any
+  session with `free_credits > 0` (`assignment.py:398-400`) and a refusal
+  leaves the task `ASSIGNED` with no state write. Introducing a *frequent*
+  refusal cause therefore livelocks: assign → refuse → credit freed →
+  doorbell → assign, **permanently stranding every task in `ASSIGNED` at
+  loop speed**, with no Phase 3 in M2 to reclaim them. Against staging's
+  ~20.6k queued rows that strands the queue in seconds. **Fix:** a
+  capacity refusal *saturates* the credit instead of freeing it, only the
+  worker's `capacity` message reopens it, only an unsupported-type refusal
+  frees one, and `hello` carries `tasks_in_flight` so a reconnecting
+  worker's running work is visible up front.
+- **#102 closes a gap the gate simply never addressed:** what happens when
+  an executor raises. A new `task_failed` message moves the task to
+  `FAILED` (already reachable from `ASSIGNED` and `RUNNING`) and frees the
+  credit. Without it a crashed task would sit `RUNNING` forever in M2.
+  Carries the exception type, **never a traceback** — tracebacks can
+  contain payload data (§12).
+- **#103** states explicitly that 2.4 adds **no** execution timeout:
+  duration is already bounded by Step 2.1's parameter validation, and
+  `lease_expires_at` must stay written-by-nothing through all of M2.
+
+#93–#96, #98 and #100 survived review unchanged.
 
 Every figure below was measured with `scripts/exec_isolation_bench.py`
 inside `python:3.12-slim` — the worker's actual base image — constrained
@@ -387,9 +423,10 @@ measurement (§10); the values that *are* recommendations say so.
   accepting 64 tasks would silently queue 56 *inside the executor* —
   acknowledged, apparently running, not started.
 - **In-flight work survives a reconnect; over-commit is refused, never
-  queued locally** (#97). Invariant: **the worker never holds a task it is
-  not executing.** A local backlog would be the worker making a
-  scheduling decision, against §3.2/§3.3.
+  queued locally** (#97, **amended by #101 — read #101, not this line, for
+  the refusal mechanics; #97 as written livelocks**). Invariant: **the
+  worker never holds a task it is not executing.** A local backlog would
+  be the worker making a scheduling decision, against §3.2/§3.3.
 - **2.4 computes results and discards them** (#98). Step 2.5 owns the
   result envelope, persistence and retry; a buffer built now would be half
   of 2.5 with none of its design, and a buffer is exactly what breaks the

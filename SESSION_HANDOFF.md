@@ -8,11 +8,49 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-07-30 (session 12) — Step 2.4 DESIGN SUB-GATE decided, awaiting approval
+## ⇒ 2026-07-30 (session 12) — Step 2.4 SUB-GATE ACCEPTED WITH AMENDMENTS; PR #30 merged
 
 **Nothing was implemented. No application code changed.** The sub-gate was
-decided and its premises measured; Step 2.4 itself has not begun and must
-not begin without an explicit go-ahead (§9).
+decided, its premises measured, then reviewed and **accepted with
+amendments (#104)**. Step 2.4 itself has not begun.
+
+### Read this first: the review found a real defect
+
+**The user delegated the approve/reject decision to the agent.** Recorded
+as a user scope call on §15 item 8. **Honest caveat, because it limits what
+the approval is worth: the agent authored the gate, so this is self-review,
+not independent validation (§10).** A second pair of eyes on #101 before
+implementation would still be worth having.
+
+It was run against the shipped code rather than the gate's own prose, and
+that is what caught the problem:
+
+- **#101 supersedes #97, which was WRONG.** #97 let a worker refuse an
+  assignment it had no local capacity for. But Step 2.3 built the refusal
+  path for a *rare* cause (unsupported type, near-unreachable behind the
+  eligibility filter), and it **frees the credit and rings the doorbell**
+  (`assignment.py:287-298`), while `assign_once` picks any session with
+  `free_credits > 0` (`assignment.py:398-400`) and a refusal leaves the
+  task `ASSIGNED` with no state write. Add a *frequent* refusal cause and
+  it livelocks: assign → refuse → credit freed → doorbell → assign,
+  **permanently stranding every task in `ASSIGNED` at loop speed**, with no
+  Phase 3 in M2 to reclaim them. Against staging's ~20.6k queued rows that
+  strands the queue in seconds. **Fix:** a capacity refusal *saturates* the
+  credit rather than freeing it; only `capacity` reopens it; only an
+  unsupported-type refusal frees one; and `hello` carries
+  `tasks_in_flight` so a reconnecting worker's running work is visible up
+  front (clamped, but self-limiting so clamping suffices).
+- **#102 closes a gap the gate never addressed** — what happens when an
+  executor raises. New `task_failed` → `FAILED` (already reachable from
+  `ASSIGNED` and `RUNNING`), credit freed. Without it a crashed task sits
+  `RUNNING` forever in M2. Carries the exception type, **never a
+  traceback** (tracebacks can contain payload data, §12).
+- **#103** records explicitly that 2.4 adds **no** execution timeout —
+  duration is already bounded by Step 2.1's validation, and
+  `lease_expires_at` stays written-by-nothing through all of M2.
+
+**#93–#96, #98 and #100 survived review unchanged.** Implementation is
+authorised; **it has not started, by your instruction.**
 
 **Decisions #93–#100 in `PHASE_STATE.md`.** The design in one line each:
 execution in `asyncio.to_thread` (#93), chunked executors with a progress
@@ -78,11 +116,23 @@ measurement — **do not copy 40**, it is a property of the machine.
 
 ### Session state at close
 
-**Committed and pushed on branch `docs/phase-2.4-design-gate` as
-**PR #30**. NOT merged** — merging starts a CD run, and there was no
-reason to deploy a docs-and-harness change at end of day.
+**PR #30 is MERGED. `main` is at `52a274f`.** CI green on all 7 required
+checks. **`staging / deploy` succeeded, and it was verified rather than
+taken off CD's tick** — public `/health` returns
+`52a274fd68458791331d3f608b4c7b786b9541b7` with **no `-k`**, so the Let's
+Encrypt certificate genuinely validated. Branch deleted local and remote.
 
-Two commits, one concern each:
+**⚠ `production / deploy` is PARKED on its required-reviewer gate** — yours
+to approve; the agent has been blocked from approving production gates
+before. **Approve it BEFORE stopping the cluster, or leave it parked and
+approve after the next `az aks start`** — approving it against a stopped
+cluster is what produced the red `61ecc4c` run. Nothing is actively
+touching the cluster while it sits parked, so stopping now is safe as long
+as you do not approve it first.
+
+The amendment docs (#101–#104) are a **separate PR, open and not merged.**
+
+PR #30 carried two commits, one concern each:
 
 1. the versioned sub-gate harness `scripts/exec_isolation_bench.py`;
 2. the sub-gate record — `docs/phase-2-task-distribution.md`,
@@ -113,14 +163,23 @@ Two commits, one concern each:
 ### Next session, in order
 
 1. `az aks start` + `az aks get-credentials` (if stopped).
-2. Merge **PR #30** (`docs/phase-2.4-design-gate`) if still open, let CD
-   finish, then delete the branch local and remote — a surviving base
-   branch is what stopped PR #15 auto-retargeting in session 9.
-3. **Approve or amend the Step 2.4 design sub-gate (Decisions #93–#100).**
-   It is decided with no open questions, but §9 needs the approval
-   recorded before implementation.
-4. **Step 2.4 — worker execution runtime — NOT STARTED. Do not begin
-   without an explicit go-ahead (§9).**
+2. **Approve the parked `production / deploy` gate** on CD run
+   `30532163218` for `52a274f`, or re-run CD after the cluster is back.
+3. Merge the open **amendments PR** (#101–#104), let CD finish, delete the
+   branch local and remote — a surviving base branch is what stopped
+   PR #15 auto-retargeting in session 9.
+4. **Step 2.4 — worker execution runtime — authorised (#104) but NOT
+   STARTED.** Build order that falls out of the gate: the four executors
+   as chunked loops (#94) with unit tests on known-answer vectors — which
+   is how "returns correct results" gets verified given #98 discards the
+   result — then the semaphore and sized pool (#96), then `task_started` /
+   `task_progress` / `task_failed` and the coordinator's handling of them
+   (#95, #102), then the amended refusal and `tasks_in_flight` (#101).
+   **Do #101 before any live multi-task run**, or the first
+   reconnect-with-running-work strands the queue.
+5. Consider `TRUNCATE tasks` on staging first — it holds ~20.6k `ASSIGNED`
+   rows of cumulative verification history, which will make 2.4's own
+   measurements harder to read.
 
 ### Still deferred, unchanged
 
