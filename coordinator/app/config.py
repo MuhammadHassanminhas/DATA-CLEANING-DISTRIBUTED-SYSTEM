@@ -107,6 +107,45 @@ def task_dequeue_max_batch() -> int:
     return int(os.environ.get("TASK_DEQUEUE_MAX_BATCH", "100"))
 
 
+def assignment_poll_interval_seconds() -> int:
+    """Recommendation, not a measured value (Phase 2.3). The assignment
+    loop is **event-driven** — an enqueue publishes to the
+    `tasks:available` channel and every replica's loop wakes immediately.
+    This interval is only the safety net for a notification that was never
+    delivered, which Redis pub/sub permits by design (fire-and-forget, no
+    delivery guarantee: a message published while a replica's subscriber
+    was reconnecting is simply gone).
+
+    It is deliberately slow. A missed notification costs at most this much
+    latency on an already-queued task; polling faster would buy little and
+    is exactly the cost the "100 idle workers produce negligible load"
+    exit criterion is about. Note the poll is **per replica, not per
+    worker** — its cost does not grow with fleet size.
+    """
+    return int(os.environ.get("ASSIGNMENT_POLL_INTERVAL_SECONDS", "30"))
+
+
+def worker_default_max_concurrent() -> int:
+    """Recommendation, not a measured value (Phase 2.3). Credits assumed
+    for a worker that connects without declaring `max_concurrent` in its
+    `hello` — every worker built before Step 2.3 existed."""
+    return int(os.environ.get("WORKER_DEFAULT_MAX_CONCURRENT", "4"))
+
+
+def worker_max_concurrent_ceiling() -> int:
+    """Recommendation, not a measured value (Phase 2.3). Hard ceiling on
+    the credits a worker may claim.
+
+    `max_concurrent` is **worker-reported**, and CLAUDE.md §12 says every
+    worker is untrusted — a worker claiming a billion credits would
+    otherwise drain the queue to itself in one pass. This bounds the lie.
+    It does not make the figure trustworthy; coordinator-observed
+    capability is Phase 4's problem (§12, "anything the scheduler trusts
+    heavily must be coordinator-observed").
+    """
+    return int(os.environ.get("WORKER_MAX_CONCURRENT_CEILING", "64"))
+
+
 def ws_ping_interval_seconds() -> int:
     """Recommendation, not a measured value. How often the coordinator
     sends an application-level `ping` envelope over a live connection —

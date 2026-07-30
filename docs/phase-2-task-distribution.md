@@ -221,17 +221,72 @@ fallback is active and every worker can still call the admin endpoints.
 - Assignment events logged with the task correlation ID.
 
 **Exit criteria**
-- [ ] A task reaches a worker and is acknowledged.
-- [ ] No task is ever assigned to two workers — verified with 500 tasks
+- [x] A task reaches a worker and is acknowledged.
+- [x] No task is ever assigned to two workers — verified with 500 tasks
       across 50 workers.
-- [ ] 100 idle workers with an empty queue produce negligible load —
+- [x] 100 idle workers with an empty queue produce negligible load —
       measured.
-- [ ] A queued task with no eligible worker stays queued and visible, not
+- [x] A queued task with no eligible worker stays queued and visible, not
       silently dropped.
-- [ ] A worker disconnecting between assignment and acknowledgement is
+- [x] A worker disconnecting between assignment and acknowledgement is
       logged. Recovery is Phase 3; detection exists now.
 - [ ] Assignment works identically for local Docker workers and remote
       Internet workers.
+
+**DECIDED 2026-07-30 — Decisions #89–#92 in `PHASE_STATE.md`.**
+
+- **One engine per replica, assigning only to the sockets that replica
+  holds** (#89). No leader election: two replicas cannot hand out the
+  same task because the claim is `FOR UPDATE SKIP LOCKED` on one row in
+  one transaction, so correctness is the queue's property, not the
+  scheduler's. Delivery goes straight down the socket rather than through
+  the `worker:{id}:push` channel — the assigning replica always holds the
+  socket, so the Redis hop would buy nothing.
+- **Event-driven, with a slow safety net** (#90). An enqueue publishes to
+  `tasks:available` and every replica wakes; a per-replica poll (default
+  30s) covers a notification Redis dropped. A pass checks queue depth
+  **once** before looking at any worker, which is what keeps the idle
+  cost flat in fleet size.
+- **Commit before send** (#91). A task is durably `ASSIGNED` before a
+  byte reaches the worker, because a stranded-but-recorded task is
+  recoverable by Phase 3 and an unrecorded one is not.
+- **Declared capabilities are sanitised, not trusted** (#92). Credits are
+  clamped, unknown types dropped, and "eligible for nothing" is never
+  widened into "eligible for everything". An ack means *received*, not
+  *started* — `ASSIGNED -> RUNNING` belongs to Step 2.4.
+
+**New wire messages.** `task_assign` (coordinator to worker), `task_ack`
+and `capacity` (worker to coordinator). The envelope is untouched and
+`PROTOCOL_VERSION` stays `"1.0"` — new `message_type` values only, which
+is the extension route Decision #6 specified. `capacity` is handled now
+but nothing emits it until Step 2.4, since nothing finishes a task yet.
+
+**Verification** — `scripts/assignment_harness.py`, versioned:
+
+```bash
+# 500 tasks across 50 workers, each with 10 credits.
+python scripts/assignment_harness.py fanout --url https://localhost:18443 \
+  --workers 50 --tasks 500 --max-concurrent 10 --insecure \
+  --enrollment-secret "$ENROLLMENT_SECRET" --admin-secret "$ADMIN_SECRET"
+
+# 100 idle workers, empty queue: samples the coordinator's own /metrics.
+python scripts/assignment_harness.py idle --url https://localhost:18443 \
+  --workers 100 --seconds 60 --insecure \
+  --enrollment-secret "$ENROLLMENT_SECRET" --admin-secret "$ADMIN_SECRET"
+
+# One worker that takes a task and vanishes without acknowledging —
+# the deterministic way to produce a millisecond-wide race.
+python scripts/assignment_harness.py stranded --url https://localhost:18443 \
+  --insecure --enrollment-secret "$ENROLLMENT_SECRET" \
+  --admin-secret "$ADMIN_SECRET"
+```
+
+Unlike `queue_harness.py` this one needs the `websockets` package, so run
+it from a venv with the worker's requirements or from the worker image.
+Its simulated workers are real registered identities with real WebSocket
+sessions — indistinguishable from containers to the coordinator (§3.5) —
+but they are **sessions from one process, not separate machines**, and
+the measurements should be read that way (§10).
 
 ---
 

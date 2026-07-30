@@ -126,6 +126,24 @@ WS_BACKOFF_MAX_SECONDS = float(os.environ.get("WORKER_WS_BACKOFF_MAX_SECONDS", "
 # coordinator's HEARTBEAT_SUSPECT_THRESHOLD_SECONDS (default 12s).
 HEARTBEAT_INTERVAL_SECONDS = int(os.environ.get("WORKER_HEARTBEAT_INTERVAL_SECONDS", "5"))
 
+# Phase 2.3 capabilities, declared once per session in `hello`.
+#
+# MAX_CONCURRENT is how many tasks this worker will hold at a time. The
+# coordinator clamps it to its own ceiling — this is a request, not an
+# entitlement (see `coordinator/app/config.worker_max_concurrent_ceiling`).
+MAX_CONCURRENT = int(os.environ.get("WORKER_MAX_CONCURRENT", "4"))
+# Which dummy task types this worker will accept. Empty/unset means "all
+# of them", which is what every worker built before Step 2.3 implicitly
+# claimed. A comma-separated list narrows it — that is also how the
+# "queued task with no eligible worker" case is produced deliberately.
+SUPPORTED_TASK_TYPES = [
+    t.strip()
+    for t in os.environ.get(
+        "WORKER_SUPPORTED_TASK_TYPES", "count_to_n,hash_rounds,sleep,opaque_payload"
+    ).split(",")
+    if t.strip()
+]
+
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 logger = logging.getLogger("worker")
 
@@ -305,6 +323,56 @@ async def _heartbeat_ws_loop(
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
+async def _acknowledge_task(
+    ws, identity: dict, send_lock: asyncio.Lock, message: dict, session_correlation_id: str
+) -> None:
+    """Accept a coordinator-assigned task and acknowledge receipt.
+
+    Phase 2.3 only. **This does not execute anything** — the executor is
+    Step 2.4. The worker takes delivery, confirms it, and holds the slot;
+    the coordinator's credit accounting is what stops it being handed more
+    than `MAX_CONCURRENT` at a time.
+
+    The ack echoes the assignment's `correlation_id`, so the task's single
+    id spans enqueue, assignment and acknowledgement across both services
+    (§11).
+
+    A type this worker did not advertise is **refused rather than
+    silently dropped**. The coordinator should never send one, so a
+    refusal here means the two disagree — which is worth surfacing
+    explicitly instead of letting the task sit ASSIGNED and unanswered.
+    """
+    payload = message.get("payload") or {}
+    task_id = payload.get("task_id")
+    task_type = payload.get("task_type")
+    # The task's own id, so the ack joins the task's trace rather than the
+    # session's. Falls back to the session id only if the coordinator sent
+    # an assignment without one, which it never does.
+    correlation_id = str(message.get("correlation_id") or session_correlation_id)
+
+    accepted = task_type in SUPPORTED_TASK_TYPES
+    ack = Envelope(
+        message_type="task_ack",
+        worker_id=identity["worker_id"],
+        correlation_id=correlation_id,
+        payload={
+            "task_id": task_id,
+            "accepted": accepted,
+            "reason": None if accepted else f"unsupported task type: {task_type}",
+        },
+    )
+    async with send_lock:
+        await ws.send(json.dumps(ack.to_dict()))
+
+    _log(
+        "task_assigned_received" if accepted else "task_refused",
+        worker_id=identity["worker_id"],
+        task_id=task_id,
+        task_type=task_type,
+        correlation_id=correlation_id,
+    )
+
+
 async def _hold_connection(
     identity: dict, access_token: str, established: dict, correlation_id: str
 ) -> None:
@@ -324,7 +392,17 @@ async def _hold_connection(
             message_type="hello",
             worker_id=identity["worker_id"],
             correlation_id=correlation_id,
-            payload={"agent_version": AGENT_VERSION},
+            payload={
+                "agent_version": AGENT_VERSION,
+                # Phase 2.3 (Decision #80): the credit count and the type
+                # filter the coordinator's assignment engine schedules
+                # against. Declared per session, so a restart with new
+                # settings takes effect on reconnect with no coordinator
+                # state to clean up (§3.6, workers are stateless between
+                # tasks).
+                "max_concurrent": MAX_CONCURRENT,
+                "supported_task_types": SUPPORTED_TASK_TYPES,
+            },
         )
         async with send_lock:
             await ws.send(json.dumps(hello.to_dict()))
@@ -364,6 +442,9 @@ async def _hold_connection(
                 if message_type == "shutdown":
                     _log("ws_shutdown_received", worker_id=identity["worker_id"])
                     return
+                if message_type == "task_assign":
+                    await _acknowledge_task(ws, identity, send_lock, message, correlation_id)
+                    continue
                 if message_type == "session_evicted":
                     _log(
                         "ws_session_evicted",

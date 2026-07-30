@@ -28,7 +28,7 @@ import logging
 import time
 from typing import Callable
 
-from prometheus_client import CONTENT_TYPE_LATEST, Gauge, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from sqlalchemy import func, select
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -68,6 +68,38 @@ TASKS_QUEUED = Gauge("coordinator_tasks_queued", "Tasks waiting in the queue.")
 ADMIN_CREDENTIAL_SEPARATE = Gauge(
     "coordinator_admin_credential_separate",
     "1 when ADMIN_SECRET is set and differs from ENROLLMENT_SECRET, else 0.",
+)
+
+# Phase 2.3 assignment engine. Unlike the fleet gauges above these are
+# genuinely **per-instance**, not identical across replicas, and that is
+# correct rather than a §3.9 violation: a replica assigns only to the
+# worker sockets it holds, so "assignments made" is a property of this
+# process. Sum across instances in a query, do not `max`.
+TASKS_ASSIGNED = Counter(
+    "coordinator_tasks_assigned_total",
+    "Tasks delivered to a worker by this coordinator instance.",
+)
+TASK_ACKS = Counter(
+    "coordinator_task_acks_total",
+    "Task assignment acknowledgements received, by outcome.",
+    ["outcome"],
+)
+# The idle-cost series. With an empty queue this is the *only* thing the
+# assignment engine does, and its rate is what makes the "100 idle workers
+# produce negligible load" exit criterion measurable rather than asserted:
+# the pass rate is driven by the safety-net poll interval, and does not
+# grow with the number of connected workers.
+ASSIGNMENT_PASSES = Counter(
+    "coordinator_assignment_passes_total",
+    "Assignment passes run by this coordinator instance.",
+)
+ASSIGNMENT_QUERIES = Counter(
+    "coordinator_assignment_dequeue_queries_total",
+    "Dequeue statements issued by the assignment engine on this instance.",
+)
+ASSIGNMENTS_IN_FLIGHT = Gauge(
+    "coordinator_assignments_in_flight",
+    "Tasks assigned by this instance and not yet acknowledged or released.",
 )
 
 # Per-instance request latency. Route template keeps label cardinality bounded.
