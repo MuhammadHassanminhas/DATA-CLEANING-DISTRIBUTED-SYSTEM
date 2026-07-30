@@ -8,10 +8,80 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## 2026-07-30 (session 11, part 2) — Step 2.3 BUILT, CI-green, 5 of 6 criteria measured
+## ⇒ SESSION CLOSED 2026-07-30 — read this block first
 
-**PR #28 (`phase-2.3-assignment-engine`, `6ded987`). All 7 required checks
-pass — 136 passed, no skips. NOT MERGED, NOT DEPLOYED, NOT APPROVED.**
+**Where the project actually is:** `main` at **`5cad07f`**, both staging
+and production deployed and verified on it. **Step 2.3 (assignment
+engine) has all six exit criteria objectively verified and is AWAITING
+YOUR APPROVAL.** It is deliberately *not* marked DONE anywhere.
+
+### Two things left in flight
+
+1. **PR #29 is OPEN and NOT MERGED** — docs only, `MERGEABLE` / `CLEAN`,
+   all 7 checks green. **It carries the `PHASE_STATE.md` and
+   `SESSION_HANDOFF.md` entries recording 2.3's live verification**, so
+   until it merges, `main`'s docs still describe 2.3 as unverified. The
+   code on `main` is correct and deployed; only the write-up is behind.
+2. **⚠️ THE CLUSTER IS STILL RUNNING AND BILLING.** It was left up for
+   the Internet-worker test and never stopped.
+
+**These two interact — pick one order and do not mix them:**
+
+- **Stop now, merge tomorrow** (recommended if you are done for the day):
+  `az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system`,
+  then merge #29 tomorrow after `az aks start`.
+- **Merge now, then stop:** merging #29 starts a CD run, and stopping the
+  cluster underneath it fails the deploy with "AKS unreachable" — the
+  exact failure that hit run `61ecc4c`. Wait for CD to finish first.
+
+### Session state, for a clean resume
+
+- Working tree **clean**, checked out on `docs/phase-2.3-verified`
+  (PR #29's branch). Nothing uncommitted, nothing stranded.
+- Branch `phase-2.3-assignment-engine` is merged and can be deleted.
+- Cluster left as found otherwise: `demo-worker` restored to 1 replica
+  after being scaled to 0 for the Internet test; the local worker process
+  stopped and its identity file deleted; all local Docker verification
+  containers and volumes removed.
+- Staging's `tasks` table holds ~20.6k `ASSIGNED` rows of cumulative
+  verification history. Harmless audit trail; `TRUNCATE tasks` clears it
+  if you want a clean slate before 2.4.
+
+### Still deferred, unchanged and not forgotten
+
+Both were deferred earlier today and **neither gates Step 2.4**:
+
+1. **Rotate `GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`** — not
+   attempted, deferred by your explicit decision. **Of everything
+   outstanding this is the only item with actual known exposure** (both
+   public via `.env.example` history, both still live, both in-cluster
+   only).
+2. **Exercise the `ADMIN_SECRET` rotation runbook** — attempted, blocked
+   by the harness permission classifier. Two real prerequisite defects
+   were found and are recorded below: `kubeseal` is not on PATH, and the
+   runbook's step-1 `python -c "import secrets…"` does not run on this
+   machine because `python` on PATH is the WindowsApps stub.
+   `docs/runbook.md` was deliberately left uncorrected.
+
+### Next session, in order
+
+1. `az aks start` + `az aks get-credentials`.
+2. Merge PR #29 if it is still open; let its CD run finish.
+3. **Approve or reject Step 2.3.** Two judgement calls to confirm:
+   (a) delivery goes straight down the socket rather than through the
+   `worker:{id}:push` channel Decision #80's wording named;
+   (b) an acknowledgement does **not** move a task to `RUNNING` — that
+   transition is Step 2.4's.
+4. **Step 2.4 — worker execution runtime — NOT STARTED. Do not begin
+   without an explicit go-ahead (§9).**
+
+---
+
+## 2026-07-30 (session 11, part 2) — Step 2.3 SHIPPED; all 6 criteria verified; AWAITING APPROVAL
+
+**PR #28 merged. `main` at `5cad07f`. CI green — 136 passed, no skips.
+Deployed to staging AND production. All six exit criteria objectively
+verified. NOT YET APPROVED — that is yours (§9/§15).**
 
 ### The design, in four decisions (#89–#92)
 
@@ -58,19 +128,53 @@ pass — 136 passed, no skips. NOT MERGED, NOT DEPLOYED, NOT APPROVED.**
 - **Disconnect-before-ack produced deterministically** via the harness's
   `stranded` mode, rather than by trying to win a millisecond race.
 
-### The one criterion NOT met
+### Criterion 6 — closed the same day, on real infrastructure
 
-**Criterion 6 — identical behaviour for a remote Internet worker.** The
-local-Docker half is proven; the Internet half needs this deployed, and
-**`gh pr merge` was denied by the harness permission classifier on both
-attempts.** Nothing about the code is implicated. PR #27 earlier today
-passed on a retry; this did not.
+**The user merged PR #28** (the agent's `gh pr merge` was denied twice by
+the harness permission classifier — a harness outcome, not a code one).
+`main` at **`5cad07f`**; CI green; **CD run `30520645010` succeeded on
+both `staging / deploy` and `production / deploy`.**
 
-**To finish 2.3:** merge PR #28 → let CI+CD run → approve the production
-gate → then run a worker on this laptop against
-`https://dcds-staging.centralindia.cloudapp.azure.com`, enqueue a task
-through the public ingress, and confirm assignment and ack look identical
-to the Docker path. That is the whole remaining scope.
+Verified on the deployed system rather than off CD's green tick:
+
+- Public `/health` returns `5cad07fa…` **with no `-k`**, so the Let's
+  Encrypt certificate genuinely validated.
+- All three staging replicas run the new image and **each logged
+  `assignment_engine_started`** — an engine per replica, per #89, not one
+  elected leader.
+- **A worker on this laptop, over the public Internet**, registered →
+  `ws_connected`, declared `max_concurrent: 2` /
+  `supported_task_types: ["hash_rounds"]`, and the coordinator recorded
+  that verbatim. A `hash_rounds` task enqueued **through the public
+  ingress** was assigned and **acknowledged 72 ms later**, whole trail on
+  replica `kl5x9`, **one correlation id `56839f9d…` across the enqueue
+  response, `task_assigned`, `task_acknowledged` and the worker's own
+  log**. Row: `ASSIGNED`, correct worker, `assigned_at` stamped,
+  `lease_expires_at` NULL, `attempt_count` 0.
+- **Eligibility re-proven over the same path:** with only that
+  hash_rounds-only worker connected, 2 `sleep` tasks stayed `QUEUED`.
+
+**An unplanned compatibility proof, worth more than a simulated one:**
+the in-cluster demo worker still runs the **pre-2.3 image `b1963f90`**
+and declares neither capability field. The coordinator gave it the
+Decision #92 default — 4 credits, all four types — so the
+backwards-compatibility path was exercised by a genuinely old worker.
+
+**Step 2.3 is therefore complete on evidence and AWAITS ONLY YOUR
+APPROVAL (§9/§15).** Two judgement calls to confirm: (a) delivery goes
+straight down the socket, not through the `worker:{id}:push` channel
+Decision #80's wording named; (b) an ack does **not** move a task to
+`RUNNING` — that is Step 2.4's.
+
+### Cluster state left behind
+
+`demo-worker` was scaled to 0 during the Internet test to remove
+attribution ambiguity and **has been restored to 1**. The local worker
+process was stopped and its identity file deleted. **The cluster is still
+RUNNING** — stop it at end of day, and only after any in-flight CD run
+finishes. Note staging's `tasks` table now holds ~20.6k ASSIGNED rows
+from cumulative verification; harmless audit trail, `TRUNCATE tasks`
+clears it.
 
 ### Gotcha worth keeping
 
