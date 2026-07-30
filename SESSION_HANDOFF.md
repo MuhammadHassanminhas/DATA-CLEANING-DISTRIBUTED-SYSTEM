@@ -15,9 +15,38 @@ criteria are met locally.** Implementation Decisions **#105–#108**. Suite
 **203 passed** (was 136 at 2.3), `ruff` clean across `coordinator worker
 dashboard protocol tests scripts`.
 
-**Two things are NOT done and gate approval:** verification on AKS with a
-worker outside the local network (§8), and your own demo plus failure demo
-(§15 items 3–4).
+**Shipped and verified over the public Internet.** PR #32 merged, `main` at
+**`fc33815`**, CI green on all 7 checks, `staging / deploy` succeeded and
+public `/health` returns `fc33815d…` **with no `-k`** — the certificate
+genuinely validated, not taken off CD's green tick.
+
+**⚠ `production / deploy` is PARKED on its required-reviewer gate** — yours
+to approve; the agent is blocked from approving production gates. The
+cluster is up and staying up, as you asked, so approving it now is safe.
+
+**The one thing left before Step 2.4 can be marked DONE: your own demo and
+failure demo (§15 items 3–4).** Everything else is verified.
+
+### The Internet test (§8) — the shipped artefact, not a local build
+
+The worker was **the ghcr image CI built for `fc33815`**, run on this laptop
+against `https://dcds-staging.centralindia.cloudapp.azure.com` with
+`WORKER_CA_FILE` empty, so the OS trust store validated the coordinator and
+no dev CA was involved. It registered, connected, declared
+`max_concurrent: 2`, and **executed 4 tasks over the real network** — two
+`sleep(25)` (25.012s / 25.010s) and two ceiling `hash_rounds` that both
+returned **`2c7324ca2eca`**, the answer recomputed independently. Progress
+and the current task were readable **through the public admin API
+mid-execution** (`running: 2`, progress 0.46 / 0.47), which is exactly what
+the dashboard reads.
+
+**One thing to fix before Step 2.9, and it is not a 2.4 defect:** four
+`count_to_n` tasks in the same staging batch went to another fleet worker
+and never reached `RUNNING`. That matches the in-cluster `demo-worker` still
+running the **pre-2.3 image** recorded in session 11 — an old worker acks
+and holds the slot without executing, which is Decision #92's documented
+compatibility behaviour. **Inference, not measurement: the running image was
+not inspected.** It will make M2's counted end-to-end runs hard to read.
 
 ### Read this first: live testing found a bug that review did not
 

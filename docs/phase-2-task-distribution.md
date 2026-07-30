@@ -301,10 +301,11 @@ the measurements should be read that way (§10).
 - Local task state deleted after submission.
 - Refusal path for an unsupported task type.
 
-**Exit criteria** — all verified locally in Docker 2026-07-30; the figures
-are in `PHASE_STATE.md`'s 2.4 register row. **Not yet verified on AKS over
-the public Internet (§8), and not yet demonstrated by the user in person
-(§15 items 3–4).**
+**Exit criteria** — all verified locally in Docker 2026-07-30, and then
+re-verified on staging **over the public Internet** with the shipped ghcr
+image (§8). The figures are in `PHASE_STATE.md`'s 2.4 register row.
+**Still outstanding: the user's own demo and failure demo (§15 items
+3–4).**
 
 - [x] All four task types execute correctly and return correct results.
       Known-answer vectors in `tests/test_executors.py`, and live runs whose
@@ -568,7 +569,44 @@ failed silently, the credits were never released, and the worker sat
 permanently "full" with nothing running while the queue waited behind it.
 Unit tests did not catch it and neither did review.
 
-**Test suite: 202 passed** (was 136 at Step 2.3), `ruff` clean.
+**Test suite: 203 passed** (was 136 at Step 2.3), `ruff` clean.
+
+### Verified over the public Internet (§8)
+
+`main` at **`fc33815`**, CI green on all 7 checks, `staging / deploy`
+succeeded, and the deployment was checked rather than taken off CD's tick:
+public `/health` returns `fc33815d…` **with no `-k`**, so the Let's Encrypt
+certificate genuinely validated. `production / deploy` sits parked on its
+required-reviewer gate.
+
+The worker was **the ghcr image CI built for that SHA**, not a local build,
+running on this laptop against
+`https://dcds-staging.centralindia.cloudapp.azure.com` with
+`WORKER_CA_FILE` empty — so the OS trust store validated the coordinator,
+no dev CA involved. Same handshake, same protocol, same code path as a
+Docker worker (§3.5).
+
+- Registered, `ws_connected`, epoch 1, and declared `max_concurrent: 2`.
+- **Executed 4 tasks over the Internet**: two `sleep(25)` (25.012s,
+  25.010s) and two ceiling `hash_rounds`. **Both hash tasks returned
+  fingerprint `2c7324ca2eca`** — the same value recomputed independently
+  from a 10,000,000-round SHA-256 chain, so correctness holds on the
+  shipped artefact over the real network, not just locally.
+- **Progress and the current task were readable through the public admin
+  API mid-execution** — the worker showed `running: 2` with both tasks at
+  0.46 / 0.47 and elapsed 11.8 / 11.9s, which is exactly the data path the
+  dashboard reads.
+- Concurrency held at 2 with `max_concurrent: 2`.
+
+**One observation that is not a 2.4 defect but will muddy M2 verification:**
+four `count_to_n` tasks enqueued in the same batch were assigned to another
+worker in the staging fleet and never reached `RUNNING`. That is consistent
+with the in-cluster `demo-worker` still running the pre-2.3 image recorded
+in session 11's notes — an old worker acknowledges an assignment and holds
+the slot without executing, which is the documented backwards-compatibility
+behaviour (Decision #92), not a fault. **Stated as inference, not
+measurement:** the running image was not inspected. Worth resolving before
+Step 2.9's counted end-to-end runs.
 
 ---
 
