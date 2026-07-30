@@ -78,8 +78,8 @@ measurement — **do not copy 40**, it is a property of the machine.
 
 ### Session state at close
 
-**Committed and pushed on branch `docs/phase-2.4-design-gate`, PR opened
-against `main`. NOT merged** — merging starts a CD run, and there was no
+**Committed and pushed on branch `docs/phase-2.4-design-gate` as
+**PR #30**. NOT merged** — merging starts a CD run, and there was no
 reason to deploy a docs-and-harness change at end of day.
 
 Two commits, one concern each:
@@ -113,9 +113,9 @@ Two commits, one concern each:
 ### Next session, in order
 
 1. `az aks start` + `az aks get-credentials` (if stopped).
-2. Merge PR for `docs/phase-2.4-design-gate` if still open, let CD finish,
-   then delete the branch local and remote — a surviving base branch is
-   what stopped PR #15 auto-retargeting in session 9.
+2. Merge **PR #30** (`docs/phase-2.4-design-gate`) if still open, let CD
+   finish, then delete the branch local and remote — a surviving base
+   branch is what stopped PR #15 auto-retargeting in session 9.
 3. **Approve or amend the Step 2.4 design sub-gate (Decisions #93–#100).**
    It is decided with no open questions, but §9 needs the approval
    recorded before implementation.
