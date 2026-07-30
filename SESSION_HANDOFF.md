@@ -40,13 +40,25 @@ and the current task were readable **through the public admin API
 mid-execution** (`running: 2`, progress 0.46 / 0.47), which is exactly what
 the dashboard reads.
 
-**One thing to fix before Step 2.9, and it is not a 2.4 defect:** four
-`count_to_n` tasks in the same staging batch went to another fleet worker
-and never reached `RUNNING`. That matches the in-cluster `demo-worker` still
-running the **pre-2.3 image** recorded in session 11 — an old worker acks
-and holds the slot without executing, which is Decision #92's documented
-compatibility behaviour. **Inference, not measurement: the running image was
-not inspected.** It will make M2's counted end-to-end runs hard to read.
+### One thing to fix before Step 2.9 — not a 2.4 defect
+
+Four `count_to_n` tasks in the same staging batch went to another fleet
+worker and never reached `RUNNING`. **Measured:** `kubectl` shows
+`demo-worker` running the worker image **`b1963f90`** (pre-2.3), so it acks
+and holds the slot without executing — Decision #92's documented
+compatibility behaviour, not a fault.
+
+**Root cause is a deployment gap, not code.** `demo-worker.yaml` at the repo
+root is a **hand-applied manifest with a hardcoded image tag**, outside
+`infra/helm/platform/` and therefore outside CD. Coordinator and dashboard
+update themselves on every rollout; this never has, and nothing fails when
+it drifts. Its `100m` CPU limit would also throttle a real `hash_rounds`
+task hard.
+
+**Left for you deliberately** — outside 2.4's scope, and live cluster
+config. But resolve it before Step 2.9, whose exit criteria count tasks end
+to end: a worker that silently parks everything it is given makes those
+counts unreadable.
 
 ### Read this first: live testing found a bug that review did not
 

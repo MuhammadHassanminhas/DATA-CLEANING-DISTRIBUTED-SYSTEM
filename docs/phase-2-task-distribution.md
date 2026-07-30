@@ -598,15 +598,25 @@ Docker worker (§3.5).
   dashboard reads.
 - Concurrency held at 2 with `max_concurrent: 2`.
 
-**One observation that is not a 2.4 defect but will muddy M2 verification:**
-four `count_to_n` tasks enqueued in the same batch were assigned to another
-worker in the staging fleet and never reached `RUNNING`. That is consistent
-with the in-cluster `demo-worker` still running the pre-2.3 image recorded
-in session 11's notes — an old worker acknowledges an assignment and holds
-the slot without executing, which is the documented backwards-compatibility
-behaviour (Decision #92), not a fault. **Stated as inference, not
-measurement:** the running image was not inspected. Worth resolving before
-Step 2.9's counted end-to-end runs.
+**One finding that is not a 2.4 defect but will break M2 verification if
+left alone.** Four `count_to_n` tasks enqueued in the same batch were
+assigned to another staging worker and never reached `RUNNING`. **Measured,
+not inferred:** `kubectl` shows `demo-worker` running the worker image
+`b1963f90` — pre-2.3 — so it acknowledges an assignment and holds the slot
+without executing, which is exactly Decision #92's documented
+backwards-compatibility behaviour and not a fault.
+
+**Root cause, and it is a deployment gap rather than a code one:**
+`demo-worker.yaml` at the repo root is a **hand-applied manifest with a
+hardcoded image tag**, living outside `infra/helm/platform/` and therefore
+outside CD. Every coordinator and dashboard rollout updates itself; this one
+never has, and nothing fails when it drifts. It also carries a `100m` CPU
+limit, which would throttle a real `hash_rounds` task hard.
+
+Left for a decision rather than changed here: it is outside Step 2.4's
+scope, and it is live cluster configuration. **Resolve it before Step 2.9**,
+whose exit criteria count tasks end to end — a worker that silently parks
+every task it is given makes those counts unreadable.
 
 ---
 
