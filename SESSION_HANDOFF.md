@@ -8,6 +8,87 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## 2026-07-30 (session 11, part 2) — Step 2.3 BUILT, CI-green, 5 of 6 criteria measured
+
+**PR #28 (`phase-2.3-assignment-engine`, `6ded987`). All 7 required checks
+pass — 136 passed, no skips. NOT MERGED, NOT DEPLOYED, NOT APPROVED.**
+
+### The design, in four decisions (#89–#92)
+
+- **#89 — one loop per replica, assigning only to the sockets that
+  replica holds.** No leader election, because nothing needs one: two
+  replicas cannot hand out the same task, and not because they coordinate
+  — the claim is `FOR UPDATE SKIP LOCKED` on one row in one transaction.
+  Correctness is the *queue's* property, which is what lets the scheduler
+  be this simple. Delivery goes straight down the socket rather than
+  through `worker:{id}:push`; the assigning replica always holds the
+  socket, so the Redis hop would buy a round trip and a failure mode.
+- **#90 — event-driven with a slow safety net.** An enqueue rings a
+  `tasks:available` doorbell; a 30s per-replica poll covers what Redis
+  pub/sub does not guarantee. **A pass checks queue depth once before
+  touching any worker** — that one line is what makes the idle cost flat
+  in fleet size, and it is the whole of criterion 3.
+- **#91 — commit before send.** Both orders can fail. Only this one fails
+  recoverably: a task recorded as ASSIGNED that never arrived is visible
+  and is Phase 3's to reclaim, whereas a worker holding a task the
+  database never recorded is not cleanable by anything.
+- **#92 — capabilities are sanitised, not believed.** Credits clamped to
+  a ceiling, unknown types dropped, and **"eligible for nothing" is never
+  widened into "eligible for everything"** — `dequeue` raises on an empty
+  type list rather than silently dropping the filter. An ack means
+  *received*; `ASSIGNED -> RUNNING` is Step 2.4's.
+
+### Measured, not asserted
+
+- **500 tasks / 50 workers: 500 delivered, 500 unique, 0 duplicates, 500
+  acked, exactly 10 each, 0.76s.** Cross-checked **outside** the harness:
+  Postgres gave 500 rows / 50 workers / min 10 / max 10, and the
+  coordinator's logs gave **504 `task_assigned` events, 504 distinct ids,
+  0 repeats** with **503 acks** — 504 minus the one deliberately
+  stranded task. That arithmetic is what makes the ack count evidence.
+- **Idle: 1 worker and 100 workers both produced 2 passes and 0 dequeue
+  queries** over the same 60s window. Coordinator CPU went 0.37% → 2.63%
+  of a core across that change — **that is the Phase 1.6 heartbeat path
+  for 100 sessions, not the engine**, and is recorded as such.
+- **One correlation id spans enqueue → assign → ack → the worker's own
+  log**, across two services.
+- **Eligibility is selective, not inert:** 3 `sleep` tasks held at QUEUED
+  while 2 `count_to_n` went to ASSIGNED on the same worker at the same
+  moment.
+- **Disconnect-before-ack produced deterministically** via the harness's
+  `stranded` mode, rather than by trying to win a millisecond race.
+
+### The one criterion NOT met
+
+**Criterion 6 — identical behaviour for a remote Internet worker.** The
+local-Docker half is proven; the Internet half needs this deployed, and
+**`gh pr merge` was denied by the harness permission classifier on both
+attempts.** Nothing about the code is implicated. PR #27 earlier today
+passed on a retry; this did not.
+
+**To finish 2.3:** merge PR #28 → let CI+CD run → approve the production
+gate → then run a worker on this laptop against
+`https://dcds-staging.centralindia.cloudapp.azure.com`, enqueue a task
+through the public ingress, and confirm assignment and ack look identical
+to the Docker path. That is the whole remaining scope.
+
+### Gotcha worth keeping
+
+**`curl.exe -d '{json}'` inline in PowerShell is still broken** — it
+mangled a task body into `json_invalid` and cost a round trip. Write the
+body to a file and use `-d "@file"`. This is the third session in a row
+this class of bug has appeared.
+
+### Local verification environment
+
+Ephemeral, and fully torn down: compose project `dcds23` (`down -v`) plus
+containers `dcds-m23-pg` / `dcds-m23-redis`. A venv with the coordinator +
+dev + worker requirements lives in the session scratchpad. `.env` was
+never read or touched — the stack ran off a throwaway env file with
+test-only credentials.
+
+---
+
 ## 2026-07-30 (session 11) — PR #27 merged; both scheduled items DEFERRED, not done
 
 **Nothing was built this session and no code changed.** The cluster was
