@@ -53,12 +53,22 @@ There is no dead-letter path, no drop, and no error: the pass assigns
 nothing, returns 0, and the loop parks again. The task remains visible in
 `GET /tasks/depth` and in `coordinator_tasks_queued`.
 
-**What this step does not do.** It does not move a task to `RUNNING` —
-that is Step 2.4, when a worker actually begins executing. An
-acknowledgement here means "received", not "started". Nothing writes
-`lease_expires_at` or `attempt_count`; those stay untouched through all
-of M2 (a Phase 2.1 exit criterion). Recovering a task whose worker
-vanished is Phase 3 — this module only *detects* and logs it.
+**What Step 2.4 added here.** The worker-reported half of the lifecycle:
+`task_started` moves `ASSIGNED -> RUNNING`, `task_progress` records
+telemetry (Redis only, never Postgres), `task_failed` moves a task whose
+executor raised to `FAILED`, and `capacity` releases the credit when a task
+finishes. An acknowledgement still means "received", never "started" — the
+two are separate messages so Phase 3 can shed telemetry under load without
+ever losing a state transition.
+
+**What still does not happen here.** Nothing writes `COMPLETED`: a task
+that finishes successfully in M2 stays `RUNNING` until Step 2.5 submits
+and persists its result, because 2.4 computes results and discards them
+(Decision #98). Nothing writes `lease_expires_at` or `attempt_count`;
+those stay untouched through all of M2 (a Phase 2.1 exit criterion).
+Nothing times a task out (Decision #103) — duration is already bounded by
+Step 2.1's parameter validation. Recovering a task whose worker vanished
+is Phase 3; this module only *detects* and logs it.
 """
 
 from __future__ import annotations
@@ -68,12 +78,14 @@ import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import WebSocket
 
 from app.config import (
     assignment_poll_interval_seconds,
+    heartbeat_offline_threshold_seconds,
     task_dequeue_max_batch,
     worker_default_max_concurrent,
     worker_max_concurrent_ceiling,
@@ -84,10 +96,21 @@ from app.metrics import (
     ASSIGNMENT_QUERIES,
     ASSIGNMENTS_IN_FLIGHT,
     TASK_ACKS,
+    TASK_PROGRESS_REPORTS,
     TASKS_ASSIGNED,
+    TASKS_FAILED,
+    TASKS_STARTED,
 )
 from app.redis_client import redis_client
-from app.task_queue import dequeue, queue_depth
+from app.task_queue import (
+    NOT_FOUND,
+    NOT_OWNER,
+    TRANSITIONED,
+    dequeue,
+    mark_status,
+    queue_depth,
+)
+from app.task_states import FAILED, RUNNING
 from app.task_types import TASK_TYPES
 from protocol import Envelope
 
@@ -103,18 +126,40 @@ WORK_AVAILABLE_CHANNEL = "tasks:available"
 # the safety-net poll already bounds the damage of being unsubscribed.
 _LISTENER_RETRY_SECONDS = 2.0
 
+# Refusal reason codes (Decision #101). A **wire contract**, not log text:
+# the credit accounting branches on them, and getting the branch wrong is
+# what livelocks the queue. Kept in step with `worker/worker.py`'s
+# constants of the same names — they are the two ends of one protocol, and
+# the worker deliberately does not import from the coordinator package.
+REFUSE_AT_CAPACITY = "at_capacity"
+REFUSE_UNSUPPORTED_TYPE = "unsupported_task_type"
+
+# Progress samples live as long as a worker's metrics snapshot does, for the
+# same reason: it is the dashboard's read, and a stale entry must expire on
+# its own if the replica holding the socket dies.
+CURRENT_TASKS_TTL_MULTIPLIER = 3
+
 
 @dataclass
 class LocalSession:
     """One worker socket held by *this* coordinator process.
 
     `in_flight` is the credit accounting from Decision #80: how many tasks
-    this worker has been handed that it has not finished with. In Step 2.3
-    nothing finishes a task — the worker acknowledges receipt and holds
-    the slot — so a worker fills to `max_concurrent` and then stops
-    drawing work. That is the correct behaviour for this step, not a
-    limitation of it: execution and slot release arrive in Step 2.4 via
-    the `capacity` message this module already handles.
+    this worker has been handed that it has not finished with. Step 2.4
+    added the other half — the worker executes, and releases the credit with
+    a `capacity` message when it is done — so a worker now cycles rather
+    than filling up once and stopping.
+
+    `saturated` is Decision #101, and it is the fix for a livelock the
+    design review caught before any of this was built. A worker that refuses
+    an assignment **because it has no free slot** must not have its credit
+    freed: freeing it rings the doorbell, the next pass picks the same
+    session (any session with `free_credits > 0`), it refuses again, and
+    every task in the queue is stranded in `ASSIGNED` at loop speed. So a
+    capacity refusal closes the door entirely, and only the worker's own
+    `capacity` message reopens it. An unsupported-type refusal is different
+    — it is rare, and the type filter makes it nearly unreachable — so that
+    one does free a single credit.
     """
 
     worker_id: str
@@ -123,13 +168,37 @@ class LocalSession:
     send_lock: asyncio.Lock
     max_concurrent: int
     supported_task_types: tuple[str, ...]
-    in_flight: int = 0
     # task_id -> that task's correlation id, so a disconnect can name every
     # task it stranded *with the id that traces it* (§11), not just a count.
     pending_acks: dict[str, str] = field(default_factory=dict)
+    # task_id -> correlation id, held from delivery until the credit is
+    # released. **Credits are keyed by task, not counted**, which is what
+    # makes a double release structurally impossible rather than merely
+    # clamped: a `capacity` naming a task this session is not holding cannot
+    # release anything (§3.7, and §12 — the worker sending it is untrusted).
+    credited: dict[str, str] = field(default_factory=dict)
+    # Work that was already running when this session opened, declared in
+    # `hello` as `tasks_in_flight` (Decision #101). It cannot be keyed —
+    # those tasks were delivered to a socket that no longer exists — so it is
+    # the one pool a `capacity` message may draw down by count. Bounding the
+    # draw to what the worker declared is what stops a duplicate release
+    # from over-crediting.
+    residual_in_flight: int = 0
+    # Latest progress sample per running task, mirrored to Redis for the
+    # dashboard. Telemetry only — nothing schedules on it.
+    current_tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
+    saturated: bool = False
+
+    @property
+    def in_flight(self) -> int:
+        """Credits consumed: work declared at reconnect, plus work delivered
+        to this session and not yet released."""
+        return self.residual_in_flight + len(self.credited)
 
     @property
     def free_credits(self) -> int:
+        if self.saturated:
+            return 0
         return max(0, self.max_concurrent - self.in_flight)
 
 
@@ -186,6 +255,33 @@ def parse_capabilities(payload: dict[str, Any] | None) -> tuple[int, tuple[str, 
     return max_concurrent, supported
 
 
+def parse_tasks_in_flight(payload: dict[str, Any] | None, max_concurrent: int) -> int:
+    """Read `tasks_in_flight` out of a `hello` (Decision #101).
+
+    A reconnecting worker whose previous socket died under running work is
+    still executing it — Step 2.4's runtime is process-level, so the threads
+    survive the session. Starting its credit count at zero would immediately
+    over-commit it, and every over-commit is a refusal; that is the loop the
+    review found.
+
+    Worker-reported, so clamped like everything else (§12) — to
+    `[0, max_concurrent]`. A worker inflating it only starves itself, which
+    is why clamping is sufficient here and no coordinator-side proof is
+    needed: the lie is self-limiting. A worker *understating* it gets
+    over-committed and refuses, which the saturation rule then absorbs
+    without stranding the queue.
+    """
+    payload = payload or {}
+    raw = payload.get("tasks_in_flight")
+    if raw is None:
+        return 0
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(value, max_concurrent))
+
+
 def register_session(session: LocalSession) -> None:
     """Take ownership of a worker socket and immediately look for work.
 
@@ -203,6 +299,8 @@ def register_session(session: LocalSession) -> None:
             "session_epoch": session.session_epoch,
             "max_concurrent": session.max_concurrent,
             "supported_task_types": list(session.supported_task_types),
+            # Non-zero only on a reconnect under running work (Decision #101).
+            "tasks_in_flight": session.in_flight,
         },
     )
     # A worker that connects to a non-empty queue should not wait for the
@@ -249,14 +347,23 @@ def log_unacknowledged(session: LocalSession, reason: str) -> None:
 async def handle_task_ack(session: LocalSession, message: dict[str, Any]) -> None:
     """Record a worker's acknowledgement of an assignment.
 
-    Does **not** change task state. `ASSIGNED -> RUNNING` belongs to Step
-    2.4, when the worker actually starts executing; an ack here means the
+    Does **not** change task state. `ASSIGNED -> RUNNING` is driven by the
+    separate `task_started` message (Decision #95); an ack here means the
     task arrived and was accepted, nothing more. Keeping the two apart is
-    what stops "delivered" from being silently reported as "started".
+    what stops "delivered" from being silently reported as "started", and it
+    is what lets Phase 3 throttle telemetry without ever dropping a state
+    transition.
 
-    A refusal frees the credit — the worker is not going to run it, so
-    holding the slot would strand capacity — but leaves the task
-    `ASSIGNED` for Phase 3, for the same reason `log_unacknowledged` does.
+    **A refusal's cause decides what happens to the credit** (Decision
+    #101). `at_capacity` saturates the session — the worker has no slot, and
+    freeing the credit here is precisely what would livelock the queue.
+    `unsupported_task_type` (or a refusal from a pre-2.4 worker, which could
+    only ever mean that) frees one credit and rings the doorbell, because
+    that cause is rare and the eligibility filter makes it nearly
+    unreachable.
+
+    Either way the task is left `ASSIGNED` for Phase 3, for the same reason
+    `log_unacknowledged` leaves its own.
     """
     payload = message.get("payload") or {}
     task_id = str(payload.get("task_id") or "")
@@ -283,8 +390,28 @@ async def handle_task_ack(session: LocalSession, message: dict[str, Any]) -> Non
                 "correlation_id": correlation_id,
             },
         )
+        _refresh_in_flight_gauge()
+        return
+
+    reason_code = str(payload.get("reason_code") or REFUSE_UNSUPPORTED_TYPE)
+    if reason_code == REFUSE_AT_CAPACITY:
+        # Saturate, do not free, and do not ring the doorbell. The credit
+        # stays consumed and this session draws nothing until it reports
+        # capacity — which is the whole of the anti-livelock rule.
+        session.saturated = True
+        TASK_ACKS.labels("refused_capacity").inc()
+        logger.warning(
+            "task_refused_at_capacity",
+            extra={
+                "task_id": task_id,
+                "worker_id": session.worker_id,
+                "correlation_id": correlation_id,
+                "in_flight": session.in_flight,
+                "max_concurrent": session.max_concurrent,
+            },
+        )
     else:
-        session.in_flight = max(0, session.in_flight - 1)
+        _release_credit(session, task_id)
         TASK_ACKS.labels("refused").inc()
         logger.warning(
             "task_refused",
@@ -292,6 +419,7 @@ async def handle_task_ack(session: LocalSession, message: dict[str, Any]) -> Non
                 "task_id": task_id,
                 "worker_id": session.worker_id,
                 "correlation_id": correlation_id,
+                "reason_code": reason_code,
                 "detail": payload.get("reason"),
             },
         )
@@ -300,14 +428,60 @@ async def handle_task_ack(session: LocalSession, message: dict[str, Any]) -> Non
     _refresh_in_flight_gauge()
 
 
+def _release_credit(session: LocalSession, task_id: str, freed: int = 1) -> bool:
+    """Give credit back. Returns whether anything was released.
+
+    **A named task is exactly-once.** If the id is one this session
+    delivered, the key is deleted and a second release for the same id does
+    nothing at all — not clamped, structurally impossible. If the id is
+    unknown but the session declared reconnect residue, one unit of residue
+    is released: that is the same task, reported by the worker that has been
+    running it since before this socket existed. If it is unknown and there
+    is no residue, nothing happens — that is a duplicate, or a worker
+    inventing ids (§12).
+
+    **An unnamed release is bounded best-effort**, residue first and then
+    arbitrary held credits. It cannot release more than the session holds,
+    so the total can never go negative. It *can* free the slot of a task
+    that is genuinely still running, in which case the worker gets
+    over-committed and refuses `at_capacity`, which the saturation rule
+    absorbs. That is the right way round: refusing to honour an unnamed
+    release would strand the worker's capacity permanently, which is worse
+    than one refusal.
+    """
+    if task_id:
+        if task_id in session.credited:
+            del session.credited[task_id]
+            return True
+        if session.residual_in_flight > 0:
+            session.residual_in_flight -= 1
+            return True
+        return False
+
+    released = min(max(1, freed), session.residual_in_flight)
+    session.residual_in_flight -= released
+    while released < freed and session.credited:
+        session.credited.pop(next(iter(session.credited)))
+        released += 1
+    return released > 0
+
+
 async def handle_capacity(session: LocalSession, message: dict[str, Any]) -> None:
     """Worker reports freed slots (Decision #80's `capacity` message).
 
-    Handled now so Step 2.4 has nothing to add on the coordinator side —
-    it only has to start sending this once a task finishes. Nothing emits
-    it in Step 2.3, because nothing executes a task yet; the path is
-    covered by unit tests rather than by the live demo, and that
-    distinction is recorded rather than blurred (§10).
+    Step 2.4 is what finally emits it: a task finishes, the worker releases
+    the slot, and the next pass hands it more work. It is also the **only**
+    thing that clears saturation (Decision #101) — a session that refused
+    for lack of capacity stays closed until the worker itself says otherwise.
+
+    Two shapes are accepted, and both are needed:
+
+    * with a `task_id` this session is holding — the normal case, released
+      exactly once no matter how many times the message arrives;
+    * without one, or naming a task this session never delivered — the
+      reconnect case. A worker that reconnected mid-execution declared those
+      tasks as `tasks_in_flight`, so they were counted without ever being
+      keyed by id here; `freed` decrements that residue.
     """
     payload = message.get("payload") or {}
     try:
@@ -316,17 +490,214 @@ async def handle_capacity(session: LocalSession, message: dict[str, Any]) -> Non
         freed = 1
     if freed < 1:
         return
-    session.in_flight = max(0, session.in_flight - freed)
+
+    task_id = str(payload.get("task_id") or "")
+    _release_credit(session, task_id, freed)
+    session.current_tasks.pop(task_id, None)
+    session.saturated = False
+
+    await _publish_current_tasks(session)
     _refresh_in_flight_gauge()
     logger.info(
         "worker_capacity_released",
         extra={
             "worker_id": session.worker_id,
+            "task_id": task_id or None,
             "freed": freed,
             "in_flight": session.in_flight,
+            # The **task's** id, not the session's. Without this the line
+            # inherits the session correlation id from the context var and the
+            # task's trace stops one message short of its own completion
+            # (§11) — which is exactly what the first live run showed.
+            "correlation_id": message.get("correlation_id"),
         },
     )
     notify_local()
+
+
+async def handle_task_started(session: LocalSession, message: dict[str, Any]) -> None:
+    """`ASSIGNED -> RUNNING`, on the worker's explicit report (Decision #95).
+
+    The transition is coordinator-authoritative: the worker reports that it
+    began, and this decides what that means. `mark_status` enforces that the
+    task is real, is this worker's, and that the move is legal; anything else
+    is logged and ignored rather than closing the socket, because a worker is
+    untrusted input, not a trusted peer (§12).
+    """
+    payload = message.get("payload") or {}
+    task_id = str(payload.get("task_id") or "")
+    correlation_id = str(message.get("correlation_id") or "")
+
+    async with get_session() as db:
+        outcome = await mark_status(
+            db, task_id=task_id, worker_id=session.worker_id, new_status=RUNNING
+        )
+        if outcome == TRANSITIONED:
+            await db.commit()
+
+    if outcome == TRANSITIONED:
+        TASKS_STARTED.inc()
+        session.current_tasks[task_id] = {
+            "task_id": task_id,
+            "task_type": payload.get("task_type"),
+            "progress": 0.0,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "correlation_id": correlation_id,
+        }
+        await _publish_current_tasks(session)
+        logger.info(
+            "task_started",
+            extra={
+                "task_id": task_id,
+                "worker_id": session.worker_id,
+                "task_type": payload.get("task_type"),
+                "correlation_id": correlation_id,
+            },
+        )
+        return
+
+    logger.warning(
+        "task_started_rejected",
+        extra={
+            "task_id": task_id,
+            "worker_id": session.worker_id,
+            "correlation_id": correlation_id,
+            "outcome": outcome,
+        },
+    )
+
+
+async def handle_task_progress(session: LocalSession, message: dict[str, Any]) -> None:
+    """Record the latest progress sample for a running task.
+
+    **Redis only, never Postgres.** A DB write per task per interval would
+    put avoidable write load on the `tasks` table, and under Decision #79
+    that table *is* the queue's hot path — the one place in the system where
+    extra writes cost throughput. Progress is also the most droppable data
+    in the protocol: losing a sample loses nothing, which is exactly why it
+    must not share a path with state transitions.
+
+    Only tasks this session actually started are recorded, so a worker
+    cannot inject a progress line for someone else's task.
+    """
+    payload = message.get("payload") or {}
+    task_id = str(payload.get("task_id") or "")
+    entry = session.current_tasks.get(task_id)
+    if entry is None:
+        TASK_PROGRESS_REPORTS.labels("unknown").inc()
+        return
+
+    try:
+        progress = float(payload.get("progress", 0.0))
+    except (TypeError, ValueError):
+        progress = 0.0
+    entry["progress"] = max(0.0, min(1.0, progress))
+    entry["elapsed_seconds"] = payload.get("elapsed_seconds")
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    TASK_PROGRESS_REPORTS.labels("recorded").inc()
+    await _publish_current_tasks(session)
+    logger.info(
+        "task_progress",
+        extra={
+            "task_id": task_id,
+            "worker_id": session.worker_id,
+            "progress": entry["progress"],
+            "elapsed_seconds": entry["elapsed_seconds"],
+            "correlation_id": entry.get("correlation_id"),
+        },
+    )
+
+
+async def handle_task_failed(session: LocalSession, message: dict[str, Any]) -> None:
+    """A task whose executor raised → `FAILED`, credit freed (Decision #102).
+
+    This closes a gap the design gate never addressed. Without it a task
+    whose executor blew up would sit `RUNNING` forever in M2, holding a
+    worker credit that nothing ever releases, with no Phase 3 lease engine
+    to reclaim either.
+
+    `FAILED` is reachable from both `ASSIGNED` and `RUNNING`, so a task that
+    failed before its `task_started` was processed still lands correctly.
+
+    The payload carries the **exception type only** — never a message and
+    never a traceback. A traceback can contain payload data, and payload
+    data must never reach a log (§12). What to *do* about a failure —
+    retry, reassign, give up — is Phase 3's, and is deliberately not decided
+    here.
+    """
+    payload = message.get("payload") or {}
+    task_id = str(payload.get("task_id") or "")
+    error_type = str(payload.get("error_type") or "unknown")[:100]
+    correlation_id = str(message.get("correlation_id") or "")
+
+    async with get_session() as db:
+        outcome = await mark_status(
+            db, task_id=task_id, worker_id=session.worker_id, new_status=FAILED
+        )
+        if outcome == TRANSITIONED:
+            await db.commit()
+
+    # Release the credit unless the database says this task was never this
+    # worker's. `ILLEGAL` (already terminal) and `NOOP` (already FAILED) both
+    # still release: the worker *was* running it, so the slot genuinely is
+    # free, and holding the credit would cost capacity for the life of the
+    # session. `NOT_OWNER` and `NOT_FOUND` release nothing — otherwise naming
+    # another worker's task id would be a way to draw down your own credits
+    # (§12).
+    if outcome not in (NOT_OWNER, NOT_FOUND):
+        _release_credit(session, task_id)
+    session.current_tasks.pop(task_id, None)
+    session.saturated = False
+    await _publish_current_tasks(session)
+    _refresh_in_flight_gauge()
+
+    if outcome == TRANSITIONED:
+        TASKS_FAILED.inc()
+    logger.warning(
+        "task_failed",
+        extra={
+            "task_id": task_id,
+            "worker_id": session.worker_id,
+            "error_type": error_type,
+            "correlation_id": correlation_id,
+            "outcome": outcome,
+        },
+    )
+    notify_local()
+
+
+def current_tasks_key(worker_id: str) -> str:
+    return f"worker:{worker_id}:current_tasks"
+
+
+async def _publish_current_tasks(session: LocalSession) -> None:
+    """Mirror this session's running tasks to Redis for the dashboard.
+
+    Written from the in-memory view in one `SET` rather than read-modify-
+    written, so a sample can never be lost to an interleaving. It is
+    ephemeral, coordinator-observed, high-frequency state — the same
+    reasoning that put worker metrics in Redis in Step 1.6 — and it carries
+    a TTL so a replica that dies does not leave a worker looking busy
+    forever.
+
+    A publish failure is swallowed. This is telemetry: it must never be able
+    to fail a state transition or drop a socket.
+    """
+    try:
+        if session.current_tasks:
+            await redis_client.set(
+                current_tasks_key(session.worker_id),
+                json.dumps(list(session.current_tasks.values())),
+                ex=heartbeat_offline_threshold_seconds() * CURRENT_TASKS_TTL_MULTIPLIER,
+            )
+        else:
+            await redis_client.delete(current_tasks_key(session.worker_id))
+    except Exception as exc:  # noqa: BLE001 — telemetry, never load-bearing
+        logger.warning(
+            "current_tasks_publish_failed",
+            extra={"worker_id": session.worker_id, "detail": str(exc)},
+        )
 
 
 async def _deliver(session: LocalSession, task: dict[str, Any]) -> bool:
@@ -368,8 +739,10 @@ async def _deliver(session: LocalSession, task: dict[str, Any]) -> bool:
         )
         return False
 
-    session.in_flight += 1
     session.pending_acks[task_id] = correlation_id
+    # The credit *is* this entry — one key, one credit, released exactly once
+    # on a `capacity`, a `task_failed`, or an unsupported-type refusal.
+    session.credited[task_id] = correlation_id
     TASKS_ASSIGNED.inc()
     logger.info(
         "task_assigned",

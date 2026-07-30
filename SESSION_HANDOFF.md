@@ -8,7 +8,104 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-07-30 (session 12) — Step 2.4 SUB-GATE ACCEPTED WITH AMENDMENTS; PR #30 merged
+## ⇒ 2026-07-30 (session 13) — Step 2.4 BUILT, VERIFIED LOCALLY, AWAITING APPROVAL
+
+**Step 2.4 (worker execution runtime) is implemented and all 8 exit
+criteria are met locally.** Implementation Decisions **#105–#108**. Suite
+**203 passed** (was 136 at 2.3), `ruff` clean across `coordinator worker
+dashboard protocol tests scripts`.
+
+**Two things are NOT done and gate approval:** verification on AKS with a
+worker outside the local network (§8), and your own demo plus failure demo
+(§15 items 3–4).
+
+### Read this first: live testing found a bug that review did not
+
+**Decision #108.** The first implementation captured the WebSocket at the
+moment execution began. Execution outlives its session by design (#97), so
+a task finishing after a reconnect reported `capacity` **down the socket
+the coordinator had already discarded**. The send failed, was swallowed,
+and the credit was never released — the worker sat at zero free credits
+with **nothing actually running**, stranding the queue behind it. That is
+#101's failure mode arriving by a different route, and neither the design
+review nor the unit tests found it; a live coordinator restart under two
+running tasks found it in one shot.
+
+Fixed: the runtime rebinds its socket on every reconnect, and a report with
+no live session is **dropped rather than buffered** — a task that finished
+while disconnected is already out of the worker's `running` map, so the next
+`hello`'s `tasks_in_flight` excludes it and the reconnect handshake releases
+the credit instead. Regression-tested in
+`tests/test_worker_runtime.py::test_a_completion_after_a_reconnect_reports_on_the_new_socket`.
+
+A second, smaller §12 hole was found by self-review and closed: a
+`task_failed` naming **another worker's** task used to draw down the
+reporter's own credits. It now releases nothing on `NOT_OWNER`/`NOT_FOUND`.
+
+### What was built
+
+- **`worker/executors.py`** — the four workloads as chunked loops with a
+  progress slot and a cooperative cancel flag. Imports nothing from the
+  coordinator; the two type registries are joined by the wire protocol.
+- **`worker/worker.py`** — a process-level `TaskRunner` (outlives every
+  session, which is what makes in-flight work survive a reconnect) holding
+  a `ThreadPoolExecutor` sized to `WORKER_MAX_CONCURRENT`, a semaphore of
+  the same size, and the running map that **is** the worker's entire local
+  task state. Refuses in two ways, never queues locally.
+- **The worker is a package now** (`python -m worker.worker` in the image)
+  because it is the first step where it is more than one file. The native
+  installers already set `PYTHONPATH`, so they need no change.
+- **Coordinator** — `task_queue.mark_status` (the only new write path,
+  ownership-checked and `FOR UPDATE`-locked), plus `handle_task_started`,
+  `handle_task_progress`, `handle_task_failed`, and `handle_task_ack`
+  branching on the refusal `reason_code` (#101's anti-livelock rule).
+  **Credits are keyed by task id, not counted** (#107).
+- **Dashboard** — a live `current task` column with a progress bar, so §6
+  is satisfied in the phase that first produces a current task.
+
+### Measured, not asserted
+
+- **The 10-minute criterion, both parts in ONE window** on a `--cpus=1`
+  worker (harsher than running them apart): `sleep(600)` completed at
+  **600.017s** while **55 ceiling `hash_rounds` tasks ran 805.5s of CPU
+  back to back**. Across 752.4s: **150 heartbeats, max gap 5.26s (mean
+  5.05), zero gaps over the 12s SUSPECT threshold, zero transitions out of
+  `ONLINE`.** Sizing was **re-derived on this machine** as the criterion
+  demands — one ceiling task is **12.916s** here, so 47 covers 600s; the
+  bench's "~40" was not reused.
+- **Correctness against known answers, not assertion:** **1,000 of 1,000**
+  `count_to_n` tasks fingerprinted `81a83544cf93` and **55 of 55** ceiling
+  `hash_rounds` tasks `2c7324ca2eca`, both recomputed independently outside
+  the system.
+- Concurrency: 6 tasks at `max_concurrent: 2` — never 3 in flight, zero
+  refusals. RSS **31,184 → 31,488 kB** across 1,000 tasks. 142 progress
+  samples with **no Postgres write for any of them**.
+- **The failure path used an INJECTED fault** (a throwaway worker with a
+  patched `executors.py`); **no production code was changed to produce
+  it.** There is no natural way to make an executor raise, which is the
+  point — the two registries agree.
+
+### Things worth knowing before touching this
+
+1. **`RUNNING` is the end state in M2 (#105).** A successful task does not
+   reach `COMPLETED` — Step 2.5 owns that. `tasks` will fill with `RUNNING`
+   rows exactly as 2.3 filled it with `ASSIGNED` ones.
+2. **Two Step 2.3 unit tests were rewritten**, seeding `credited` instead of
+   `in_flight`, because #107 changed credits from a counter to a keyed map.
+   What they assert is unchanged.
+3. **A task surviving a reconnect reports no progress to the new session**
+   until it finishes (that session never saw it start). Its completion
+   still lands and its credit is still released. Counted as
+   `coordinator_task_progress_reports_total{outcome="unknown"}`.
+4. Local verification ran as compose project **`dcds24`** plus standalone
+   containers `dcds24-cpu1` / `dcds24-faulty` and test containers
+   `dcds24-pg` / `dcds24-redis` on network `dcds24-net`. **`.env` was never
+   read or touched** — a throwaway env file with test-only credentials was
+   used. Tear down with `docker compose -p dcds24 down -v`.
+
+---
+
+## 2026-07-30 (session 12) — Step 2.4 SUB-GATE ACCEPTED WITH AMENDMENTS; PR #30 merged
 
 **Nothing was implemented. No application code changed.** The sub-gate was
 decided, its premises measured, then reviewed and **accepted with

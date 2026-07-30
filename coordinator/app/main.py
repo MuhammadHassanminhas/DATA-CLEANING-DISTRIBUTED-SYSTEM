@@ -30,12 +30,17 @@ from sqlalchemy import select, text
 from app.assignment import (
     LocalSession,
     assignment_loop,
+    current_tasks_key,
     handle_capacity,
     handle_task_ack,
+    handle_task_failed,
+    handle_task_progress,
+    handle_task_started,
     log_unacknowledged,
     notification_listener,
     notify_work_available,
     parse_capabilities,
+    parse_tasks_in_flight,
     register_session,
     unregister_session,
 )
@@ -490,6 +495,12 @@ async def list_workers(response: Response, x_admin_secret: str = Header(default=
         metrics = json.loads(metrics_json) if metrics_json else {}
         registry_json = await redis_client.get(f"worker:{worker.id}:connection")
         registry = json.loads(registry_json) if registry_json else None
+        # Step 2.4: what this worker is executing right now, latest progress
+        # sample included. Read from Redis like everything else ephemeral, so
+        # any replica answers identically (§3.9) — including a replica that
+        # does not hold this worker's socket.
+        tasks_json = await redis_client.get(current_tasks_key(str(worker.id)))
+        current_tasks = json.loads(tasks_json) if tasks_json else []
 
         item: dict[str, object] = {
             "worker_id": str(worker.id),
@@ -504,6 +515,8 @@ async def list_workers(response: Response, x_admin_secret: str = Header(default=
             # answers identically (§3.9). None when not connected.
             "max_concurrent": registry.get("max_concurrent") if registry else None,
             "supported_task_types": registry.get("supported_task_types") if registry else None,
+            "current_tasks": current_tasks,
+            "running_task_count": len(current_tasks),
         }
         for field in _WORKER_METRICS_FIELDS:
             item[field] = metrics.get(field)
@@ -818,6 +831,9 @@ async def ws_connect(websocket: WebSocket) -> None:
     # `assignment.parse_capabilities` for exactly what is clamped and why.
     hello_payload = hello.get("payload") or {}
     max_concurrent, supported_task_types = parse_capabilities(hello_payload)
+    # Step 2.4 (Decision #101): a worker reconnecting mid-execution is still
+    # running that work, so its credits start where reality is, not at zero.
+    tasks_in_flight = parse_tasks_in_flight(hello_payload, max_concurrent)
 
     worker_id = str(worker_uuid)
     session_epoch = await redis_client.incr(f"worker:{worker_id}:session_epoch")
@@ -880,6 +896,7 @@ async def ws_connect(websocket: WebSocket) -> None:
         send_lock=send_lock,
         max_concurrent=max_concurrent,
         supported_task_types=supported_task_types,
+        residual_in_flight=tasks_in_flight,
     )
     register_session(local_session)
 
@@ -919,7 +936,7 @@ async def ws_connect(websocket: WebSocket) -> None:
                 )
                 continue
 
-            # Step 2.3 assignment protocol. New `message_type` values only —
+            # Step 2.3/2.4 task protocol. New `message_type` values only —
             # the envelope is untouched and PROTOCOL_VERSION stays "1.0",
             # which is the extension route Decision #6 specified.
             if message_type == "task_ack":
@@ -928,6 +945,22 @@ async def ws_connect(websocket: WebSocket) -> None:
 
             if message_type == "capacity":
                 await handle_capacity(local_session, message)
+                continue
+
+            # Step 2.4. `task_started` is a state transition and
+            # `task_progress` is telemetry; they are separate messages on
+            # purpose (Decision #95), so Phase 3 can shed the second under
+            # load without ever losing the first.
+            if message_type == "task_started":
+                await handle_task_started(local_session, message)
+                continue
+
+            if message_type == "task_progress":
+                await handle_task_progress(local_session, message)
+                continue
+
+            if message_type == "task_failed":
+                await handle_task_failed(local_session, message)
                 continue
 
             logger.info("worker_message_received", extra={"worker_id": worker_id, "message_type": message_type})
@@ -944,6 +977,11 @@ async def ws_connect(websocket: WebSocket) -> None:
         current = await redis_client.get(registry_key)
         if current is not None and json.loads(current)["session_epoch"] == session_epoch:
             await redis_client.delete(registry_key)
+            # Step 2.4: a disconnected worker has no *observable* current
+            # task, whatever its threads are still doing. Clearing it beats
+            # waiting out the TTL, which would leave the dashboard showing
+            # progress that can no longer advance.
+            await redis_client.delete(current_tasks_key(worker_id))
             await _transition_status(worker_uuid, "OFFLINE", "ws_disconnected")
 
 

@@ -301,15 +301,22 @@ the measurements should be read that way (§10).
 - Local task state deleted after submission.
 - Refusal path for an unsupported task type.
 
-**Exit criteria**
-- [ ] All four task types execute correctly and return correct results.
-- [ ] A 10-minute task runs to completion while heartbeats continue
+**Exit criteria** — all verified locally in Docker 2026-07-30; the figures
+are in `PHASE_STATE.md`'s 2.4 register row. **Not yet verified on AKS over
+the public Internet (§8), and not yet demonstrated by the user in person
+(§15 items 3–4).**
+
+- [x] All four task types execute correctly and return correct results.
+      Known-answer vectors in `tests/test_executors.py`, and live runs whose
+      logged fingerprints match values computed independently — including
+      1,000 of 1,000 tasks at one fingerprint (Decision #106).
+- [x] A 10-minute task runs to completion while heartbeats continue
       uninterrupted — verified on the dashboard. **Two parts, both
       required (Decisions #99–#100, option (c), user-chosen 2026-07-30):**
-  - [ ] **(1) The letter.** One `sleep` task with `seconds: 600` runs to
+  - [x] **(1) The letter.** One `sleep` task with `seconds: 600` runs to
         completion, holding a slot for the full ten minutes, heartbeats
         uninterrupted.
-  - [ ] **(2) The substance.** The worker is additionally held
+  - [x] **(2) The substance.** The worker is additionally held
         **CPU-saturated for ≥600s** by repeated `hash_rounds` tasks at the
         existing 10,000,000 ceiling, heartbeats uninterrupted throughout.
         A sleeping task consumes no CPU, so part (1) alone cannot show
@@ -324,11 +331,11 @@ the measurements should be read that way (§10).
     on the AKS worker from a fresh measurement — do not copy 40**, since
     it is a property of the machine, not of the criterion.
   - No parameter ceiling is raised and no Step 2.1 artefact is changed.
-- [ ] Progress updates appear during execution.
-- [ ] Concurrency limit is respected and configurable.
-- [ ] Worker deletes temporary state after submission — verified.
-- [ ] Unsupported task type is refused cleanly, not crashed on.
-- [ ] Worker memory stays flat across 1,000 sequential tasks — no leak.
+- [x] Progress updates appear during execution.
+- [x] Concurrency limit is respected and configurable.
+- [x] Worker deletes temporary state after submission — verified.
+- [x] Unsupported task type is refused cleanly, not crashed on.
+- [x] Worker memory stays flat across 1,000 sequential tasks — no leak.
 
 ### Design sub-gate — ACCEPTED WITH AMENDMENTS 2026-07-30
 
@@ -457,6 +464,111 @@ docker run --rm -i --cpus=1 -v "$PWD:/bench:ro" python:3.12-slim \
 `psutil` is absent from the bare image, so the RSS figures report `NaN`
 unless it is installed first; the memory number above came from a run with
 `pip install 'psutil>=5.9,<7'` ahead of it.
+
+### What was built (Decisions #105–#108)
+
+**`worker/executors.py`** — the four workloads as chunked loops, each
+taking a one-slot progress list and a cooperative cancel flag. It imports
+nothing from the coordinator: the two type registries are joined by the
+wire protocol, not by a shared module, because the worker ships in its own
+image with its own requirements.
+
+**`worker/worker.py`** — a `TaskRunner` created once at startup and
+therefore outliving every session, holding a `ThreadPoolExecutor` sized to
+`WORKER_MAX_CONCURRENT`, an `asyncio.Semaphore` of the same size, and the
+map of running tasks that *is* the worker's entire local task state.
+Admission control refuses in two ways and never queues: an unadvertised
+type is `unsupported_task_type`, no free slot is `at_capacity`. A duplicate
+assignment is acknowledged and not started twice.
+
+The worker is a package from this step on (`python -m worker.worker` in the
+image), because it is the first step where it is more than one file.
+
+**Coordinator** — `task_queue.mark_status` is the only new write path, and
+every guard on it exists because the caller is an untrusted worker (§12):
+the id must parse, the row is locked `FOR UPDATE`, `assigned_worker_id`
+must be the reporting worker, and the move goes through
+`task_states.check_transition`. `assignment.py` gained
+`handle_task_started`, `handle_task_progress` and `handle_task_failed`, and
+`handle_task_ack` now branches on the refusal's `reason_code` — the
+anti-livelock rule from #101.
+
+**Credits are keyed by task id** rather than counted (#107). A named
+release is exactly-once by construction; only the reconnect residue
+declared in `hello` may be released by count.
+
+**Dashboard** — a live `current task` column with a progress bar, fed from
+Redis via `GET /workers`, so §6's "current task" is satisfied in the phase
+that first produces one. The full lifecycle view remains Step 2.7's.
+
+**Three things this deliberately does not do**, so they are not mistaken
+for oversights: no task reaches `COMPLETED` (#105 — a successful task
+stays `RUNNING` until Step 2.5 persists its result), no execution timeout
+exists (#103), and a task that survives a reconnect reports no *progress*
+to the new session until it finishes, because the new session never saw it
+start — its completion still lands, and the credit is still released.
+
+### Verification — measured locally, in Docker
+
+Every figure below was produced against a real coordinator, Postgres and
+Redis over TLS, with the long-duration run on a worker constrained to
+`--cpus=1` to match the shape the design was measured in.
+
+- **All four types, live, and correct.** `count_to_n`, `hash_rounds` and
+  `opaque_payload` each logged the exact fingerprint computed
+  independently (`36877f3dcf65`, `adcac83e02f9`, `42898f37607b`);
+  `sleep`'s fingerprint resolved to a result of exactly `14.0` for a
+  14-second task. At scale: **1,000 sequential `count_to_n` tasks, 1,000
+  distinct ids, every one fingerprinted `81a83544cf93`** — the value
+  computed independently for the result `2000`.
+- **The 10-minute criterion, both parts, in one window** — see the figures
+  recorded in `PHASE_STATE.md`. Running them simultaneously is harsher
+  than running them apart: one slot held by `sleep(600)` while the other
+  ran ceiling-parameter `hash_rounds` back to back on a single CPU.
+  **Sizing was re-derived on this machine as the criterion requires** —
+  one ceiling task measured **12.916s** here, so 47 covered 600s and 60
+  were enqueued for margin. The `~40` in the criterion above is the bench
+  machine's number and was deliberately not reused.
+- **Concurrency respected and configurable:** 6 tasks at a worker
+  declaring `max_concurrent: 2` — every `task_execution_started` reported
+  `tasks_in_flight` of 1 or 2, never 3, with zero refusals.
+- **Progress observed live:** a 14s `sleep` reported 0.25 → 0.61 → 0.97 at
+  the configured interval, each sample carrying the task's own correlation
+  id, and no Postgres write for any of them.
+- **Local state deleted after submission:** the worker's `running` map and
+  the coordinator's Redis `current_tasks` key both return to empty, and
+  the dashboard shows the worker idle.
+- **Memory flat:** worker RSS **31,184 kB → 31,488 kB (+0.3 MB)** across
+  the 1,000-task run.
+- **Both refusal paths, live**, forced with `POST /workers/{id}/push`
+  because the eligibility filter and credit accounting make the
+  coordinator refuse to over-commit on its own: an unregistered type was
+  refused `unsupported_task_type`, and a third task pushed at a
+  2-slot worker with both slots busy was refused `at_capacity` rather than
+  queued locally.
+- **The failure path, live, with an injected fault.** There is no natural
+  way to make an executor raise — the two registries agree, which is the
+  point — so a throwaway worker was run with a patched `executors.py` that
+  raises `ZeroDivisionError`. **No production code was changed to produce
+  this.** The task reached `FAILED`, the credit was freed, and the
+  exception message never appeared anywhere: the log and the wire carried
+  `error_type` only.
+- **Reconnect under running work:** two 75-second tasks kept computing
+  through a **coordinator restart**, the new session's `hello` declared
+  `tasks_in_flight: 2` so the coordinator opened at zero free credits, a
+  task enqueued meanwhile correctly stayed `QUEUED`, and both credits were
+  released on the *new* session the moment the work finished — after which
+  the queued task was assigned within 100 ms.
+
+**This last test is what found Decision #108's bug**, and it is worth
+recording as the thing that justified running it: the first implementation
+captured the session's socket when execution began, so the two completions
+reported down a socket the coordinator had already thrown away. The sends
+failed silently, the credits were never released, and the worker sat
+permanently "full" with nothing running while the queue waited behind it.
+Unit tests did not catch it and neither did review.
+
+**Test suite: 202 passed** (was 136 at Step 2.3), `ruff` clean.
 
 ---
 

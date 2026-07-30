@@ -88,6 +88,10 @@ services:
       # stays queued rather than being dropped.
       WORKER_MAX_CONCURRENT: ${WORKER_MAX_CONCURRENT:-4}
       WORKER_SUPPORTED_TASK_TYPES: ${WORKER_SUPPORTED_TASK_TYPES:-count_to_n,hash_rounds,sleep,opaque_payload}
+      # Phase 2.4 progress cadence (recommendation, not measured). Lowered
+      # from the 10s default for local dev only, so a short demo task
+      # actually reports progress before it finishes.
+      WORKER_PROGRESS_INTERVAL_SECONDS: ${WORKER_PROGRESS_INTERVAL_SECONDS:-5}
     volumes:
       - ./certs:/certs:ro
       - worker-identity-data:/var/lib/worker-identity
