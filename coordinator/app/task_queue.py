@@ -37,7 +37,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import bindparam, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Task
@@ -162,12 +162,12 @@ async def enqueue_batch(
 #
 # `updated_at` is set explicitly because the model's `onupdate=func.now()`
 # is a SQLAlchemy ORM-level hook and does not fire for raw SQL.
-_DEQUEUE_SQL = text(
-    """
+def _dequeue_sql(type_filter: str) -> str:
+    return f"""
     WITH claimed AS (
         SELECT id
         FROM tasks
-        WHERE status = 'QUEUED'
+        WHERE status = 'QUEUED'{type_filter}
         ORDER BY priority, created_at
         LIMIT :limit
         FOR UPDATE SKIP LOCKED
@@ -182,6 +182,21 @@ _DEQUEUE_SQL = text(
     RETURNING t.id, t.task_type, t.parameters, t.payload, t.priority,
               t.correlation_id, t.assigned_at
     """
+
+
+_DEQUEUE_SQL = text(_dequeue_sql(""))
+
+# Phase 2.3 eligibility filter: claim only types this worker said it can
+# run. A separate statement rather than a `(:all OR ...)` predicate in the
+# one above, so the unfiltered path Step 2.2 measured keeps exactly the
+# plan it was measured with.
+#
+# `expanding=True` renders a real `IN (:t1, :t2, ...)` list at execution
+# time. That is deliberate over `= ANY(:types)`: passing a Python list as
+# a single array parameter through `text()` leaves the parameter's type
+# ambiguous to asyncpg, and expanding sidesteps the question entirely.
+_DEQUEUE_SQL_TYPED = text(_dequeue_sql(" AND task_type IN :task_types")).bindparams(
+    bindparam("task_types", expanding=True)
 )
 
 
@@ -191,28 +206,53 @@ async def dequeue(
     worker_id: uuid.UUID | str,
     limit: int = DEFAULT_DEQUEUE_LIMIT,
     max_batch: int,
+    task_types: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Claim up to `limit` queued tasks for `worker_id`. Does not commit.
 
     Returns the claimed rows, newest claim state included. An empty list
-    means the queue held nothing claimable — either genuinely empty, or
-    every candidate row was locked by a concurrent dequeuer. The caller
-    cannot distinguish those two, and does not need to: both mean "no
-    work for you right now".
+    means the queue held nothing claimable — either genuinely empty, every
+    candidate row was locked by a concurrent dequeuer, or (with
+    `task_types` set) nothing queued matches. The caller cannot
+    distinguish those, and does not need to: all mean "no work for you
+    right now".
+
+    `task_types` is the Phase 2.3 eligibility filter — claim only types
+    the worker declared it can run. `None` means no filter, which is the
+    Step 2.2 primitive's behaviour and what `POST /tasks/dequeue` still
+    does. An **empty list is not the same as `None`**: it means "eligible
+    for nothing" and is rejected rather than silently widened to
+    everything, because a worker that declared only unrecognised types
+    must not quietly become eligible for all of them.
 
     This is a queue primitive, not an assignment decision. The caller
     names the worker. *Choosing* which worker should get work — capability
-    filtering, credit accounting, the push over the Redis channel — is the
+    filtering, credit accounting, the push over the socket — is the
     assignment engine in Step 2.3, which calls this.
+
+    **Cost note, honest (§10):** the filter is applied inside the index
+    scan's ordered walk, not by a dedicated index. `ix_tasks_queue` is
+    `(status, priority, created_at)`, so a worker eligible for a rare type
+    behind a long run of ineligible ones pays for the rows it steps over.
+    Measured in Step 2.3 rather than assumed; see the PHASE_STATE row. A
+    `(status, task_type, priority, created_at)` index is the fix if a real
+    workload needs it, and is deliberately not added on speculation.
     """
     if limit < 1:
         raise QueueLimitExceeded("limit must be at least 1")
     if limit > max_batch:
         raise QueueLimitExceeded(f"limit {limit} exceeds the {max_batch}-task dequeue cap")
 
-    result = await session.execute(
-        _DEQUEUE_SQL, {"limit": limit, "worker_id": str(worker_id)}
-    )
+    params: dict[str, Any] = {"limit": limit, "worker_id": str(worker_id)}
+    if task_types is None:
+        statement = _DEQUEUE_SQL
+    else:
+        if not task_types:
+            raise QueueLimitExceeded("task_types is empty: the worker is eligible for nothing")
+        statement = _DEQUEUE_SQL_TYPED
+        params["task_types"] = list(task_types)
+
+    result = await session.execute(statement, params)
     return [dict(row) for row in result.mappings().all()]
 
 

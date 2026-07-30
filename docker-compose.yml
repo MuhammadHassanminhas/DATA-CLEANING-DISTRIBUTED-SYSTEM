@@ -39,6 +39,12 @@ services:
       # Operator credential (Step 2.2.1) — a different value from
       # ENROLLMENT_SECRET, and never given to the worker service below.
       ADMIN_SECRET: ${ADMIN_SECRET}
+      # Defaults match the coordinator's own (see app/config.py); exposed
+      # here so a Phase 2.3 scale run can register a large fleet without
+      # tripping the per-client registration limit, and can shorten the
+      # assignment safety-net poll. Neither is changed for normal dev.
+      REGISTER_RATE_LIMIT_PER_MINUTE: ${REGISTER_RATE_LIMIT_PER_MINUTE:-5}
+      ASSIGNMENT_POLL_INTERVAL_SECONDS: ${ASSIGNMENT_POLL_INTERVAL_SECONDS:-30}
     ports:
       - "${COORDINATOR_PORT}:8443"
     volumes:
@@ -76,6 +82,12 @@ services:
       WORKER_LOOP_INTERVAL_SECONDS: 5
       COORDINATOR_URL: https://coordinator:8443
       ENROLLMENT_SECRET: ${ENROLLMENT_SECRET}
+      # Phase 2.3 capabilities, declared in `hello`. Overridable so a scale
+      # run can set the credit count, and so a worker can be started
+      # deliberately ineligible for a type to demonstrate that such a task
+      # stays queued rather than being dropped.
+      WORKER_MAX_CONCURRENT: ${WORKER_MAX_CONCURRENT:-4}
+      WORKER_SUPPORTED_TASK_TYPES: ${WORKER_SUPPORTED_TASK_TYPES:-count_to_n,hash_rounds,sleep,opaque_payload}
     volumes:
       - ./certs:/certs:ro
       - worker-identity-data:/var/lib/worker-identity

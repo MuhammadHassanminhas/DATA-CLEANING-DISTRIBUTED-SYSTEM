@@ -27,6 +27,18 @@ from alembic.config import Config
 from fastapi import FastAPI, Header, Request, Response, WebSocket, WebSocketDisconnect
 from sqlalchemy import select, text
 
+from app.assignment import (
+    LocalSession,
+    assignment_loop,
+    handle_capacity,
+    handle_task_ack,
+    log_unacknowledged,
+    notification_listener,
+    notify_work_available,
+    parse_capabilities,
+    register_session,
+    unregister_session,
+)
 from app.config import (
     access_token_ttl_seconds,
     admin_secret_is_separate,
@@ -144,6 +156,13 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     else:
         logger.info("startup migrations skipped (RUN_MIGRATIONS_ON_STARTUP=false)")
     sweep_task = asyncio.create_task(_heartbeat_sweep_loop())
+    # Step 2.3. One assignment engine per replica, assigning only to the
+    # sockets this replica holds, plus the subscriber that wakes it when
+    # any replica enqueues. Both are pure background workers: they hold no
+    # authoritative state and a replica without them still serves every
+    # request, it just stops handing out work (§3.9).
+    assignment_task = asyncio.create_task(assignment_loop())
+    notification_task = asyncio.create_task(notification_listener())
     yield
     # No app-level connection drain here: uvicorn's own `Server.shutdown()`
     # calls `connection.shutdown()` on every live WebSocket (a proper
@@ -152,11 +171,12 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     # verified live (Decisions Log #21). By this point every `ws_connect`
     # handler has already run its own `finally` cleanup below, so there is
     # nothing left here to drain.
-    sweep_task.cancel()
-    try:
-        await sweep_task
-    except asyncio.CancelledError:
-        pass
+    for background in (sweep_task, assignment_task, notification_task):
+        background.cancel()
+        try:
+            await background
+        except asyncio.CancelledError:
+            pass
     await engine.dispose()
     await redis_client.aclose()
     logger.info("coordinator stopped")
@@ -479,6 +499,11 @@ async def list_workers(response: Response, x_admin_secret: str = Header(default=
             "created_at": worker.created_at.isoformat(),
             "connected": registry is not None,
             "session_epoch": registry.get("session_epoch") if registry else None,
+            # Step 2.3 declared capabilities. Read from the Redis registry
+            # rather than from any process's memory, so every replica
+            # answers identically (§3.9). None when not connected.
+            "max_concurrent": registry.get("max_concurrent") if registry else None,
+            "supported_task_types": registry.get("supported_task_types") if registry else None,
         }
         for field in _WORKER_METRICS_FIELDS:
             item[field] = metrics.get(field)
@@ -788,6 +813,12 @@ async def ws_connect(websocket: WebSocket) -> None:
     if session_correlation_id:
         correlation_id_var.set(session_correlation_id)
 
+    # Step 2.3 capabilities, declared in `hello` and sanitised before use —
+    # both fields are worker-reported and therefore untrusted (§12). See
+    # `assignment.parse_capabilities` for exactly what is clamped and why.
+    hello_payload = hello.get("payload") or {}
+    max_concurrent, supported_task_types = parse_capabilities(hello_payload)
+
     worker_id = str(worker_uuid)
     session_epoch = await redis_client.incr(f"worker:{worker_id}:session_epoch")
     # Announce the new epoch before this session becomes authoritative —
@@ -803,6 +834,11 @@ async def ws_connect(websocket: WebSocket) -> None:
                 "session_epoch": session_epoch,
                 "coordinator_instance": COORDINATOR_INSTANCE_ID,
                 "connected_at": datetime.now(timezone.utc).isoformat(),
+                # Step 2.3: published here so the declared capabilities are
+                # readable by any replica and by the dashboard, not only by
+                # the one process holding the socket.
+                "max_concurrent": max_concurrent,
+                "supported_task_types": list(supported_task_types),
             }
         ),
         ex=ws_registry_ttl_seconds(),
@@ -832,6 +868,20 @@ async def ws_connect(websocket: WebSocket) -> None:
     ping_task = asyncio.create_task(_ping_loop(worker_id, websocket, send_lock, ping_state))
     push_task = asyncio.create_task(_push_listener(worker_id, websocket, send_lock))
     control_task = asyncio.create_task(_control_listener(worker_id, session_epoch, websocket, send_lock))
+
+    # Step 2.3: hand this socket to the assignment engine. Registered only
+    # after the session is fully established and ONLINE, so a task is never
+    # delivered down a half-open handshake. Sharing `send_lock` is what
+    # keeps a task frame from interleaving with a ping or an eviction.
+    local_session = LocalSession(
+        worker_id=worker_id,
+        session_epoch=session_epoch,
+        websocket=websocket,
+        send_lock=send_lock,
+        max_concurrent=max_concurrent,
+        supported_task_types=supported_task_types,
+    )
+    register_session(local_session)
 
     try:
         while True:
@@ -869,6 +919,17 @@ async def ws_connect(websocket: WebSocket) -> None:
                 )
                 continue
 
+            # Step 2.3 assignment protocol. New `message_type` values only —
+            # the envelope is untouched and PROTOCOL_VERSION stays "1.0",
+            # which is the extension route Decision #6 specified.
+            if message_type == "task_ack":
+                await handle_task_ack(local_session, message)
+                continue
+
+            if message_type == "capacity":
+                await handle_capacity(local_session, message)
+                continue
+
             logger.info("worker_message_received", extra={"worker_id": worker_id, "message_type": message_type})
     except WebSocketDisconnect:
         logger.info("worker_disconnected", extra={"worker_id": worker_id})
@@ -876,6 +937,10 @@ async def ws_connect(websocket: WebSocket) -> None:
         ping_task.cancel()
         push_task.cancel()
         control_task.cancel()
+        # Step 2.3 exit criterion: name every task this session was handed
+        # but never acknowledged. Detection only — Phase 3 owns recovery.
+        log_unacknowledged(local_session, reason="worker_disconnected")
+        unregister_session(worker_id, session_epoch)
         current = await redis_client.get(registry_key)
         if current is not None and json.loads(current)["session_epoch"] == session_epoch:
             await redis_client.delete(registry_key)
@@ -963,6 +1028,10 @@ async def enqueue_tasks(body: EnqueueTaskRequest, response: Response) -> dict[st
         "tasks_enqueued",
         extra=_admin_log(task_type=body.task_type, count=len(task_ids), priority=body.priority),
     )
+    # Step 2.3: wake every replica's assignment engine. Published *after*
+    # the commit, so a woken replica cannot look before the rows are
+    # visible. Best-effort by design — see `assignment.notify_work_available`.
+    await notify_work_available()
     # Ids are returned only for a single-task create. Echoing 10,000 UUIDs
     # back would make the response bigger than the request that caused it,
     # for no caller that needs them — a bulk enqueue is a load operation.
