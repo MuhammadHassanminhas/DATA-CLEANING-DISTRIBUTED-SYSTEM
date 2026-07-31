@@ -815,6 +815,28 @@ recording: the exit criterion passed on the pre-fix build. A criterion can
 be met by something that is quietly wasteful or quietly slow, and only a
 live run shows the difference.
 
+### The §6 dashboard gap — deferred to Step 2.7 by the user
+
+**Step 2.5 adds nothing to the dashboard, and that is a known gap rather
+than an oversight.** The dashboard shows worker-status tiles and the
+current-task column Step 2.4 added; it shows no queue depth, no running
+count and no completed count. Step 2.5's entire visible behaviour is tasks
+reaching `COMPLETED`, so **that behaviour is not watchable in a browser** —
+it was verified through the admin API and the database instead.
+
+This sits against §6 ("a first-class deliverable in every phase... after
+each phase the user must be able to open a browser and watch that phase's
+behaviour happen live") and §7. Step 2.4 met the same point by adding the
+minimum surface for its own phase and leaving the rest to 2.7.
+
+**The user was offered the minimum tile row and chose to defer the whole
+thing to Step 2.7 (2026-07-31).** Recorded as a **user scope call on §6 and
+§7, not as a satisfied criterion** (§10) — the same family as Decisions
+#34–35, #77, and the 2.2/2.2.1/2.3 approvals. Step 2.7 already owns queue
+depth updating live and completed tasks with duration, so nothing new is
+added to that step; what changes is that 2.5's own demo is an API-and-
+database demo.
+
 ### Verification — measured locally, in Docker
 
 Against a real coordinator, worker, Postgres and Redis over TLS.

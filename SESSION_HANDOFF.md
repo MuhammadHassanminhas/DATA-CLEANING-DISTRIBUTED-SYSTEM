@@ -20,6 +20,22 @@ computed results and threw them away by design (#98/#105), so every
 successful task stopped at `RUNNING`. A success now submits a result
 envelope, the coordinator validates and persists it, and the task terminates.
 
+### The §6 dashboard gap — deferred to 2.7 by your decision (#118)
+
+**Step 2.5 adds nothing to the dashboard.** It shows worker-status tiles and
+2.4's current-task column — no queue depth, no running count, no completed
+count. So **the one thing 2.5 does, tasks reaching `COMPLETED`, cannot be
+seen in a browser**; it was verified through the admin API and the database.
+
+The minimum tile row was offered and you chose to defer the whole thing to
+Step 2.7 on 2026-07-31. Recorded as a **user scope call on §6 and §7, not as
+a satisfied criterion** (§10). Nothing is added to 2.7's scope by this — it
+already owns live queue depth and completed tasks with duration.
+
+**What this means for the demo:** when you come to run Step 2.5's demo, it
+is an API-and-database demo. Do not expect to watch a task complete on the
+dashboard until 2.7.
+
 ### What is NOT done — read before claiming anything
 
 - **No commit, no PR, no CI run.** Everything is on the local branch
