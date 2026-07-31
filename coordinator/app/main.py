@@ -21,10 +21,11 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from alembic import command
 from alembic.config import Config
-from fastapi import FastAPI, Header, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, Query, Request, Response, WebSocket, WebSocketDisconnect
 from sqlalchemy import select, text
 
 from app.assignment import (
@@ -55,8 +56,10 @@ from app.config import (
     result_retention_days,
     result_retention_sweep_interval_seconds,
     run_migrations_on_startup,
+    task_api_rate_limit_per_minute,
     task_dequeue_max_batch,
     task_enqueue_max_batch,
+    task_list_max_limit,
     worker_claim_ttl_seconds,
     ws_ping_interval_seconds,
     ws_pong_timeout_seconds,
@@ -64,7 +67,13 @@ from app.config import (
 )
 from app.db import engine, get_session
 from app.logging_config import configure_logging
-from app.metrics import RESULTS_PURGED, MetricsMiddleware, metrics_endpoint
+from app.metrics import (
+    RESULTS_PURGED,
+    TASK_API_RATE_LIMITED,
+    TASKS_CANCELLED,
+    MetricsMiddleware,
+    metrics_endpoint,
+)
 from app.middleware import (
     CorrelationIDMiddleware,
     _caller_ip,
@@ -91,14 +100,21 @@ from app.security import (
     verify_enrollment_secret,
 )
 from app.task_queue import (
+    DEFAULT_LIST_LIMIT,
+    NOT_CANCELLABLE,
+    NOT_FOUND,
+    TRANSITIONED,
     QueueLimitExceeded,
+    cancel_queued_task,
     counts_by_status,
     dequeue,
     enqueue_batch,
     get_task,
+    list_tasks,
     purge_expired_results,
     queue_depth,
 )
+from app.task_states import UnknownTaskState
 from app.task_types import InvalidTaskParameters, UnknownTaskType
 from protocol import PROTOCOL_VERSION, Envelope
 
@@ -393,14 +409,59 @@ async def _heartbeat_sweep_loop() -> None:
         await asyncio.sleep(interval)
 
 
-async def _rate_limited(source_ip: str) -> bool:
-    """Fixed-window counter per source IP. See `register_rate_limit_per_minute`
-    docstring — the limit itself is a recommendation, not a measured value."""
-    key = f"register:ratelimit:{source_ip}"
+async def _fixed_window_limited(scope: str, source_ip: str, limit: int) -> bool:
+    """Fixed-window counter per source IP, per named scope.
+
+    One counter family, two callers: worker registration (Phase 1.3) and the
+    operator task API (Phase 2.6). The scopes are separate keys on purpose —
+    a registration flood must not consume an operator's budget, and vice
+    versa, because they are different callers defending against different
+    things.
+
+    Both limits are recommendations, not measured values; see
+    `config.register_rate_limit_per_minute` and
+    `config.task_api_rate_limit_per_minute`.
+    """
+    key = f"{scope}:ratelimit:{source_ip}"
     count = await redis_client.incr(key)
     if count == 1:
         await redis_client.expire(key, RATE_LIMIT_WINDOW_SECONDS)
-    return count > register_rate_limit_per_minute()
+    return count > limit
+
+
+async def _rate_limited(source_ip: str) -> bool:
+    return await _fixed_window_limited("register", source_ip, register_rate_limit_per_minute())
+
+
+async def _operator_guard(
+    request: Request, response: Response, *, secret: str, event: str
+) -> dict[str, object] | None:
+    """Rate-limit then authenticate an operator task API call (Phase 2.6).
+
+    Returns the error body to send, or None to proceed.
+
+    **Order matters and is deliberate: limit first, authenticate second.**
+    An unauthenticated flood is exactly what the limiter is for, so it must
+    not be reachable only by callers who already hold the credential. It is
+    the same order `register_worker` uses, for the same reason.
+
+    The rejection log keeps each endpoint's own event name (`enqueue_...`,
+    `task_list_...`) rather than one shared string: the Step 1.5.6 auth-spike
+    alert is built on `*_rejected` events, and collapsing them would tell an
+    operator that *something* was refused without saying what.
+    """
+    if await _fixed_window_limited(
+        "taskapi", _caller_ip(request), task_api_rate_limit_per_minute()
+    ):
+        response.status_code = 429
+        TASK_API_RATE_LIMITED.inc()
+        logger.warning("task_api_rate_limited", extra=_admin_log(endpoint=event))
+        return {"detail": "rate limited"}
+    if not verify_admin_secret(secret):
+        response.status_code = 401
+        logger.warning(f"{event}_rejected_invalid_admin_secret", extra=_admin_log())
+        return {"detail": "invalid admin credential"}
+    return None
 
 
 @app.post("/workers/register", status_code=201)
@@ -1074,32 +1135,55 @@ async def push_to_worker(worker_id: str, body: PushRequest, response: Response) 
 
 
 # --------------------------------------------------------------------------
-# Task queue (Phase 2.2)
+# Operator task API (Phase 2.2, completed in Phase 2.6)
 #
-# Deliberately minimal: enqueue, depth, and the dequeue primitive. That is
-# what Step 2.2's own exit criteria need to be demonstrable, and no more.
-# The full operator surface — list, inspect, cancel, filter — is Step 2.6,
-# and the logic that *decides* which worker gets a task is Step 2.3.
+# Step 2.2 built the minimum its own criteria needed — enqueue, depth, and
+# the dequeue primitive. Step 2.6 completes the surface so that **no
+# operator ever needs to touch the database directly**: listing with
+# filters, inspection with the full lifecycle, and cancellation.
 #
-# Guarded by the operator credential, same as /workers and revoke. Since
-# Step 2.2.1 that is `ADMIN_SECRET` rather than the shared enrollment
-# secret — these endpoints are exactly why that split had to happen, since
-# otherwise any worker could drain the queue (see `config.admin_secret`).
+# Every endpoint here is guarded by `_operator_guard` — per-source-IP rate
+# limit, then the operator credential. Since Step 2.2.1 that credential is
+# `ADMIN_SECRET` rather than the shared enrollment secret; these endpoints
+# are exactly why that split had to happen, since otherwise any worker
+# could drain the queue (see `config.admin_secret`).
+#
+# One endpoint is deliberately outside the guard: `POST /tasks/dequeue`.
+# See `config.task_api_rate_limit_per_minute` for why.
+#
+# **Credential placement.** The read endpoints take `X-Admin-Secret`; the
+# two POSTs that predate this step also accept `admin_secret` in the body
+# and keep doing so, because scripts, harnesses and the CD smoke test send
+# it that way. The header is the documented path for new callers — a body
+# field can end up echoed in a validation error, which is precisely how a
+# live secret leaked in session 13 (see `_validation_error_without_echo`).
 # --------------------------------------------------------------------------
 
 
 @app.post("/tasks", status_code=201)
-async def enqueue_tasks(body: EnqueueTaskRequest, response: Response) -> dict[str, object]:
+async def enqueue_tasks(
+    request: Request,
+    body: EnqueueTaskRequest,
+    response: Response,
+    x_admin_secret: str = Header(default=""),
+) -> dict[str, object]:
     """Create one or more queued tasks.
 
     Every task carries the request's correlation ID from creation (§11 and
     a Phase 2.1 exit criterion), so a task is traceable back to the call
     that made it, and a bulk enqueue shares one ID across the batch.
+
+    A bulk create returns the correlation ID and **not** 10,000 task ids —
+    the response would be larger than the request that caused it. Since
+    Step 2.6 that is a complete answer rather than a dead end:
+    `GET /tasks?correlation_id=...` lists exactly what the batch created,
+    which is why migration 0004 indexes that column.
     """
-    if not verify_admin_secret(body.admin_secret):
-        response.status_code = 401
-        logger.warning("enqueue_rejected_invalid_admin_secret", extra=_admin_log())
-        return {"detail": "invalid admin credential"}
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret or body.admin_secret, event="enqueue"
+    )
+    if rejection is not None:
+        return rejection
 
     correlation_id = correlation_id_var.get()
 
@@ -1143,8 +1227,125 @@ async def enqueue_tasks(body: EnqueueTaskRequest, response: Response) -> dict[st
     }
 
 
+def _task_summary(row: dict[str, Any]) -> dict[str, object]:
+    """One task as a listing row (Phase 2.6).
+
+    Metadata only. `has_result` replaces the result body — see
+    `task_queue.list_tasks` for why a listing never joins `task_results`.
+    """
+    assigned_at = row["assigned_at"]
+    completed_at = row["completed_at"]
+    return {
+        "task_id": str(row["id"]),
+        "task_type": row["task_type"],
+        "status": row["status"],
+        "priority": row["priority"],
+        "assigned_worker_id": (
+            str(row["assigned_worker_id"]) if row["assigned_worker_id"] else None
+        ),
+        "created_at": row["created_at"].isoformat(),
+        "assigned_at": assigned_at.isoformat() if assigned_at else None,
+        "started_at": row["started_at"].isoformat() if row["started_at"] else None,
+        "completed_at": completed_at.isoformat() if completed_at else None,
+        "updated_at": row["updated_at"].isoformat(),
+        "attempt_count": row["attempt_count"],
+        "correlation_id": row["correlation_id"],
+        "observed_duration_seconds": _observed_duration(assigned_at, completed_at),
+        "has_result": row["result_id"] is not None,
+    }
+
+
+def _observed_duration(assigned_at: datetime | None, completed_at: datetime | None) -> float | None:
+    """Coordinator-observed wall time from assignment to completion.
+
+    The measurement that cannot be lied about, as distinct from the
+    worker-reported `duration_seconds` inside the result envelope — see
+    `inspect_task` for why both are reported and never blurred (§10).
+    """
+    if assigned_at is None or completed_at is None:
+        return None
+    return round((completed_at - assigned_at).total_seconds(), 3)
+
+
+@app.get("/tasks")
+async def list_tasks_endpoint(
+    request: Request,
+    response: Response,
+    status: list[str] | None = Query(default=None),
+    task_type: str | None = None,
+    worker_id: str | None = None,
+    correlation_id: str | None = None,
+    limit: int = Query(default=DEFAULT_LIST_LIMIT, ge=1),
+    offset: int = Query(default=0, ge=0),
+    x_admin_secret: str = Header(default=""),
+) -> dict[str, object]:
+    """List tasks, newest first, with filters (Phase 2.6).
+
+    Filters combine with AND: `status` (repeatable — `?status=QUEUED&
+    status=RUNNING`), `task_type`, `worker_id`, `correlation_id`. An
+    unrecognised status or task type is a **400, not an empty list**: an
+    operator who typos `RUNING` must be told, not shown "no tasks" and left
+    to conclude the fleet is idle.
+
+    Paging is `limit`/`offset`, capped by `TASK_LIST_MAX_LIMIT`, with
+    `has_more` instead of a total — the reasoning, and the cost that drove
+    it, is in `task_queue.list_tasks`.
+
+    The filters that were actually applied are echoed back. That is not
+    decoration: with paging and a shared credential it is the one thing that
+    makes a pasted response self-describing when it turns up later in an
+    incident channel.
+    """
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="task_list"
+    )
+    if rejection is not None:
+        return rejection
+
+    parsed_worker: uuid.UUID | None = None
+    if worker_id is not None:
+        try:
+            parsed_worker = uuid.UUID(worker_id)
+        except ValueError:
+            response.status_code = 400
+            return {"detail": "worker_id is not a valid UUID"}
+
+    try:
+        async with get_session() as session:
+            rows, has_more = await list_tasks(
+                session,
+                statuses=status,
+                task_type=task_type,
+                worker_id=parsed_worker,
+                correlation_id=correlation_id,
+                limit=limit,
+                offset=offset,
+                max_limit=task_list_max_limit(),
+            )
+    except (UnknownTaskState, UnknownTaskType, QueueLimitExceeded) as exc:
+        response.status_code = 400
+        logger.warning("task_list_rejected_invalid_filter", extra=_admin_log(detail=str(exc)))
+        return {"detail": str(exc)}
+
+    return {
+        "tasks": [_task_summary(row) for row in rows],
+        "count": len(rows),
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+        "filters": {
+            "status": status,
+            "task_type": task_type,
+            "worker_id": worker_id,
+            "correlation_id": correlation_id,
+        },
+    }
+
+
 @app.get("/tasks/depth")
-async def task_queue_depth(response: Response, x_admin_secret: str = Header(default="")) -> dict[str, object]:
+async def task_queue_depth(
+    request: Request, response: Response, x_admin_secret: str = Header(default="")
+) -> dict[str, object]:
     """Queue depth — the cheap read (Step 2.2 exit criterion) that backs
     the dashboard's queue-size figure (§6).
 
@@ -1153,10 +1354,11 @@ async def task_queue_depth(response: Response, x_admin_secret: str = Header(defa
     Both are recomputed from Postgres per call — nothing is cached here,
     so every replica answers identically (§3.9).
     """
-    if not verify_admin_secret(x_admin_secret):
-        response.status_code = 401
-        logger.warning("task_depth_rejected_invalid_admin_secret", extra=_admin_log())
-        return {"detail": "invalid admin credential"}
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="task_depth"
+    )
+    if rejection is not None:
+        return rejection
 
     async with get_session() as session:
         depth = await queue_depth(session)
@@ -1233,23 +1435,75 @@ async def dequeue_tasks(body: DequeueTaskRequest, response: Response) -> dict[st
     }
 
 
+def _lifecycle(task: dict[str, Any]) -> list[dict[str, object]]:
+    """The task's state history, oldest first (Phase 2.6).
+
+    Built from the row's own timestamp columns, and every entry names the
+    column it came from. That `source` field is the honest part: the
+    lifecycle is **reconstructed**, not replayed from an event log, and the
+    reconstruction is exact for some states and inferred for others.
+
+    * `QUEUED`, `ASSIGNED`, `RUNNING`, `COMPLETED` each have a dedicated
+      column, so those entries are what the coordinator actually recorded.
+    * `FAILED` and `CANCELLED` have none. They use `updated_at`, which is
+      correct because a terminal state is the last write the row ever
+      receives — nothing in M2 updates a task afterwards, and the retention
+      sweep touches `task_results`, not `tasks`. Stated rather than assumed,
+      because it stops being true the moment something updates a terminal
+      task.
+    * A task that predates migration 0004 has no `started_at`, so its
+      RUNNING entry is **absent rather than fabricated** (§10).
+
+    A per-transition event table would remove the inference, and was
+    rejected for M2: it adds a write to the assignment hot path to serve a
+    read that four columns already answer. Phase 3, which introduces retries
+    and therefore *repeated* transitions per task, is where a single column
+    per state stops being enough.
+    """
+    timeline: list[dict[str, object]] = [
+        {"state": "QUEUED", "at": task["created_at"].isoformat(), "source": "created_at"}
+    ]
+    if task["assigned_at"] is not None:
+        timeline.append(
+            {"state": "ASSIGNED", "at": task["assigned_at"].isoformat(), "source": "assigned_at"}
+        )
+    if task["started_at"] is not None:
+        timeline.append(
+            {"state": "RUNNING", "at": task["started_at"].isoformat(), "source": "started_at"}
+        )
+    if task["status"] == "COMPLETED" and task["completed_at"] is not None:
+        timeline.append(
+            {"state": "COMPLETED", "at": task["completed_at"].isoformat(), "source": "completed_at"}
+        )
+    elif task["status"] in ("FAILED", "CANCELLED"):
+        timeline.append(
+            {
+                "state": task["status"],
+                "at": task["updated_at"].isoformat(),
+                "source": "updated_at (no dedicated column; terminal states are the last write)",
+            }
+        )
+    return timeline
+
+
 @app.get("/tasks/{task_id}")
 async def inspect_task(
-    task_id: str, response: Response, x_admin_secret: str = Header(default="")
+    request: Request,
+    task_id: str,
+    response: Response,
+    x_admin_secret: str = Header(default=""),
 ) -> dict[str, object]:
-    """One task with its persisted result envelope (Phase 2.5).
+    """One task: full lifecycle, timestamps, and its persisted result.
 
-    Declared **after** `/tasks/depth` on purpose: FastAPI matches routes in
-    declaration order, so a path parameter registered first would swallow
-    the literal path.
+    Declared **after** `/tasks/depth` and `/tasks` on purpose: FastAPI
+    matches routes in declaration order, so a path parameter registered
+    first would swallow the literal paths.
 
-    This is the minimum read that makes Step 2.5's "execution duration
-    recorded and visible" criterion verifiable rather than asserted — the
-    duration is inside the stored envelope, so without a read path there is
-    nowhere to see it but the database. It is a **primitive**, in the same
-    sense `POST /tasks/dequeue` was kept as one in Step 2.2: Step 2.6 owns
-    the operator task API — filters, batch listing, full lifecycle history,
-    cancellation — and builds on this rather than around it.
+    Built in Step 2.5 as the minimum read that made "execution duration
+    recorded and visible" verifiable rather than asserted; Step 2.6 adds the
+    `timeline` and `started_at` that make it the operator's inspection
+    endpoint — "returns the full lifecycle with timestamps" is this step's
+    own exit criterion.
 
     Two durations come back and they are not the same measurement, which is
     why both are reported rather than one being presented as "the" duration
@@ -1262,10 +1516,11 @@ async def inspect_task(
       the worker's admission path and the result round trip, so it is always
       the larger of the two, and it is the one that cannot be lied about.
     """
-    if not verify_admin_secret(x_admin_secret):
-        response.status_code = 401
-        logger.warning("task_inspect_rejected_invalid_admin_secret", extra=_admin_log())
-        return {"detail": "invalid admin credential"}
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="task_inspect"
+    )
+    if rejection is not None:
+        return rejection
 
     async with get_session() as session:
         task = await get_task(session, task_id)
@@ -1274,27 +1529,9 @@ async def inspect_task(
         response.status_code = 404
         return {"detail": "task not found"}
 
-    assigned_at = task["assigned_at"]
-    completed_at = task["completed_at"]
-    observed = (
-        round((completed_at - assigned_at).total_seconds(), 3)
-        if assigned_at is not None and completed_at is not None
-        else None
-    )
-
     return {
-        "task_id": str(task["id"]),
-        "task_type": task["task_type"],
-        "status": task["status"],
-        "priority": task["priority"],
-        "assigned_worker_id": str(task["assigned_worker_id"]) if task["assigned_worker_id"] else None,
-        "assigned_at": assigned_at.isoformat() if assigned_at else None,
-        "completed_at": completed_at.isoformat() if completed_at else None,
-        "created_at": task["created_at"].isoformat(),
-        "updated_at": task["updated_at"].isoformat(),
-        "attempt_count": task["attempt_count"],
-        "correlation_id": task["correlation_id"],
-        "observed_duration_seconds": observed,
+        **_task_summary(task),
+        "timeline": _lifecycle(task),
         # None once the retention sweep has removed the body. The task row
         # survives as the audit trail — that is the documented behaviour of
         # `RESULT_RETENTION_DAYS`, not a lost result.
@@ -1304,3 +1541,65 @@ async def inspect_task(
             task["result_submitted_at"].isoformat() if task["result_submitted_at"] else None
         ),
     }
+
+
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(
+    request: Request,
+    task_id: str,
+    response: Response,
+    x_admin_secret: str = Header(default=""),
+) -> dict[str, object]:
+    """Cancel a task that is still queued (Phase 2.6).
+
+    **Only a `QUEUED` task can be cancelled in M2**, and the refusal for
+    anything else is deliberate rather than a gap left open — see
+    `task_queue.cancel_queued_task` for what cancelling in-flight work would
+    actually require. An in-flight or already-terminal task comes back
+    **409 with its current status**, so the operator learns why rather than
+    guessing.
+
+    A second cancel of the same task is also 409 (`CANCELLED`), not a
+    silent 200. That is a considered choice against the idempotent reading:
+    §3.7's idempotency requirement is about a *worker* retrying a result it
+    cannot know landed, whereas an operator repeating a cancel is asking a
+    question — "did this call cancel it?" — and the honest answer to the
+    second one is no. The state is identical either way; only the report
+    differs.
+
+    Takes no body. The credential is the `X-Admin-Secret` header, which is
+    also why there is nothing here for a validation error to echo.
+    """
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="task_cancel"
+    )
+    if rejection is not None:
+        return rejection
+
+    async with get_session() as session:
+        outcome, current = await cancel_queued_task(session, task_id=task_id)
+        # Commit only when something was written. A refused cancel must not
+        # leave a transaction to be rolled back at an arbitrary later point.
+        if outcome == TRANSITIONED:
+            await session.commit()
+
+    TASKS_CANCELLED.labels(outcome).inc()
+
+    if outcome == NOT_FOUND:
+        response.status_code = 404
+        return {"detail": "task not found"}
+
+    if outcome == NOT_CANCELLABLE:
+        response.status_code = 409
+        logger.info("task_cancel_refused", extra=_admin_log(task_id=task_id, status=current))
+        return {
+            "task_id": task_id,
+            "status": current,
+            "detail": (
+                f"task is {current}: only a QUEUED task can be cancelled "
+                "(cancelling in-flight work is not in M2 scope)"
+            ),
+        }
+
+    logger.info("task_cancelled", extra=_admin_log(task_id=task_id, previous_status=current))
+    return {"task_id": task_id, "status": "CANCELLED", "previous_status": current}

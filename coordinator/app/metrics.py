@@ -147,6 +147,25 @@ RESULTS_PURGED = Counter(
     "Result bodies deleted by the retention sweep.",
 )
 
+# Phase 2.6 operator API. `outcome` carries the whole decision so a refusal
+# is visible without reading logs — "cancelled" means a queued task left the
+# queue, "not_cancellable" means an operator tried to cancel work already in
+# flight, which is the case the M2 scope limit produces (see
+# `task_queue.cancel_queued_task`).
+TASKS_CANCELLED = Counter(
+    "coordinator_task_cancellations_total",
+    "Task cancellation requests, by outcome.",
+    ["outcome"],
+)
+# Rejections by the coordinator's own limiter, not the ingress's. Counted
+# rather than derived from logs because this is the one control that can
+# make a *correct* operator call fail, so it has to be trivially visible
+# when it starts firing.
+TASK_API_RATE_LIMITED = Counter(
+    "coordinator_task_api_rate_limited_total",
+    "Operator task API requests rejected by the per-source-IP rate limit.",
+)
+
 # Per-instance request latency. Route template keeps label cardinality bounded.
 REQUEST_LATENCY = Histogram(
     "coordinator_request_duration_seconds",
