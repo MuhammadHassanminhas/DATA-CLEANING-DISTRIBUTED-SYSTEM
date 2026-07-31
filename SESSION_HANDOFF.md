@@ -36,16 +36,48 @@ already owns live queue depth and completed tasks with duration.
 is an API-and-database demo. Do not expect to watch a task complete on the
 dashboard until 2.7.
 
-### What is NOT done — read before claiming anything
+### Shipped — merged, deployed to staging, Internet-tested
 
-- **No commit, no PR, no CI run.** Everything is on the local branch
-  `phase-2.5-result-submission`, which has **not been pushed**.
-- **No deployment.** Not staging, not production.
-- **No Internet test (§8).** All verification was local Docker.
-- **No demo run by you (§15 items 3–4).** That is the outstanding gate.
-- **The AKS cluster was never started this session**, so no credit was spent
-  on it. Whether it is running is whatever you left it as — the session-13
-  entry below says it was left **up and billing**; verify before assuming.
+**PR #36 merged, `main` at `94636a6`**, CI green on all 7 checks with **253
+passed in CI**. `staging / deploy` succeeded and was verified rather than
+taken off CD's tick: public `/health` returns `94636a61b99…` **with no
+`-k`**. Branch deleted local and remote.
+
+**§8 satisfied.** The **ghcr image CI built for that SHA** ran against
+`https://dcds-staging.centralindia.cloudapp.azure.com` with `WORKER_CA_FILE`
+empty, and **all four types reached `COMPLETED` over the real network** —
+`hash_rounds` returning the digest recomputed independently outside the
+system. `demo-worker` was scaled to 0 for the test and **restored to 1**.
+
+### ⚠ Two things that need YOU
+
+1. **`production / deploy` is PARKED on its required-reviewer gate** (CD run
+   `30608814126` for `94636a6`). Yours to approve — the agent is blocked
+   from approving production gates. **Approve it BEFORE stopping the
+   cluster, or leave it parked and approve after the next `az aks start`** —
+   approving against a stopped cluster is what produced the red `61ecc4c`
+   run.
+2. **The demo and failure demo (§15 items 3–4) — the outstanding gate.**
+   Everything else on Step 2.5 is verified. Note #118: the demo is an
+   **API-and-database demo**, not a browser one.
+
+### ⚠ The AKS cluster is RUNNING and billing
+
+It was **already running when this session started** — left up by session 13,
+not started by me. Staging is 7/7 healthy. **The staging CD job has
+finished, so nothing is in flight and a stop is safe**, as long as you do
+not approve the parked production gate first:
+
+```powershell
+az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+```
+
+### What is NOT done
+
+- **The demo and failure demo run by you (§15 items 3–4).**
+- **Production deploy** — parked on your gate, see above.
+- **The §6 dashboard surface** — deferred to Step 2.7 by your decision
+  (#118). Step 2.5's behaviour is not watchable in a browser.
 
 ### What was verified, live, in Docker
 

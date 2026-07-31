@@ -882,7 +882,47 @@ Against a real coordinator, worker, Postgres and Redis over TLS.
 - **Phase 3 columns untouched:** `lease_expires_at` NULL and
   `attempt_count` 0 on every completed row, and `attempt` is on the wire in
   the assignment at 0.
-- **Test suite: 251 passed** (was 203 at Step 2.4), `ruff` clean.
+- **Test suite: 253 passed** (was 203 at Step 2.4), `ruff` clean.
+
+### Shipped and verified over the public Internet (§8)
+
+PR #36 merged, `main` at **`94636a6`**, **CI green on all 7 checks** with
+**253 passed** in CI against ephemeral Postgres/Redis — the same count as
+locally. `staging / deploy` succeeded and the deployment was **checked
+rather than taken off CD's green tick**: public `/health` returns
+`94636a61b994ef00f1807eee0411cdd03afe335c` **with no `-k`**, so the Let's
+Encrypt certificate genuinely validated.
+
+The worker was **the ghcr image CI built for that SHA**
+(`sha256:23580cfb…`), not a local build, run against
+`https://dcds-staging.centralindia.cloudapp.azure.com` with `WORKER_CA_FILE`
+empty so the OS trust store validated the coordinator — no dev CA involved.
+Same handshake, same protocol, same code path as a Docker worker (§3.5).
+
+`demo-worker` was scaled to 0 for the duration and **restored to 1**, to
+remove attribution ambiguity — it still runs the pre-2.3 image `b1963f90`
+and would have acked and parked whatever it was given (the standing drift
+noted for Step 2.9).
+
+**All four types reached `COMPLETED` over the real network**, enqueued
+through the **public ingress** and read back through the **public admin
+API**:
+
+| type | status | worker duration | observed | result |
+|---|---|---|---|---|
+| `count_to_n` | COMPLETED | 0.003 | 0.113 | `2000` |
+| `hash_rounds` | COMPLETED | 0.378 | 0.457 | `c4773d4f7ba4…` |
+| `sleep` | COMPLETED | 8.002 | 8.081 | `8.0` |
+| `opaque_payload` | COMPLETED | 0.002 | 0.096 | exact base64 round trip |
+
+`hash_rounds` returned the **same digest recomputed independently outside
+the system**, so correctness holds on the shipped artefact over the real
+network and not only locally. Every stored envelope carried
+`session_epoch` 1 and `attempt_number` 0, and every result was
+acknowledged `transitioned` with `pending: 0` — the buffer drained.
+
+**`production / deploy` is PARKED on its required-reviewer gate.** That is
+the user's to approve; the agent is blocked from approving production gates.
 
 ---
 
