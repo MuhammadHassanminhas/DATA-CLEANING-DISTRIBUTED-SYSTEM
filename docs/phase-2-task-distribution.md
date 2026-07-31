@@ -694,19 +694,53 @@ helm upgrade --install platform infra/helm/platform -n staging `
   --set demoWorker.image.tag=$SHA --dry-run=server
 ```
 
-**What this does NOT mean (§10): staging currently has NO demo worker.** The
-dry run applied nothing, and the chart change is not merged, so nothing
-recreates it until this lands on `main` and CD deploys. That is the intended
-order — delete, then let CD create the managed copy — but until then the
-staging fleet has only whatever external workers are connected. Confirm the
-managed copy after the next deploy with:
+### Shipped and verified on the deployed object 2026-07-31
 
-```powershell
-kubectl -n staging get deploy demo-worker -o json | ConvertFrom-Json | ForEach-Object { $_.spec.template.spec.containers[0].image; $_.metadata.labels }
+PR #39 merged, **`main` at `99c89e7893fc384ac2cfca2061585d8364c3663c`**, CI
+green on all 7 checks, CD run `30614723949` `success` on **both**
+`staging / deploy` and `production / deploy`. Branch deleted local and remote.
+
+**The green tick was not the check.** The deployed object was read directly,
+and both required conditions hold:
+
+```
+image:  ghcr.io/.../data-cleaning-distributed-system-worker:99c89e7893fc384ac2cfca2061585d8364c3663c
+labels: {"app":"demo-worker","app.kubernetes.io/managed-by":"Helm"}
 ```
 
-The image tag must equal the deployed SHA and the labels must include
-`app.kubernetes.io/managed-by: Helm`.
+The image tag **equals the deployed SHA**, and the `managed-by: Helm` label
+is present. The annotations back the label up rather than leaving it to be
+taken on trust — `meta.helm.sh/release-name: platform` and
+`meta.helm.sh/release-namespace: staging` — so the object is genuinely owned
+by the release and not merely labelled as if it were. `deployment.kubernetes.io/revision`
+is `1`: it is a newly created object, not the old one relabelled. Helm release
+is at revision 45. The three deliberate changes landed as written: CPU limit
+`500m`, `WORKER_MAX_CONCURRENT=1`, and
+`WORKER_AGENT_VERSION=demo-worker-99c89e7893fc…`. **Production still runs no
+demo-worker at all**, as intended.
+
+**Then the substance, because a correct tag is not the thing that was
+broken.** The old worker acknowledged assignments and parked them forever; a
+Deployment can carry the right tag and still do that. So a task was run end to
+end through the **public ingress**:
+
+- The worker's own log shows `task_runner_started` with `max_concurrent: 1`
+  and all four supported task types — a message the pre-2.3 image cannot emit,
+  which is what makes it a version proof rather than an inference from a tag
+  string.
+- `count_to_n(n=2000)` enqueued through `POST /tasks` on the public endpoint
+  reached **`COMPLETED`**, assigned to `b2ca7645-f91e-4eac-a5a2-1775d0dcbae7`
+  — **the demo-worker's own `worker_id`**, matched against its log, so the
+  attribution is not assumed.
+- Stored result **`2000`**, the known answer. `observed_duration_seconds` 0.02
+  against a worker-reported 0.002, `session_epoch` 2, `attempt_number` 0.
+
+That is the difference between the tag being right and the fleet member
+actually working. **The drift is closed, not relocated.**
+
+**Not claimed:** no secret was printed at any point, and the fresh-clone and
+CPU-saturation properties of the new `500m` limit were not re-measured — the
+headroom figure above is arithmetic against the quota, not a load test.
 
 **Regression check after the change: `253 passed`, `ruff` clean.** Run in a
 `python:3.12-slim` container against ephemeral Postgres 16 / Redis 7 with
@@ -1016,12 +1050,262 @@ the user's to approve; the agent is blocked from approving production gates.
 - No operator ever needs to touch the database directly.
 
 **Exit criteria**
-- [ ] All operations work via the API.
-- [ ] Batch submission of 1,000 tasks succeeds.
-- [ ] Task inspection returns the full lifecycle with timestamps.
-- [ ] Cancelling a queued task removes it from the queue.
-- [ ] Unauthenticated requests are rejected.
-- [ ] API documented well enough to use without reading source.
+- [x] All operations work via the API.
+- [x] Batch submission of 1,000 tasks succeeds.
+- [x] Task inspection returns the full lifecycle with timestamps.
+- [x] Cancelling a queued task removes it from the queue.
+- [x] Unauthenticated requests are rejected.
+- [x] API documented well enough to use without reading source.
+
+### Design decisions — #122–#127
+
+**#122 — cancellation covers `QUEUED` only, and the refusal is the
+feature.** `task_states` also permits `ASSIGNED -> CANCELLED` and
+`RUNNING -> CANCELLED`, so writing the transition was available and was
+rejected. A coordinator-side write is not a cancellation: the worker holding
+that task keeps executing, keeps its credit, and eventually submits a result
+for a task the database calls terminal — which `complete_task` then refuses
+as `ILLEGAL`. The task's work is thrown away, the credit is stranded, and
+the operator is told "cancelled" about a worker that never stopped. Real
+cancellation needs a wire message and a worker-side cancel path (the
+executors already carry the cooperative flag from Decision #94), which is
+not this step's scope and is not being half-built here. So an in-flight or
+terminal task returns **409 with its current status**, and the operator
+learns why.
+
+A second cancel is **409 reporting `CANCELLED`**, not a silent 200. §3.7's
+idempotency requirement is about a *worker* retrying a submission it cannot
+know landed; an operator repeating a cancel is asking whether *this call*
+cancelled it, and the honest answer is no. The state is identical either
+way; only the report differs.
+
+The race against the assignment engine is settled by the lock, not by
+timing: cancel takes `FOR UPDATE` before reading the status, dequeue claims
+with `FOR UPDATE SKIP LOCKED`. A dequeue in flight steps over a row being
+cancelled; a cancel arriving mid-dequeue blocks, then sees `ASSIGNED` and
+refuses. There is no window in which a task is both cancelled and handed
+out.
+
+**#123 — the lifecycle is reconstructed from four columns, not replayed
+from an event log, and `started_at` is the column that was missing.** Until
+this step, the moment a task moved `ASSIGNED -> RUNNING` survived only while
+it stayed `RUNNING`: the transition wrote `updated_at`, and completion
+overwrote it. Progress samples write nothing to Postgres by design
+(Decision #94), so nothing else could reconstruct it. Migration `0004` adds
+one nullable column, written **inside the UPDATE that already performs the
+transition** — no extra statement on the assignment hot path.
+
+A `task_events` table was the alternative and was rejected for M2: it adds a
+write per transition to serve a read that four columns answer. Every
+timeline entry names the column it came from, because the reconstruction is
+exact for `QUEUED`/`ASSIGNED`/`RUNNING`/`COMPLETED` and **inferred** for
+`FAILED`/`CANCELLED`, which have no column and use `updated_at`. That is
+correct only because a terminal state is the last write a task row ever
+receives — stated rather than assumed, since it stops being true the moment
+something updates a terminal task. Phase 3, which introduces retries and
+therefore *repeated* transitions per task, is where one column per state
+stops being enough.
+
+Tasks created before `0004` keep `started_at` NULL and their timeline omits
+the `RUNNING` entry **rather than inventing one from `updated_at`**, which
+for a completed task is the completion time (§10). No backfill is attempted.
+
+**#124 — listings return `has_more`, never a total, and never a result
+body.** A filtered `COUNT(*)` costs more than the page it describes, and
+`tasks` accumulates terminal rows for the lifetime of the system by design
+(Decision #79) — so a "3 of 412,905" header would make every listing pay for
+a number nobody acts on. `has_more` costs one extra row: the query asks for
+`limit + 1`. Result bodies are excluded because a 200-row page at the 128 KB
+cap is a 25 MB response; `has_result` says whether one exists and
+`GET /tasks/{id}` fetches it, which also keeps the listing query off
+`task_results` entirely.
+
+Order is fixed at `created_at DESC, id DESC` rather than caller-selectable.
+The `id` tiebreak is not decoration: one multi-row INSERT stamps every row
+of a bulk enqueue with an identical `created_at`, so without it a page
+boundary could repeat or skip rows. **An unknown `status` or `task_type` is
+a 400, not an empty list** — an operator who typos `RUNING` must be told,
+not shown "no tasks" and left to conclude the fleet is idle.
+
+**#125 — the coordinator rate-limits the operator API itself, and exempts
+the dequeue primitive.** ingress-nginx already limits per source IP, but the
+edge is not in the path for a Compose run, an in-cluster caller or a
+port-forward — so without this, "the operator API is rate limited" would be
+a property of one deployment topology rather than of the coordinator. Same
+fixed-window mechanism as registration, a separate key scope, and applied
+**before** authentication so an unauthenticated flood does not require a
+credential to be rejected.
+
+Default 300/minute because a *program* is the realistic caller: Step 2.7's
+dashboard will proxy these endpoints from a single pod, so the whole
+dashboard shares one bucket — the trap the registration limiter fell into
+before `_caller_ip` was fixed. **`POST /tasks/dequeue` is exempt**, the only
+task endpoint that is: `scripts/queue_harness.py` drives roughly a thousand
+claim calls as fast as it can to prove three replicas never double-assign,
+and limiting it would break a versioned verification for no security gain.
+
+**#126 — validation errors no longer quote the request back.** FastAPI's
+default handler echoes the offending value in each error's `input` field,
+and for a `missing` error that value is the **whole request body**. In
+session 13 a demo helper sent `ADMIN_SECRET` under the wrong field name and
+the 422 handed the live secret back, where it was captured in a transcript
+and had to be rotated (Decision #119). §12 says credentials are never logged
+and never rendered; a response body is a rendering. The handler is
+app-wide, not per-endpoint, so a future endpoint that accepts a secret does
+not have to remember. `admin_secret` on `POST /tasks` also became optional
+in the schema, so omitting it produces a 401 from the auth check rather than
+a 422 from pydantic — the header is now the documented path.
+
+**#127 — the credential stays where existing callers put it.** The read
+endpoints take `X-Admin-Secret`; `POST /tasks` accepts the header **and**
+keeps its body field, because scripts, harnesses and the CD smoke test send
+it that way and breaking them buys nothing. `POST /tasks/{id}/cancel` takes
+no body at all, so there is nothing there for a validation error to echo.
+The inconsistency is documented in `docs/operator-api.md` rather than
+resolved by a breaking change.
+
+**One schema change: migration `0004`** — `tasks.started_at`, and
+`ix_tasks_created_at` on `(created_at, id)`. No index was added for
+`correlation_id` or `assigned_worker_id`: migration 0002 already created
+both. That was found by the first live run of the migration failing on a
+duplicate relation, not by reading 0002 first, and it is recorded because
+the reverse mistake — shipping a second index under a new name — would have
+gone unnoticed.
+
+### Verification — measured locally, in Docker
+
+Compose project **`dcds26`** against a real coordinator, worker, Postgres
+and Redis over TLS, driven from a container on the same network so the
+private dev CA validated. Suite **275 passed** (was 253 at 2.5), `ruff`
+clean across `coordinator worker dashboard protocol tests scripts`.
+
+**Criterion 1 — all operations work via the API.** A `count_to_n(2000)`
+task submitted through `POST /tasks` was executed by the real worker and
+read back `COMPLETED` with the result **2000**, the known answer. Filters by
+`task_type`, `status`, `worker_id` and `correlation_id` each returned only
+matching rows; a typo'd status returned **400** (`unknown task state:
+'RUNING'`) rather than an empty list; a page over the cap returned 400; a
+listing carried `has_result` and no result body.
+
+**Criterion 2 — batch submission of 1,000 tasks.** One call, **0.069s**,
+`count: 1000`, `task_ids: null`. Paged back by correlation id at 200 per
+page: **1,000 unique ids across 5 pages**, no repeats and no gaps — which is
+what the `id` tiebreak in #124 exists for, since all 1,000 rows share a
+`created_at`.
+
+**Criterion 3 — full lifecycle with timestamps.** The completed task's
+timeline was `QUEUED -> ASSIGNED -> RUNNING -> COMPLETED` at
+`10:04:30.103471`, `.113323`, `.130120`, `.148877`, each entry naming its
+source column, timestamps monotonic. Both durations came back and did not
+blur: **coordinator-observed 0.036s against a worker-reported 0.002s**.
+
+**Criterion 4 — cancelling a queued task removes it from the queue.** Run
+with the worker **stopped**, so the measurement was not racing the drain:
+3 `sleep(120)` tasks all stayed `QUEUED`, one was cancelled, and **depth
+went 377 → 376 — exactly one** — with `counts` gaining `CANCELLED: 1`. The
+cancelled task had `assigned_worker_id` NULL (it was never handed to
+anyone) and a two-entry timeline ending at `CANCELLED`. A second cancel
+returned **409 `CANCELLED`**; cancelling the earlier `COMPLETED` task
+returned **409 `COMPLETED`**; an unknown id returned 404. The worker was
+then restarted and a task it had actually taken returned **409 `RUNNING`**,
+with the task still `RUNNING` afterwards — refused, not half-cancelled.
+
+**Criterion 5 — unauthenticated requests are rejected.** 401 on all five
+endpoints with no credential, and on a near-miss credential (one character
+short), which is `hmac.compare_digest` doing its job. The session 13 leak
+was reproduced deliberately — `POST /tasks` with `admin_secret` in the body
+and `task_type` missing — and the 422 came back as
+`{"detail":[{"loc":["body","task_type"],"msg":"Field required","type":"missing"}]}`
+with **the credential absent from the response**.
+
+**Rate limiting**, measured against a fresh window: **300 × 200 then the
+first 429 on request #301.** An earlier run of the same check reported the
+first 429 at #270, which is the fixed window doing exactly what it should —
+the preceding stage's ~31 calls were still inside the same minute. Recorded
+because it is the sort of number that looks like a defect until the
+mechanism is stated.
+
+**Observability.** `task_cancelled`, `task_cancel_refused`,
+`task_list_rejected_invalid_filter`, `task_list_rejected_invalid_admin_secret`
+and `task_api_rate_limited` all emitted as structured JSON with
+`correlation_id` and `client_ip`. New metrics read from `/metrics`:
+`coordinator_task_cancellations_total{outcome="transitioned"} 2`,
+`{outcome="not_cancellable"} 3`, `{outcome="not_found"} 1`, and
+`coordinator_task_api_rate_limited_total 41`.
+
+**Migration `0004` was applied from an empty database**, not only forward
+from an existing one: the database was dropped and recreated, the full suite
+re-run, and `alembic_version` read back **0004** with `started_at` present
+and `ix_tasks_created_at btree (created_at, id)` on `tasks`.
+`lease_expires_at` and `attempt_count` remain written by nothing.
+
+**What the index costs and buys**, measured rather than assumed, on 60,000
+rows. `EXPLAIN (ANALYZE)` of the endpoint's own query — no index **20.172
+ms** (Parallel Seq Scan + top-N sort), `(created_at)` **4.516 ms** (index
+scan, but an Incremental Sort reading 10,001 rows to return 50 because a
+bulk enqueue makes one giant tie group), `(created_at, id)` **0.096 ms** (no
+sort node, 50 rows read). Write cost on a 10,000-task bulk enqueue, seven
+runs each after a discarded warm-up: no index **0.540s**, `(created_at)`
+**0.628s**, `(created_at, id)` **0.593s** — so roughly **+0.05s**, with the
+difference between the two index shapes inside the run-to-run spread. The
+composite is not claimed to be cheaper to write, only not measurably dearer.
+
+### Two things this step did not get for free
+
+**A latent test-isolation defect surfaced.** `assignment._work_available` is
+a module-level `asyncio.Event`, and an Event binds itself to the first loop
+that awaits it. Earlier test modules await it inside their own
+`asyncio.run`, so a later module that starts the whole app through
+`TestClient` found the object bound to a loop that no longer existed —
+`assignment_loop` died on its first wait and surfaced as an error at
+lifespan shutdown. Fixed in the test module by binding a fresh Event before
+the app starts. **The production path is unaffected and was not changed**: a
+deployed coordinator has one event loop for the life of the process, and
+this is a property of running one process across many loops, which only the
+suite does.
+
+**§6 is not satisfied by this step, and that is the user's standing scope
+call, not a claim that it is.** Step 2.6 adds no dashboard surface, so its
+behaviour is **not watchable in a browser** — the same gap recorded for Step
+2.5 as Decision #118, which deferred live queue depth, running tasks and
+completed tasks to Step 2.7. Nothing is added to 2.7's scope by this; the
+demo below is an API-and-terminal demo.
+
+### Demo you run yourself
+
+With the stack up (`docker compose up -d`) and `$env:ADMIN_SECRET` to hand.
+Full reference, including the PowerShell `curl.exe` caveat, in
+`docs/operator-api.md`.
+
+1. **Submit and watch one task through its whole life.**
+   `POST /tasks` with `{"task_type":"count_to_n","parameters":{"n":2000}}`,
+   then `GET /tasks/{id}` — the `timeline` shows all four states with
+   timestamps, and `result.result` is `2000`.
+2. **Submit 1,000 in one call**, then find them all with
+   `GET /tasks?correlation_id=…&limit=200`, paging on `offset` until
+   `has_more` is false.
+3. **Filter**: `GET /tasks?status=COMPLETED&limit=10`, then
+   `?task_type=sleep`, then `?worker_id=…` from `GET /workers`.
+4. **Cancel a queued task.** Stop the worker
+   (`docker compose stop worker`), submit 3 `sleep(120)` tasks, read
+   `GET /tasks/depth`, cancel one, read depth again — it drops by exactly
+   one, and the task's timeline ends at `CANCELLED`.
+
+**Failure demo**
+
+1. **Cancel something already running.** Start the worker again, wait for a
+   sleep task to reach `RUNNING`, cancel it: **409** naming its status, and
+   `GET /tasks/{id}` shows it still `RUNNING` — refused, not half-cancelled.
+2. **Call anything without the credential**: 401. Then with one character
+   changed: 401.
+3. **Typo a filter**: `GET /tasks?status=RUNING` → 400 saying so, not an
+   empty list.
+4. **Trip the rate limit**: set `TASK_API_RATE_LIMIT_PER_MINUTE=5` in
+   `.env`, restart the coordinator, and call `GET /tasks/depth` six times —
+   the sixth is 429.
+5. **Prove the 422 no longer leaks.** `POST /tasks` with `admin_secret` in
+   the body and `task_type` omitted: the 422 names the missing field and
+   does not contain the secret.
 
 ---
 
