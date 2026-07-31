@@ -659,6 +659,209 @@ every task it is given makes those counts unreadable.
 - [ ] Execution duration recorded and visible.
 - [ ] Large result payloads handled without breaking the connection.
 
+### Design sub-gate — Decisions #110–#117
+
+Six decisions, each recorded because it was a real fork rather than the
+only option.
+
+**#110 — a success submits `task_result`, and that message carries the
+credit release.** Step 2.4's success path sent `capacity`; it no longer
+does. Sending both would be a second release for the same task — harmless,
+because a keyed release is exactly-once (Decision #107), but it would spread
+one credit's accounting across two messages and two code paths.
+
+`capacity` is **kept and still handled**, and that is not dead code: a
+worker built before this step sends nothing else on success, and §3.5 says
+the coordinator cannot tell one worker generation from another. The
+in-cluster `demo-worker` is a live example — it still runs a pre-2.3 image.
+
+**#111 — the coordinator acknowledges every result, and the ack is always
+definitive.** A worker retries an unacknowledged result, so an ack that only
+ever meant success would leave a *malformed* result retrying forever — the
+worker punishing itself for an answer that will never change. `accepted`
+says whether the result was stored; either way the worker stops.
+
+The alternative considered and rejected was no ack at all, treating a
+successful send as a successful submission. That loses a result whenever a
+coordinator dies between reading the frame and committing the row, which is
+exactly the window this step exists to close.
+
+**#112 — the pending-result buffer exists, and it is bounded.** Step 2.4
+shipped with no buffer and said so plainly (Decision #98): a report with no
+live session was dropped, because a buffer is worker-side state with nothing
+to release it if the process dies. That reasoning has not stopped being
+true — but 2.5's "finishes during a brief coordinator outage" criterion
+cannot be met without one, because a result is the only message carrying
+data nothing else can reconstruct. A lost progress sample is nothing; a lost
+`capacity` is recovered by the next `hello`; a lost result is work done and
+thrown away.
+
+So the buffer is bounded at `WORKER_MAX_PENDING_RESULTS`, never written to
+disk, and **abandoned openly on shutdown rather than persisted** — a worker
+that survives its own restart with state is not stateless (§3.6). At the cap
+the oldest entry is dropped and logged; its task stays `RUNNING`, visible,
+and is Phase 3's to reclaim. `tasks_in_flight` deliberately excludes pending
+results: the thread is back in the pool, so counting them would understate
+the worker's capacity for as long as the coordinator was away — the wrong
+direction.
+
+**#113 — the result cap is 128 KB, and Decision #81's 64 KB was wrong by
+arithmetic.** `opaque_payload` accepts up to 64 KB of **decoded** bytes and
+the executor echoes them back **base64-encoded**, which is 4/3 the size —
+87,384 bytes for a full-size input. A 64 KB result cap would therefore have
+truncated the largest *legal* task's result, so `task_types.py`'s note that
+a worker echoing its input "should not be able to exceed the result cap by
+construction" compared decoded input to encoded output. Found by building
+this step, not by review. 128 KB clears 87 KB with room for the envelope.
+
+**Oversize is truncated, never rejected**, and that split is the point: a
+malformed message is not a result and is refused before anything is written;
+an oversize one *is* a result that simply carries more bytes than are worth
+storing. Refusing to complete a task over its payload size would strand real
+work. The cap is enforced on both sides — the worker keeps an oversize frame
+off the wire (which is what "without breaking the connection" is actually
+about), and the coordinator re-checks because the worker is untrusted (§12).
+
+**#114 — a result arriving for an `ASSIGNED` task is walked through
+`RUNNING`, not granted a new transition.** A `task_started` can be lost to a
+socket that died between it and the result. The obvious fix is to add
+`ASSIGNED -> COMPLETED` to the state machine; it was rejected. That edge
+would make "completed without ever running" legal everywhere and forever, to
+serve one lossy corner, and Phase 2.1 has an approved test asserting it
+illegal. Instead `complete_task` performs both legal transitions inside the
+same locked transaction. Two legal moves, no new edge, and the audit trail
+still says the task ran.
+
+**#115 — retention is enforced by a per-replica sweep, not documented and
+left.** `RESULT_RETENTION_DAYS` (7, Decision #81) deletes bodies from
+`task_results`; the `tasks` row survives as the permanent audit trail and
+its `result_id` becomes NULL through the existing `ON DELETE SET NULL`, so
+retention needs no second write. Every replica sweeps — the DELETE is
+idempotent and row-scoped, so concurrent sweeps race harmlessly and leader
+election would buy nothing but a failure mode (the same reasoning as
+Decision #89). A retention period nothing implements is a hypothesis, and
+this project does not record those as results (§10).
+
+**Idempotency is structural, and the token is not what provides it.** Worth
+stating because the two are easy to conflate. `complete_task` locks the task
+row before reading its status, so a task already `COMPLETED` returns
+`DUPLICATE` having written nothing — no second result row, no re-stamped
+`completed_at`. That holds for a retry, for two replicas racing the same
+resubmission, and for a worker simply repeating itself. The
+`idempotency_token` is **recorded and enforced by nothing in M2**, which is
+precisely what the exit criterion asks for: it is what lets Phase 3 tell a
+retry apart from a genuinely second attempt, once there are second attempts.
+
+**What this step does not do**, so none of it is mistaken for an oversight:
+it adds no execution timeout (Decision #103 still holds), writes neither
+`lease_expires_at` nor `attempt_count` — it *reads* the latter to put it on
+the wire, which is a different thing — and does not decide what happens to a
+task whose result was rejected or abandoned. Those stay `RUNNING`, visible,
+and are Phase 3's.
+
+**One schema change: migration `0003`, a single index.** Phase 2.1 built
+`task_results` so writing results would need no migration, and it did — the
+envelope lives in the existing JSONB `payload` and its length in the
+existing `size_bytes`. What 2.1 could not foresee is the *read* pattern
+retention introduces: `DELETE ... WHERE submitted_at < ...` on a schedule
+forever, which without an index scans every result ever stored on every
+sweep. Recorded as a recommendation, not a measurement — no sweep has been
+run against a large table.
+
+**New wire messages.** `task_result` (worker to coordinator) and
+`task_result_ack` (coordinator to worker). `task_assign` gains an `attempt`
+field. The envelope is untouched and `PROTOCOL_VERSION` stays `"1.0"`.
+
+**New read path.** `GET /tasks/{task_id}` — admin-authenticated, returning
+the task row and its stored result envelope. It exists because "execution
+duration recorded and visible" is otherwise unverifiable without opening the
+database. It is a **primitive**, in the same sense `POST /tasks/dequeue` was
+kept as one in Step 2.2: Step 2.6 owns the operator task API — filters,
+listing, full lifecycle history, cancellation — and builds on this rather
+than around it. It reports two durations and does not blur them (§10): the
+worker-reported `duration_seconds` inside the result, and the
+coordinator-observed `observed_duration_seconds` from `assigned_at` to
+`completed_at`, which includes delivery and the result round trip and is the
+one that cannot be lied about.
+
+### Two defects live testing found that review and unit tests did not
+
+Recorded prominently because this is the second step running where the
+live run — not the design review, not the suite — is what found the
+problems, and both were **invisible to a passing test**.
+
+**#116 — every result went over the wire twice.** A completing task submits
+its result *and* records it as pending, which wakes the retry loop; the loop
+then found a pending result that had been on the wire for a millisecond and
+sent it again. Both landed, the second as a `duplicate` — so idempotency did
+exactly its job, nothing broke, no test failed, and the only symptom was a
+`duplicate` ack in a log nobody had a reason to read. What it cost was the
+wire: for the full-size `opaque_payload` echo that is **87 KB duplicated per
+task**, fleet-wide. Fixed with a per-result "sent at" stamp and a grace
+period; `attach` clears the stamps on reconnect, because a send is void the
+moment its socket dies.
+
+**#117 — the retry loop could not be woken from its backoff.** `attach` set
+the `results_pending` event on reconnect, but only the *idle* branch of the
+submission loop waited on that event; the retry branch waited on
+`stop_event`. So a worker that had climbed its backoff during an outage kept
+sleeping after the coordinator came back. **Measured before the fix:** the
+result was delivered, but 26.23s of backoff after the reconnect. **Measured
+after:** `ws_connected` at `05:17:56.405738`, delivery at `05:17:56.405770`
+— 32 µs — and acknowledged 131 ms after reconnect.
+
+Neither was a correctness failure, which is exactly why they are worth
+recording: the exit criterion passed on the pre-fix build. A criterion can
+be met by something that is quietly wasteful or quietly slow, and only a
+live run shows the difference.
+
+### Verification — measured locally, in Docker
+
+Against a real coordinator, worker, Postgres and Redis over TLS.
+
+- **All four types complete, with results checked against independently
+  computed answers**: `count_to_n(2000)` → `2000`; `hash_rounds(200000)` →
+  `c4773d4f…fecd`, recomputed from a 200,000-round SHA-256 chain outside the
+  system; `opaque_payload` → its exact base64 round trip; `sleep(4)` → `4.0`.
+  Every row `COMPLETED` with `completed_at` stamped and `result_id` set.
+- **Volume:** 200 tasks → **200 COMPLETED, 200 result rows, 200 distinct
+  result ids, 200 distinct idempotency tokens, 0 wrong answers.** Worker RSS
+  **31,224 → 31,412 kB (+0.19 MB)**, so the bounded buffer does not leak.
+- **The outage criterion, live:** a `sleep(25)` task was started, the
+  coordinator was **stopped** 6s in, the task finished with nowhere to send
+  (`task_report_dropped_no_session`, `pending: 1`, backoff climbing 2.35 →
+  15.16 → 26.23s), and on restart the result was delivered and the task
+  reached `COMPLETED`. The stored envelope shows **`duration_seconds`
+  25.002 against an observed 68.67s** — the two measurements differing by
+  the outage is the clearest possible illustration of why both are reported.
+  Its `session_epoch` is **4**, the epoch it *executed* under, not the 5 it
+  submitted on.
+- **Malformed, over the real socket**, using a throwaway protocol client —
+  **no production code was changed to produce it**, the same discipline
+  Step 2.4's injected fault used. A result with no idempotency token was
+  answered `accepted: false / rejected / missing_idempotency_token`, and the
+  task row afterwards was **`RUNNING`, `result_id` NULL, `completed_at`
+  NULL, zero result rows** — untouched. The log carried the reason and never
+  the body (§12).
+- **Duplicate submission over the real socket:** the same envelope three
+  times → acks `transitioned`, `duplicate`, `duplicate`, and **one** result
+  row.
+- **Large payloads:** a full-size `opaque_payload` (65,536 decoded bytes)
+  produced an **87,384-character result stored whole** in an 87,602-byte
+  envelope, `truncated` false, connection intact — the case Decision #113's
+  arithmetic is about, since the superseded 64 KB cap would have truncated
+  it. An over-cap result truncates and still completes.
+- **Retention, live:** four aged bodies, one sweep, `result_retention_purged
+  rows: 4`. Afterwards **9 tasks still `COMPLETED` with timestamps intact
+  and 4 carrying `result_id` NULL** — the audit trail survives its body.
+- **One correlation id spans enqueue → assigned → acknowledged → started →
+  progress → completed across both services** (§11). Step 2.4's trace
+  stopped at `capacity`; it now reaches completion.
+- **Phase 3 columns untouched:** `lease_expires_at` NULL and
+  `attempt_count` 0 on every completed row, and `attempt` is on the wire in
+  the assignment at 0.
+- **Test suite: 251 passed** (was 203 at Step 2.4), `ruff` clean.
+
 ---
 
 ## Step 2.6 — Operator task APIs

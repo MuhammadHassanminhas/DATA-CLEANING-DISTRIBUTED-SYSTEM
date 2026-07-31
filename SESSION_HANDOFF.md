@@ -8,7 +8,127 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ SESSION CLOSED 2026-07-30 (session 13) — Step 2.4 DONE and APPROVED
+## ⇒ 2026-07-31 (session 14) — Step 2.5 BUILT and VERIFIED LOCALLY, AWAITING APPROVAL
+
+**Step 2.5 (result submission and completion) is implemented and all 6 exit
+criteria are met locally.** Design decisions **#110–#117**. Suite **251
+passed** (was 203 at 2.4), `ruff` clean across `coordinator worker dashboard
+protocol tests scripts`.
+
+**This is the step that finally moves a task to `COMPLETED`.** Step 2.4
+computed results and threw them away by design (#98/#105), so every
+successful task stopped at `RUNNING`. A success now submits a result
+envelope, the coordinator validates and persists it, and the task terminates.
+
+### What is NOT done — read before claiming anything
+
+- **No commit, no PR, no CI run.** Everything is on the local branch
+  `phase-2.5-result-submission`, which has **not been pushed**.
+- **No deployment.** Not staging, not production.
+- **No Internet test (§8).** All verification was local Docker.
+- **No demo run by you (§15 items 3–4).** That is the outstanding gate.
+- **The AKS cluster was never started this session**, so no credit was spent
+  on it. Whether it is running is whatever you left it as — the session-13
+  entry below says it was left **up and billing**; verify before assuming.
+
+### What was verified, live, in Docker
+
+Compose project **`dcds25`** against a real coordinator, worker, Postgres
+and Redis over TLS.
+
+- **All four types complete with correct results**, checked against values
+  recomputed independently outside the system: `count_to_n(2000)` → `2000`;
+  `hash_rounds(200000)` → `c4773d4f…fecd`; `opaque_payload` → its exact
+  base64 round trip; `sleep(4)` → `4.0`.
+- **200 tasks → 200 COMPLETED, 200 result rows, 200 distinct idempotency
+  tokens, 0 wrong answers.** Worker RSS **31,224 → 31,412 kB (+0.19 MB)**.
+- **The outage criterion:** a `sleep(25)` task ran, the **coordinator was
+  stopped** 6s in, the task finished with nowhere to send, and the result
+  landed on reconnect. Stored envelope: `duration_seconds` **25.002** against
+  an observed **68.67s**, `session_epoch` **4** (the epoch it executed under,
+  not the 5 it submitted on).
+- **Malformed rejected over the real socket** by a throwaway protocol client
+  — **no production code was changed to produce it**, same discipline as
+  2.4's injected fault. Row afterwards: `RUNNING`, `result_id` NULL,
+  `completed_at` NULL, zero result rows. Log carried the reason, never the
+  body.
+- **Large payload:** full-size `opaque_payload` → **87,384-character result
+  stored whole**, connection intact.
+- **Retention exercised:** 4 aged bodies purged, 9 tasks still `COMPLETED`
+  with timestamps intact and `result_id` NULL.
+
+### Read this first: live testing found two defects again
+
+Second step running where the live run — not review, not the suite — found
+the problems, and **both were invisible to a passing test**:
+
+- **#116** — every result went over the wire **twice**. A completing task
+  submitted it *and* woke the retry loop, which resent it a millisecond
+  later. Both landed, the second as a harmless `duplicate`, so nothing
+  failed. Cost: **87 KB duplicated per full-size task, fleet-wide.**
+- **#117** — `attach` set the wake event on reconnect but the retry branch
+  was parked on a *different* event, so a worker that had climbed its
+  backoff during an outage kept sleeping after the coordinator returned.
+  **26.23s late before the fix; 32 µs after.**
+
+The exit criterion passed on the pre-fix build in both cases. That is the
+point of recording them.
+
+### One finding worth knowing: Decision #81's 64 KB cap was wrong
+
+`opaque_payload` accepts 64 KB of **decoded** bytes and echoes them back
+**base64-encoded** — 4/3 the size, **87,384 bytes** measured. So
+`task_types.py`'s claim that a worker echoing its input "cannot exceed the
+result cap by construction" compared decoded input to encoded output, and a
+64 KB result cap would have truncated the largest *legal* task's result. The
+cap is now 128 KB (**Decision #113**).
+
+### Things to know before touching this
+
+1. **`capacity` is no longer sent on success** — `task_result` carries the
+   credit release (#110). `capacity` is still *handled*, deliberately, for
+   pre-2.5 workers (§3.5); verified that such a worker still cycles its slot.
+2. **Migration `0003`** adds one index for the retention sweep. Applied and
+   verified live (`alembic_version = 0003`).
+3. **Two Step 2.4 worker tests were rewritten** because the success message
+   changed. What they assert is unchanged.
+4. **`GET /tasks/{task_id}` is new** and is a *primitive*, not Step 2.6's
+   operator API — same call Step 2.2 made keeping `POST /tasks/dequeue`.
+5. Local verification ran as compose project **`dcds25`** plus standalone
+   `dcds25-pg` / `dcds25-redis` on network `dcds25-net`. **`.env` was never
+   read or touched** — a throwaway env file with test-only credentials was
+   used. Tear down: `docker compose -p dcds25 down -v`.
+
+### Gotchas hit this session
+
+- **Windows `curl` (schannel) cannot validate the private dev CA** — it
+  fails the revocation check. **Python 3.14's OpenSSL also rejects it**
+  ("CA cert does not include key usage extension"). The way through is to
+  run the client **inside a container** (Python 3.12 there validates it
+  fine), which is what the CD smoke test already does (Decision #68).
+- **Do not `export POSTGRES_PASSWORD` in the same shell as
+  `docker compose`** — a real environment variable beats `--env-file`, which
+  silently gave the coordinator the wrong password and CrashLooped it.
+- **Git Bash rewrites `/tmp/...` arguments to `docker exec`.** Prefix with
+  `MSYS_NO_PATHCONV=1` or use `//tmp/...`.
+
+### Next step
+
+**Commit, push, open a PR, get CI green, deploy, Internet-test, then your
+demo.** After that, Step 2.6 (operator task APIs) — **NOT STARTED, do not
+begin without an explicit go-ahead (§9).**
+
+### Still open, unchanged from session 13
+
+1. **Rotate `ADMIN_SECRET`** — still urgent, still not done. See below.
+2. **Rotate `GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`.**
+3. **`demo-worker` image drift** — still runs pre-2.3 image `b1963f90`.
+   **Now more visible**: such a worker acks and parks tasks forever, so with
+   2.5 they never reach `COMPLETED` either. Fix before Step 2.9.
+
+---
+
+## SESSION CLOSED 2026-07-30 (session 13) — Step 2.4 DONE and APPROVED
 
 **Step 2.4 (worker execution runtime) is DONE and APPROVED by the user
 2026-07-30.** `main` at **`23736fb`**, CI green, CD `success` on **both**
