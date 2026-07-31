@@ -290,7 +290,14 @@ different credential, and never see this one.
 
 ```powershell
 # 1. New value. Keep it out of your shell history if that matters to you.
-$new = python -c "import secrets; print(secrets.token_urlsafe(32))"
+#    32 random bytes, base64url, no padding - 43 characters.
+$b = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+$new = [Convert]::ToBase64String($b).TrimEnd('=').Replace('+','-').Replace('/','_')
+# The equivalent python one-liner is `python -c "import secrets;
+# print(secrets.token_urlsafe(32))"`, but do NOT reach for it on the
+# Windows operator host: `python` on PATH there is the WindowsApps stub,
+# which opens the Store instead of running. Verified 2026-07-31.
 
 # 2. Sanity check: it must NOT equal ENROLLMENT_SECRET, or you have
 #    silently reverted the Step 2.2.1 separation.
@@ -353,6 +360,22 @@ Every replica must print `1.0`. A `0.0` means that pod is running on the
 `ENROLLMENT_SECRET` fallback — every worker can call the admin endpoints
 until it is fixed. The same pods log `admin_secret_fallback_in_use` at
 WARNING on startup when that happens.
+
+**If you cannot `exec` into a pod** (production is more locked down than
+staging), two weaker checks together cover the same ground without ever
+printing the credential — the decrypted Secret matches the value you
+generated, and no replica logged the fallback:
+
+```powershell
+$b64 = kubectl -n production get secret admin-secret -o jsonpath='{.data.ADMIN_SECRET}'
+[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) -eq $new   # expect True
+kubectl -n production logs -l app=coordinator --tail=400 |
+  Select-String -SimpleMatch 'admin_secret_fallback_in_use'                   # expect nothing
+```
+
+**This procedure was exercised end to end on 2026-07-31** — both
+namespaces re-sealed, applied, restarted and verified. It is no longer
+untested.
 
 **If `kubeseal` is not installed**, fetch the binary and seal offline —
 no cluster round trip is needed, only the committed public cert:
