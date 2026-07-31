@@ -151,6 +151,30 @@ def task_list_max_limit() -> int:
     return int(os.environ.get("TASK_LIST_MAX_LIMIT", "200"))
 
 
+def db_pool_size() -> int:
+    """Connections this replica keeps open to Postgres (Phase 2.7).
+
+    **Measured, not recommended** — the default of 5 was observed to be the
+    limiting factor, and `app/db.py` records the measurement. Raised to 15
+    so a fleet completing tasks cannot starve an operator read.
+
+    It is a per-replica figure and Postgres's `max_connections` is shared,
+    so read it together with `db_max_overflow` and the replica count.
+    """
+    return int(os.environ.get("DB_POOL_SIZE", "15"))
+
+
+def db_max_overflow() -> int:
+    """Extra connections allowed above `db_pool_size` under burst.
+
+    Deliberately smaller than SQLAlchemy's default 10, because the pool it
+    tops up is three times larger: the pair is what bounds one replica's
+    share of `max_connections`, and a burst allowance that dwarfs the
+    steady-state pool makes that ceiling hard to reason about.
+    """
+    return int(os.environ.get("DB_MAX_OVERFLOW", "5"))
+
+
 def task_result_max_bytes() -> int:
     """Ceiling on one persisted result body, in bytes (Phase 2.5).
 
