@@ -107,6 +107,53 @@ def task_dequeue_max_batch() -> int:
     return int(os.environ.get("TASK_DEQUEUE_MAX_BATCH", "100"))
 
 
+def task_result_max_bytes() -> int:
+    """Ceiling on one persisted result body, in bytes (Phase 2.5).
+
+    **Recommendation, not a measured value** — but the number is derived
+    rather than picked, and the derivation matters because Decision #81's
+    original 64 KB was wrong by arithmetic:
+
+    `opaque_payload` accepts up to `MAX_OPAQUE_PAYLOAD_BYTES` (64 KB) of
+    *decoded* bytes and the executor returns them **base64-encoded**, which
+    is 4/3 the size — 87,384 bytes for a full-size input. A 64 KB result cap
+    would therefore truncate the largest *legal* task's result, so
+    `task_types.py`'s claim that a worker echoing its input "should not be
+    able to exceed the result cap by construction" compared decoded input to
+    encoded output. 128 KB clears 87 KB with room for the envelope's other
+    fields (Decision #113).
+
+    Enforced on both sides: the worker caps its own envelope before it
+    reaches the wire, and the coordinator caps again on receipt because
+    every worker is untrusted (§12). Over-cap is **truncated, not rejected**
+    — the task still completes, because an oversize result is a fact about
+    the payload, not a malformed message.
+    """
+    return int(os.environ.get("TASK_RESULT_MAX_BYTES", str(128 * 1024)))
+
+
+def result_retention_days() -> int:
+    """How long a result **body** is kept (Phase 2.5, Decision #81).
+
+    **Recommendation, not a measured value.** The `tasks` row survives
+    forever as the audit trail; only the body in `task_results` expires, and
+    `tasks.result_id` is `ON DELETE SET NULL` so the reference stays
+    consistent when it does. Set to 0 to disable the sweep entirely.
+    """
+    return int(os.environ.get("RESULT_RETENTION_DAYS", "7"))
+
+
+def result_retention_sweep_interval_seconds() -> int:
+    """How often the retention sweep runs. Recommendation, not measured.
+
+    Hourly rather than daily so the deleted volume per pass stays small and
+    predictable, and so a misconfiguration is visible within an hour instead
+    of a day. Every replica runs its own sweep; the DELETE is idempotent, so
+    concurrent sweeps are harmless and no leader election is needed (§3.9).
+    """
+    return int(os.environ.get("RESULT_RETENTION_SWEEP_INTERVAL_SECONDS", "3600"))
+
+
 def assignment_poll_interval_seconds() -> int:
     """Recommendation, not a measured value (Phase 2.3). The assignment
     loop is **event-driven** — an enqueue publishes to the

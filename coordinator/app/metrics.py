@@ -120,6 +120,33 @@ TASK_PROGRESS_REPORTS = Counter(
     ["outcome"],
 )
 
+# Phase 2.5 result submission. `outcome` carries the full decision — a
+# result is completed, a duplicate, rejected as malformed, or refused
+# because the task is not this worker's — so a rejection spike is visible
+# without reading logs, which is what makes the malformed-input criterion
+# alertable rather than only auditable.
+TASK_RESULTS = Counter(
+    "coordinator_task_results_total",
+    "Result submissions received, by outcome.",
+    ["outcome"],
+)
+TASKS_COMPLETED = Counter(
+    "coordinator_tasks_completed_total",
+    "Tasks moved to COMPLETED with a persisted result.",
+)
+# Buckets straddle the 128 KB cap so both the ordinary small result and the
+# full-size `opaque_payload` echo (~87 KB base64) land in their own bucket,
+# and anything truncated is visible in the overflow.
+RESULT_SIZE_BYTES = Histogram(
+    "coordinator_task_result_size_bytes",
+    "Persisted result envelope size.",
+    buckets=(256, 1024, 4096, 16384, 65536, 131072, 524288),
+)
+RESULTS_PURGED = Counter(
+    "coordinator_task_results_purged_total",
+    "Result bodies deleted by the retention sweep.",
+)
+
 # Per-instance request latency. Route template keeps label cardinality bounded.
 REQUEST_LATENCY = Histogram(
     "coordinator_request_duration_seconds",

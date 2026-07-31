@@ -61,14 +61,24 @@ finishes. An acknowledgement still means "received", never "started" — the
 two are separate messages so Phase 3 can shed telemetry under load without
 ever losing a state transition.
 
-**What still does not happen here.** Nothing writes `COMPLETED`: a task
-that finishes successfully in M2 stays `RUNNING` until Step 2.5 submits
-and persists its result, because 2.4 computes results and discards them
-(Decision #98). Nothing writes `lease_expires_at` or `attempt_count`;
-those stay untouched through all of M2 (a Phase 2.1 exit criterion).
-Nothing times a task out (Decision #103) — duration is already bounded by
-Step 2.1's parameter validation. Recovering a task whose worker vanished
-is Phase 3; this module only *detects* and logs it.
+**What Step 2.5 added here.** `handle_task_result` — the message that
+finally completes a task. A success now submits a result envelope instead
+of a bare `capacity`; the coordinator validates it, persists the body, moves
+the task to `COMPLETED`, releases the credit and acknowledges. `capacity` is
+kept and still handled, because a pre-2.5 worker sends nothing else and the
+coordinator must not be able to tell one worker generation from another
+(§3.5).
+
+**What still does not happen here.** Nothing writes `lease_expires_at` or
+`attempt_count`; those stay untouched through all of M2 (a Phase 2.1 exit
+criterion) — 2.5 *reads* `attempt_count` to put it on the wire, which is a
+different thing. Nothing times a task out (Decision #103) — duration is
+already bounded by Step 2.1's parameter validation. Nothing enforces the
+`idempotency_token` or the `session_epoch` a result carries: they are
+recorded from day one so Phase 3 needs no protocol change, and duplicate
+suppression in M2 comes from the task's own terminal state instead.
+Recovering a task whose worker vanished is Phase 3; this module only
+*detects* and logs it.
 """
 
 from __future__ import annotations
@@ -87,6 +97,7 @@ from app.config import (
     assignment_poll_interval_seconds,
     heartbeat_offline_threshold_seconds,
     task_dequeue_max_batch,
+    task_result_max_bytes,
     worker_default_max_concurrent,
     worker_max_concurrent_ceiling,
 )
@@ -95,17 +106,24 @@ from app.metrics import (
     ASSIGNMENT_PASSES,
     ASSIGNMENT_QUERIES,
     ASSIGNMENTS_IN_FLIGHT,
+    RESULT_SIZE_BYTES,
     TASK_ACKS,
     TASK_PROGRESS_REPORTS,
+    TASK_RESULTS,
     TASKS_ASSIGNED,
+    TASKS_COMPLETED,
     TASKS_FAILED,
     TASKS_STARTED,
 )
 from app.redis_client import redis_client
+from app.results import MalformedResult
+from app.results import validate as validate_result
 from app.task_queue import (
+    DUPLICATE,
     NOT_FOUND,
     NOT_OWNER,
     TRANSITIONED,
+    complete_task,
     dequeue,
     mark_status,
     queue_depth,
@@ -667,6 +685,179 @@ async def handle_task_failed(session: LocalSession, message: dict[str, Any]) -> 
     notify_local()
 
 
+async def _send_to_session(session: LocalSession, envelope: Envelope) -> bool:
+    """Write one envelope to this session's socket, tolerating a dead one.
+
+    A failed send is logged and swallowed for the same reason `_deliver`
+    swallows its own: one worker whose socket died between its message and
+    this reply must not raise out of the read loop and take the session
+    down with it. For an ack specifically the loss is harmless — the worker
+    retries and the second submission is a `DUPLICATE`.
+    """
+    try:
+        async with session.send_lock:
+            await session.websocket.send_text(json.dumps(envelope.to_dict()))
+        return True
+    except Exception as exc:  # noqa: BLE001 — a dead socket is a normal outcome here
+        logger.warning(
+            "task_result_ack_send_failed",
+            extra={"worker_id": session.worker_id, "detail": str(exc)},
+        )
+        return False
+
+
+async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> None:
+    """`RUNNING -> COMPLETED`, with the result persisted (Phase 2.5).
+
+    This is what finally completes a task. Step 2.4 computed results and
+    threw them away (Decision #98), so every successful task in M2 stopped
+    at `RUNNING`; from here a success submits an envelope, the coordinator
+    validates and stores it, and the task reaches its terminal state.
+
+    **Three things happen here and their order is deliberate.**
+
+    1. **Validate before touching the database.** `results.validate` is
+       pure, so a malformed submission is refused having written nothing at
+       all — which is the whole of the "malformed results are rejected
+       without corrupting task state" criterion. Oversize is *not*
+       malformed and is truncated rather than refused; see `app.results`.
+    2. **Persist and complete atomically.** `task_queue.complete_task` does
+       both inside one `FOR UPDATE` lock, so a completed task always has its
+       result and a stored result is always pointed at.
+    3. **Release the credit, then acknowledge.** The credit goes back on
+       every outcome except `NOT_OWNER` and `NOT_FOUND` — the same rule
+       `handle_task_failed` uses and for the same §12 reason: naming another
+       worker's task must never be a way to draw down your own credits.
+       Otherwise the slot genuinely is free, and holding the credit over a
+       *rejected* result would cost the worker capacity for the life of the
+       session.
+
+    **The ack is always definitive**, whether or not the result landed. A
+    worker retries a pending result until it is acknowledged (the "finishes
+    during a brief coordinator outage" criterion), so an ack that only ever
+    meant success would leave a malformed result retrying forever — the
+    worker punishing itself for an answer that will never change. `accepted`
+    tells it whether the result was stored; either way it stops.
+
+    A task left `RUNNING` by a rejection stays visible for Phase 3, exactly
+    like a task stranded `ASSIGNED` by a refusal.
+    """
+    payload = message.get("payload") or {}
+    correlation_id = str(message.get("correlation_id") or "")
+    raw_task_id = str(payload.get("task_id") or "")
+
+    try:
+        envelope = validate_result(payload, max_bytes=task_result_max_bytes())
+    except MalformedResult as exc:
+        TASK_RESULTS.labels("rejected").inc()
+        # The slot is free, but **only release it if the message names a task
+        # this session actually delivered.** A malformed result may carry no
+        # task id at all, or a garbage one, and `_release_credit` cannot tell
+        # those apart from a legitimate id: an empty string takes its unnamed
+        # best-effort branch and pops an arbitrary held credit, and an
+        # unrecognised string draws down the reconnect residue. Either would
+        # free the slot of a task that is genuinely still running, on the say-so
+        # of a message the coordinator has just rejected as not being a result
+        # (§12). Same discipline as `NOT_OWNER`/`NOT_FOUND` on the failure path:
+        # if the report cannot identify a slot, it releases none.
+        if raw_task_id and raw_task_id in session.credited:
+            _release_credit(session, raw_task_id)
+        session.current_tasks.pop(raw_task_id, None)
+        session.saturated = False
+        await _publish_current_tasks(session)
+        _refresh_in_flight_gauge()
+        logger.warning(
+            "task_result_rejected",
+            extra={
+                "task_id": raw_task_id,
+                "worker_id": session.worker_id,
+                "correlation_id": correlation_id,
+                "reason_code": exc.reason_code,
+                # The reason, never the body: a result payload is caller
+                # data and must not reach a log (§12).
+                "detail": exc.detail,
+            },
+        )
+        await _send_to_session(
+            session,
+            Envelope(
+                message_type="task_result_ack",
+                worker_id=session.worker_id,
+                session_epoch=session.session_epoch,
+                correlation_id=correlation_id,
+                payload={
+                    "task_id": raw_task_id,
+                    "accepted": False,
+                    "outcome": "rejected",
+                    "reason_code": exc.reason_code,
+                },
+            ),
+        )
+        notify_local()
+        return
+
+    task_id = envelope["task_id"]
+    async with get_session() as db:
+        outcome = await complete_task(db, envelope=envelope, worker_id=session.worker_id)
+        if outcome == TRANSITIONED:
+            await db.commit()
+
+    if outcome not in (NOT_OWNER, NOT_FOUND):
+        _release_credit(session, task_id)
+        session.current_tasks.pop(task_id, None)
+        session.saturated = False
+        await _publish_current_tasks(session)
+        _refresh_in_flight_gauge()
+
+    TASK_RESULTS.labels(outcome).inc()
+    if outcome == TRANSITIONED:
+        TASKS_COMPLETED.inc()
+        RESULT_SIZE_BYTES.observe(envelope["size_bytes"])
+        logger.info(
+            "task_completed",
+            extra={
+                "task_id": task_id,
+                "worker_id": session.worker_id,
+                "correlation_id": correlation_id,
+                "duration_seconds": envelope["duration_seconds"],
+                "result_size_bytes": envelope["size_bytes"],
+                "result_truncated": envelope["truncated"],
+                # Recorded, enforced by nothing in M2 — Phase 3's handles.
+                "attempt_number": envelope["attempt_number"],
+                "session_epoch": envelope["session_epoch"],
+                "idempotency_token": envelope["idempotency_token"],
+            },
+        )
+    else:
+        logger.warning(
+            "task_result_not_applied",
+            extra={
+                "task_id": task_id,
+                "worker_id": session.worker_id,
+                "correlation_id": correlation_id,
+                "outcome": outcome,
+            },
+        )
+
+    await _send_to_session(
+        session,
+        Envelope(
+            message_type="task_result_ack",
+            worker_id=session.worker_id,
+            session_epoch=session.session_epoch,
+            correlation_id=correlation_id,
+            payload={
+                "task_id": task_id,
+                # A duplicate is a success from the worker's side: the task
+                # is completed and there is nothing left to retry.
+                "accepted": outcome in (TRANSITIONED, DUPLICATE),
+                "outcome": outcome,
+            },
+        ),
+    )
+    notify_local()
+
+
 def current_tasks_key(worker_id: str) -> str:
     return f"worker:{worker_id}:current_tasks"
 
@@ -721,6 +912,12 @@ async def _deliver(session: LocalSession, task: dict[str, Any]) -> bool:
             "payload": task["payload"],
             "priority": task["priority"],
             "assigned_at": task["assigned_at"].isoformat(),
+            # Phase 2.5: which attempt this is, so the worker can echo it
+            # back in the result envelope. **Always 0 through all of M2** —
+            # `attempt_count` is a Phase 3 column and nothing writes it — but
+            # it is on the wire from day one, so Phase 3's retry engine
+            # changes a number rather than a protocol.
+            "attempt": task.get("attempt_count", 0),
         },
     )
 
