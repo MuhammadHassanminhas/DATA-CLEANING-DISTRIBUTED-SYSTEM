@@ -636,6 +636,88 @@ scope, and it is live cluster configuration. **Resolve it before Step 2.9**,
 whose exit criteria count tasks end to end — a worker that silently parks
 every task it is given makes those counts unreadable.
 
+### RESOLVED 2026-07-31 — Decision #121, the manifest is now in the chart
+
+**Fixed in the repository; the live cutover is a one-time manual step and
+has NOT been performed** (§10 — this is a code change, not a verified
+deployment).
+
+`demo-worker.yaml` is deleted from the repo root. The Deployment is now
+`infra/helm/platform/templates/demo-worker.yaml`, gated on
+`demoWorker.enabled` (default `false`, `true` in `values-staging.yaml`), and
+`_deploy-env.yml` passes `--set demoWorker.image.tag="$SHA"` alongside the
+coordinator and dashboard tags. **The drift class is closed rather than the
+one instance of it:** the tag now comes from the deployed SHA on every
+rollout, so it cannot fall behind again.
+
+Three things changed with the move, each for a reason:
+
+1. **CPU limit `100m` → `500m`.** The old limit throttled a ceiling
+   `hash_rounds` task hard. Worst-case namespace draw at the coordinator's
+   HPA ceiling of 5 is now **2900m against the `limits.cpu: 3` quota** —
+   it fits, with 100m of headroom. That is tight and is recorded as such.
+2. **`WORKER_MAX_CONCURRENT: 1`**, explicit. The worker's default is 4, and
+   it declares that number as credits, so a 0.5-core pod would claim four
+   CPU tasks it cannot serve. Raise it only with the CPU limit.
+3. **`WORKER_AGENT_VERSION` carries the deployed SHA** (`demo-worker-<sha>`)
+   instead of the fixed string `demo-worker-1`, so any future drift is
+   visible on the dashboard rather than needing a `kubectl` to find. The
+   original drift went unnoticed across four steps for exactly that reason.
+
+**One-time cutover — PERFORMED 2026-07-31.** The hand-applied Deployment was
+deleted from `staging`:
+
+```powershell
+kubectl -n staging delete deployment demo-worker
+```
+
+Its unmanaged status was **confirmed on the live object before deleting it**,
+not assumed: no `app.kubernetes.io/managed-by: Helm` label, no `meta.helm.sh/*`
+annotations, and a `kubectl.kubernetes.io/last-applied-configuration`
+annotation. Helm would have refused to adopt it and the `--atomic` deploy
+would have rolled back. **The drift was worse than the repo suggested** — the
+running image was `b1963f90`, while the deleted root manifest pinned
+`0df7e206`, so the manifest had drifted from the cluster as well as from `main`.
+
+Verified after the delete: zero `demo-worker` pods, `coordinator 3/3`,
+`dashboard 1/1`, `redis 1/1` still healthy, and public `/health` returns
+`1cdaff2a32ab75ab824889e982917c21dfc55037` over a validated certificate.
+
+A **server-side dry run** of the chart against the live `staging` namespace
+then rendered the Deployment at the release's own SHA with no ownership
+conflict and no quota rejection:
+
+```powershell
+helm upgrade --install platform infra/helm/platform -n staging `
+  --values infra/helm/platform/values-staging.yaml `
+  --set coordinator.image.tag=$SHA --set dashboard.image.tag=$SHA `
+  --set demoWorker.image.tag=$SHA --dry-run=server
+```
+
+**What this does NOT mean (§10): staging currently has NO demo worker.** The
+dry run applied nothing, and the chart change is not merged, so nothing
+recreates it until this lands on `main` and CD deploys. That is the intended
+order — delete, then let CD create the managed copy — but until then the
+staging fleet has only whatever external workers are connected. Confirm the
+managed copy after the next deploy with:
+
+```powershell
+kubectl -n staging get deploy demo-worker -o json | ConvertFrom-Json | ForEach-Object { $_.spec.template.spec.containers[0].image; $_.metadata.labels }
+```
+
+The image tag must equal the deployed SHA and the labels must include
+`app.kubernetes.io/managed-by: Helm`.
+
+**Regression check after the change: `253 passed`, `ruff` clean.** Run in a
+`python:3.12-slim` container against ephemeral Postgres 16 / Redis 7 with
+CI's environment, so it matches CI's posture rather than the host's Python
+3.14. Same count as the Step 2.5 baseline — the chart change touches no
+application code, and this confirms it.
+
+**Not changed:** the worker still writes its identity file to the container
+filesystem, so a rescheduled pod registers as a new `worker_id`. Pre-existing
+behaviour, unrelated to the drift, and noise rather than a fault.
+
 ---
 
 ## Step 2.5 — Result submission and completion
