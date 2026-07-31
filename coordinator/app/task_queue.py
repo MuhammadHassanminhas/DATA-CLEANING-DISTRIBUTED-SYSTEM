@@ -34,6 +34,7 @@ queue is the Phase 3 `REASSIGNED` transition and is not invented here.
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -43,7 +44,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Task
 from app.task_states import (
     ASSIGNED,
+    COMPLETED,
     QUEUED,
+    RUNNING,
     InvalidTaskTransition,
     check_transition,
 )
@@ -165,6 +168,14 @@ async def enqueue_batch(
 # crash between "claimed" and "assigned" is impossible — there is no
 # between.
 #
+# `attempt_count` is **read** in the RETURNING list from Phase 2.5 so the
+# assignment can tell the worker which attempt it is running, and the
+# worker can echo it back in the result envelope (a 2.5 exit criterion:
+# the field is on the wire from day one so Phase 3 adds no protocol
+# change). Reading it is not writing it — it stays 0 through all of M2,
+# which is the Phase 2.1 criterion, and there is a test asserting exactly
+# that.
+#
 # `updated_at` is set explicitly because the model's `onupdate=func.now()`
 # is a SQLAlchemy ORM-level hook and does not fire for raw SQL.
 def _dequeue_sql(type_filter: str) -> str:
@@ -185,7 +196,7 @@ def _dequeue_sql(type_filter: str) -> str:
     FROM claimed
     WHERE t.id = claimed.id
     RETURNING t.id, t.task_type, t.parameters, t.payload, t.priority,
-              t.correlation_id, t.assigned_at
+              t.correlation_id, t.assigned_at, t.attempt_count
     """
 
 
@@ -270,6 +281,11 @@ NOOP = "noop"
 NOT_FOUND = "not_found"
 NOT_OWNER = "not_owner"
 ILLEGAL = "illegal"
+# Phase 2.5. Distinct from NOOP because the caller must treat them
+# differently: a duplicate result submission is a **success** from the
+# worker's point of view — the task is completed, so the worker should stop
+# retrying — whereas NOOP is a state report that changed nothing.
+DUPLICATE = "duplicate"
 
 
 async def mark_status(
@@ -336,6 +352,162 @@ async def mark_status(
         {"status": new_status, "id": str(parsed)},
     )
     return TRANSITIONED
+
+
+async def complete_task(
+    session: AsyncSession,
+    *,
+    envelope: dict[str, Any],
+    worker_id: uuid.UUID | str,
+) -> str:
+    """Persist a result and complete its task, in one transaction (Phase 2.5).
+
+    Does not commit — the caller owns the transaction boundary, exactly as
+    `dequeue` and `mark_status` do.
+
+    **Both writes or neither.** The result row and the task's move to
+    `COMPLETED` happen inside the same `FOR UPDATE` lock, so there is no
+    window in which a task is completed with no result, or a result exists
+    that nothing points at. That is the whole reason this is one function
+    and not `mark_status` plus a separate insert.
+
+    **Idempotency is structural, not clamped** (§3.7). The row is locked
+    before its status is read; a task already `COMPLETED` returns
+    `DUPLICATE` having written nothing at all — not a second result row, not
+    a re-stamped `completed_at`. Two coordinator replicas processing the
+    same retried submission serialise on that lock, so the second one sees
+    `COMPLETED` and stops. The `idempotency_token` in the envelope is
+    therefore **recorded, not enforced** in M2: the task's own terminal
+    state is what makes a duplicate a no-op, and the token is what lets
+    Phase 3 tell a retry apart from a genuinely second attempt.
+
+    **A missing `RUNNING` is walked through, not widened.** A result can
+    arrive for a task still `ASSIGNED` — the `task_started` report is a
+    separate message and can be lost to a socket that died between the two.
+    Rather than adding `ASSIGNED -> COMPLETED` to the state machine (which
+    would make "completed without ever running" legal everywhere, forever,
+    to serve one lossy edge), the task is moved through `RUNNING` first.
+    Two legal transitions, no new edge, and the audit trail still says the
+    task ran.
+    """
+    task_id = str(envelope["task_id"])
+    try:
+        parsed = uuid.UUID(task_id)
+    except (ValueError, AttributeError):
+        return NOT_FOUND
+
+    row = (
+        await session.execute(
+            text(
+                "SELECT status, assigned_worker_id FROM tasks "
+                "WHERE id = CAST(:id AS uuid) FOR UPDATE"
+            ),
+            {"id": str(parsed)},
+        )
+    ).mappings().one_or_none()
+    if row is None:
+        return NOT_FOUND
+    if str(row["assigned_worker_id"]) != str(worker_id):
+        return NOT_OWNER
+
+    current = row["status"]
+    if current == COMPLETED:
+        return DUPLICATE
+
+    # ASSIGNED needs the RUNNING hop; RUNNING goes straight through. Every
+    # step is checked, so an already-terminal task (FAILED, CANCELLED) is
+    # refused here rather than silently overwritten.
+    path = [RUNNING, COMPLETED] if current == ASSIGNED else [COMPLETED]
+    state = current
+    try:
+        for target in path:
+            check_transition(state, target)
+            state = target
+    except InvalidTaskTransition:
+        return ILLEGAL
+
+    result_id = uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO task_results (id, payload, size_bytes, submitted_at) "
+            "VALUES (CAST(:id AS uuid), CAST(:payload AS jsonb), :size_bytes, now())"
+        ),
+        {
+            "id": str(result_id),
+            "payload": json.dumps(envelope),
+            "size_bytes": int(envelope["size_bytes"]),
+        },
+    )
+    # `completed_at` is stamped here and nowhere else — Step 2.4 deliberately
+    # left it alone, including on failure, because it means "this task
+    # produced a result", not "this task stopped moving".
+    await session.execute(
+        text(
+            "UPDATE tasks SET status = :status, result_id = CAST(:result_id AS uuid), "
+            "completed_at = now(), updated_at = now() WHERE id = CAST(:id AS uuid)"
+        ),
+        {"status": COMPLETED, "result_id": str(result_id), "id": str(parsed)},
+    )
+    return TRANSITIONED
+
+
+async def get_task(session: AsyncSession, task_id: str) -> dict[str, Any] | None:
+    """One task with its result envelope, or None (Phase 2.5).
+
+    The minimum read that makes "execution duration recorded and visible"
+    verifiable rather than asserted. It is a **primitive**, in the same
+    sense `POST /tasks/dequeue` was kept as one in Step 2.2: Step 2.6 owns
+    the operator task API with filtering, batch views and full lifecycle
+    history, and will build on this rather than around it.
+    """
+    try:
+        parsed = uuid.UUID(str(task_id))
+    except (ValueError, AttributeError):
+        return None
+
+    row = (
+        await session.execute(
+            text(
+                "SELECT t.id, t.task_type, t.status, t.priority, t.assigned_worker_id, "
+                "t.assigned_at, t.completed_at, t.created_at, t.updated_at, "
+                "t.attempt_count, t.correlation_id, t.result_id, "
+                "r.payload AS result_payload, r.size_bytes AS result_size_bytes, "
+                "r.submitted_at AS result_submitted_at "
+                "FROM tasks t LEFT JOIN task_results r ON r.id = t.result_id "
+                "WHERE t.id = CAST(:id AS uuid)"
+            ),
+            {"id": str(parsed)},
+        )
+    ).mappings().one_or_none()
+    return dict(row) if row is not None else None
+
+
+async def purge_expired_results(session: AsyncSession, *, retention_days: int) -> int:
+    """Delete result **bodies** past the retention period. Does not commit.
+
+    Returns how many rows went. Only `task_results` is touched: the `tasks`
+    row survives as the permanent audit trail and its `result_id` becomes
+    NULL through the existing `ON DELETE SET NULL`, which is why retention
+    needs no second write and no application-side bookkeeping.
+
+    `retention_days <= 0` disables the sweep and deletes nothing, so
+    switching retention off is a configuration change rather than a code
+    path that has to be remembered.
+
+    Every replica runs this. The DELETE is idempotent and row-scoped, so
+    concurrent sweeps race harmlessly — no leader election, consistent with
+    §3.9 and with how the assignment engine already runs per replica.
+    """
+    if retention_days <= 0:
+        return 0
+    result = await session.execute(
+        text(
+            "DELETE FROM task_results "
+            "WHERE submitted_at < now() - make_interval(days => :days)"
+        ),
+        {"days": retention_days},
+    )
+    return int(result.rowcount or 0)
 
 
 async def queue_depth(session: AsyncSession) -> int:

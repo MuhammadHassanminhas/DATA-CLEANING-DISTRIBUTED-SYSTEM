@@ -73,6 +73,23 @@ it is not executing.** There is no local queue. A worker with no free slot
 *refuses* the assignment (Decision #101), because a local backlog would
 be the worker making a scheduling decision, which §3.2/§3.3 reserve for
 the coordinator.
+
+Phase 2.5: the worker submits results. A completed task now builds a
+result envelope — task id, attempt number, session epoch, status, body,
+execution duration, idempotency token — and holds it in a **bounded**
+pending buffer until the coordinator acknowledges it, retrying with the
+same full-jitter backoff the reconnect path uses.
+
+That buffer is the one place Step 2.4's "no worker-side state" rule bends,
+and it bends deliberately rather than by accident. A result is the only
+message carrying data nothing else can reconstruct: a lost progress sample
+is nothing, a lost `capacity` is recovered by the next `hello`, a lost
+result is work done and thrown away. So it is kept — bounded at
+`MAX_PENDING_RESULTS`, never written to disk, and abandoned openly on
+shutdown rather than persisted, because a worker that survives its own
+restart with state is not stateless (§3.6). The invariant above is
+untouched: the buffer holds *finished* work, the slot is already free, and
+`tasks_in_flight` still counts only what is executing.
 """
 
 from __future__ import annotations
@@ -179,6 +196,61 @@ PROGRESS_INTERVAL_SECONDS = float(os.environ.get("WORKER_PROGRESS_INTERVAL_SECON
 # again, `unsupported_task_type` frees a single credit.
 REFUSE_AT_CAPACITY = "at_capacity"
 REFUSE_UNSUPPORTED_TYPE = "unsupported_task_type"
+
+# Phase 2.5 result submission. Full-jitter backoff again (same algorithm as
+# the reconnect backoff below and for the same herd reason: a coordinator
+# coming back after an outage faces every worker's pending results at once).
+# **Recommendations, not measured values** (§10). The base is seconds rather
+# than sub-second because a result is submitted immediately on completion —
+# this loop is only the *retry* path, so its cadence costs nothing in the
+# normal case and a tight retry would only hammer a coordinator that is
+# already having a bad time.
+RESULT_RETRY_BASE_SECONDS = float(os.environ.get("WORKER_RESULT_RETRY_BASE_SECONDS", "5"))
+RESULT_RETRY_FACTOR = float(os.environ.get("WORKER_RESULT_RETRY_FACTOR", "2"))
+RESULT_RETRY_MAX_SECONDS = float(os.environ.get("WORKER_RESULT_RETRY_MAX_SECONDS", "60"))
+
+# How long a result that was just sent is left alone before it is retried.
+# Recommendation, not a measured value.
+#
+# **This exists because of a defect a live run found, not review** (Decision
+# #116). A completing task submits its result immediately *and* records it as
+# pending, which wakes the retry loop; the loop then found a pending result
+# that had been on the wire for a millisecond and sent it again. Both landed,
+# the second as a harmless `duplicate` — idempotency did its job — so nothing
+# broke and nothing in the tests failed. What it cost was the wire: every
+# result went twice, and for a full-size `opaque_payload` echo that is 87 KB
+# sent twice per task, fleet-wide.
+#
+# A send is void the moment its socket dies, so `attach` clears these
+# timestamps on reconnect and recovery stays immediate.
+RESULT_ACK_GRACE_SECONDS = float(os.environ.get("WORKER_RESULT_ACK_GRACE_SECONDS", "10"))
+
+# How many unacknowledged results this worker will hold. Recommendation,
+# not a measured value.
+#
+# Step 2.4 shipped with **no** buffer at all and said so plainly (Decision
+# #98): a report with no live session was dropped, because a buffer is
+# worker-side state with nothing to release it if the process dies. Step
+# 2.5's "finishes during a brief coordinator outage and succeeds on
+# reconnect" criterion is what makes the buffer necessary — but the reason
+# not to have one has not gone away, so it is bounded. At the cap the
+# **oldest** pending result is dropped and logged loudly; its task stays
+# RUNNING in the coordinator, visible, and is Phase 3's to reclaim. Dropping
+# the oldest rather than refusing the newest is deliberate: the oldest is the
+# one most likely to have already been superseded by a reassignment.
+MAX_PENDING_RESULTS = int(os.environ.get("WORKER_MAX_PENDING_RESULTS", "64"))
+
+# Worker-side ceiling on one result envelope, mirroring the coordinator's
+# `TASK_RESULT_MAX_BYTES`. Enforced on both sides on purpose: this one keeps
+# an oversize frame off the wire entirely (the "large result payloads
+# handled without breaking the connection" criterion is about the transport,
+# not just the database), and the coordinator's keeps a lying worker from
+# writing one anyway (§12).
+MAX_RESULT_BYTES = int(os.environ.get("WORKER_MAX_RESULT_BYTES", str(128 * 1024)))
+
+# The status a successful result carries. Failure has its own message
+# (`task_failed`, Decision #102) and does not come through here.
+RESULT_STATUS_COMPLETED = "COMPLETED"
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 logger = logging.getLogger("worker")
@@ -383,6 +455,21 @@ class RunningTask:
     progress: list[float] = field(default_factory=lambda: [0.0])
     cancel: threading.Event = field(default_factory=threading.Event)
     last_reported: float | None = None
+    # Phase 2.5 result-envelope fields, captured at admission rather than at
+    # completion, and that timing is the point for two of them:
+    #
+    # * `attempt` and `session_epoch` describe the attempt that *ran*. A task
+    #   outlives its session (Decision #97), so reading the epoch when the
+    #   result is submitted would record the session that happened to be live
+    #   at the end — which is not the one that executed it, and is precisely
+    #   the distinction Phase 3 needs to spot a stale result.
+    # * `idempotency_token` is minted once, here, so every retry of the same
+    #   result carries the same token. A token generated at submission time
+    #   would be new on each retry, which is the opposite of what a token is
+    #   for.
+    attempt: int = 0
+    session_epoch: int = 0
+    idempotency_token: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class TaskRunner:
@@ -416,12 +503,70 @@ class TaskRunner:
         # The socket to report on *right now*, rebound on every reconnect.
         self._ws = None
         self._send_lock: asyncio.Lock | None = None
+        # Phase 2.5. The epoch of the session that is live now, stamped onto
+        # each task at admission so the result records the attempt that ran.
+        self.session_epoch = 0
+        # Results computed but not yet acknowledged by the coordinator, oldest
+        # first. **This is the only worker state that outlives a task**, and
+        # it is bounded for that reason — see `MAX_PENDING_RESULTS`.
+        self.pending_results: dict[str, dict] = {}
+        # task_id -> when it was last put on the wire. Kept beside
+        # `pending_results` rather than inside the envelope because the
+        # envelope is persisted verbatim as the result body, and when a send
+        # happened is this worker's business, not the coordinator's.
+        self.result_sent_at: dict[str, float] = {}
+        # Set whenever there is something to submit, so the retry loop can
+        # park instead of polling and can be woken the instant a session comes
+        # back — which is what makes the "brief outage" recovery immediate
+        # rather than up to one backoff interval late.
+        self.results_pending = asyncio.Event()
 
     @property
     def tasks_in_flight(self) -> int:
+        """Tasks **executing**, which deliberately excludes results waiting to
+        be submitted.
+
+        A finished-but-unsubmitted task is not occupying a slot: its thread is
+        back in the pool and the worker can take new work. Counting it here
+        would understate this worker's capacity for as long as the coordinator
+        was unreachable, which is exactly the wrong direction.
+        """
         return len(self.running)
 
-    def attach(self, ws, send_lock: asyncio.Lock) -> None:
+    def record_result(self, task_id: str, envelope: dict) -> None:
+        """Queue one result for submission, evicting the oldest at the cap."""
+        while len(self.pending_results) >= MAX_PENDING_RESULTS:
+            dropped, _ = next(iter(self.pending_results.items()))
+            del self.pending_results[dropped]
+            _log(
+                "task_result_buffer_overflow",
+                task_id=dropped,
+                pending=len(self.pending_results),
+                cap=MAX_PENDING_RESULTS,
+            )
+        self.pending_results[task_id] = envelope
+        self.results_pending.set()
+
+    def result_acknowledged(self, task_id: str) -> bool:
+        """Drop a pending result the coordinator has answered for.
+
+        Called for a **rejection** as well as an acceptance: a malformed
+        result is malformed on every attempt, so continuing to retry it would
+        be the worker punishing itself for an answer that will never change.
+        The coordinator leaves such a task RUNNING for Phase 3.
+        """
+        existed = self.pending_results.pop(task_id, None) is not None
+        self.result_sent_at.pop(task_id, None)
+        if not self.pending_results:
+            self.results_pending.clear()
+        return existed
+
+    def awaiting_ack(self, task_id: str) -> bool:
+        """Whether this result was sent recently enough to still expect an ack."""
+        sent = self.result_sent_at.get(task_id)
+        return sent is not None and (time.monotonic() - sent) < RESULT_ACK_GRACE_SECONDS
+
+    def attach(self, ws, send_lock: asyncio.Lock, session_epoch: int = 0) -> None:
         """Point completion reports at the session that is live now.
 
         This exists because of a defect a live reconnect test found, and it
@@ -436,6 +581,18 @@ class TaskRunner:
         """
         self._ws = ws
         self._send_lock = send_lock
+        self.session_epoch = session_epoch
+        # Anything sent on the previous socket is void — it either arrived and
+        # was acknowledged (and is no longer pending) or it did not. Clearing
+        # these means the new session retries immediately instead of waiting
+        # out a grace period earned on a socket that no longer exists.
+        self.result_sent_at.clear()
+        # A reconnect is the moment pending results become deliverable again.
+        # Waking the retry loop here is what turns "retries and succeeds on
+        # reconnect" into a sub-second recovery rather than one that waits out
+        # whatever backoff tier the loop had climbed to.
+        if self.pending_results:
+            self.results_pending.set()
 
     def detach(self) -> None:
         self._ws = None
@@ -444,13 +601,18 @@ class TaskRunner:
     async def report(self, envelope: Envelope) -> bool:
         """Send a report on the current session, or drop it.
 
-        Dropping is safe, and specifically it is safe for `capacity`: a task
-        that finished while the worker was disconnected is already out of
-        `running`, so the next `hello` declares a `tasks_in_flight` that
-        excludes it, and the credit is released by that count rather than by
-        this message. The reconnect handshake *is* the fallback path — there
-        is no need for a report buffer, and a buffer would be worker-side
-        state with nothing to release it if the process died.
+        Dropping is safe for a **state or telemetry** report, which is all
+        this carried in Step 2.4: a task that finished while the worker was
+        disconnected is already out of `running`, so the next `hello` declares
+        a `tasks_in_flight` that excludes it, and the credit is released by
+        that count rather than by this message. The reconnect handshake *is*
+        the fallback path for those.
+
+        A **result** is the one thing that cannot simply be dropped — it is
+        the only message carrying data nothing else can reconstruct. That is
+        why Step 2.5 adds `pending_results` and a retry loop on top of this,
+        rather than changing what this does: the send still fails quietly, and
+        the retry is what makes it eventually arrive.
         """
         if self._ws is None or self._send_lock is None:
             _log("task_report_dropped_no_session", message_type=envelope.message_type)
@@ -471,6 +633,22 @@ class TaskRunner:
     def shutdown(self) -> None:
         self.cancel_all()
         self.pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _coerce_int(value: object, default: int = 0) -> int:
+    """Read an integer the coordinator sent, without trusting its shape.
+
+    The coordinator is not untrusted the way a worker is, but a field that
+    only became non-zero in Phase 3 is exactly the kind of thing that arrives
+    absent, null, or as a string from an older or newer peer. A default beats
+    a `TypeError` in the middle of admission control.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 async def _send(ws, send_lock: asyncio.Lock, envelope: Envelope) -> bool:
@@ -532,6 +710,150 @@ async def _refuse_task(
     )
 
 
+def _build_result_envelope(task: RunningTask, result: object, duration: float) -> dict:
+    """The Phase 2.5 result envelope, capped before it reaches the wire.
+
+    Every field the step's exit criteria name is here from day one, including
+    the two nothing enforces in M2 (`attempt_number`, `session_epoch`) and the
+    token that makes a retry distinguishable from a second attempt — so Phase
+    3 adds enforcement rather than a protocol version.
+
+    **Oversize is truncated, never dropped and never grown.** The task
+    genuinely completed, so refusing to report it would strand real work over
+    a payload size; sending it anyway is what "breaks the connection" in the
+    criterion's own words. So the body goes and the envelope stays, carrying
+    the size it would have been. The coordinator re-checks the same cap on
+    receipt, because this worker is untrusted (§12) and this check runs inside
+    it.
+    """
+    envelope = {
+        "task_id": task.task_id,
+        "status": RESULT_STATUS_COMPLETED,
+        "attempt_number": task.attempt,
+        "session_epoch": task.session_epoch,
+        "idempotency_token": task.idempotency_token,
+        "duration_seconds": round(duration, 3),
+        "result": result,
+        "truncated": False,
+    }
+    encoded = json.dumps(envelope, default=str, separators=(",", ":"))
+    size = len(encoded.encode("utf-8"))
+    if size > MAX_RESULT_BYTES:
+        envelope["result"] = None
+        envelope["truncated"] = True
+        envelope["original_size_bytes"] = size
+        _log(
+            "task_result_truncated",
+            task_id=task.task_id,
+            original_size_bytes=size,
+            cap_bytes=MAX_RESULT_BYTES,
+            correlation_id=task.correlation_id,
+        )
+    return envelope
+
+
+async def _submit_result(identity: dict, runner: TaskRunner, task_id: str) -> bool:
+    """Send one pending result on the live session. Returns whether it went.
+
+    It stays pending until the coordinator's `task_result_ack` arrives — a
+    successful *send* is not a successful *submission*, because a coordinator
+    that dies between reading the frame and committing the row would
+    otherwise lose the result silently. The `idempotency_token` and the task's
+    own terminal state are what make the resulting retry harmless (§3.7).
+    """
+    envelope = runner.pending_results.get(task_id)
+    if envelope is None:
+        return False
+    sent = await runner.report(
+        Envelope(
+            message_type="task_result",
+            worker_id=identity["worker_id"],
+            correlation_id=envelope.get("correlation_id") or task_id,
+            payload={k: v for k, v in envelope.items() if k != "correlation_id"},
+        )
+    )
+    if sent:
+        runner.result_sent_at[task_id] = time.monotonic()
+    return sent
+
+
+async def _result_submission_loop(
+    identity: dict, runner: TaskRunner, stop_event: asyncio.Event
+) -> None:
+    """Retry unacknowledged results until they land (Phase 2.5).
+
+    **Process-level, like the runner itself and for the same reason.** A
+    session-scoped loop would die with the socket, which is precisely the
+    moment the retries start mattering — the exit criterion is about a worker
+    that finishes *during* an outage.
+
+    It parks on `results_pending` when there is nothing owed, so an idle
+    worker costs no wakeups, and `attach` sets that event on reconnect so
+    recovery is immediate rather than a backoff tier late.
+    """
+    failures = 0
+    while not stop_event.is_set():
+        # Cleared before the work, not after: a result recorded *during* this
+        # pass must leave the event set so the wait below returns immediately
+        # rather than sleeping through it.
+        runner.results_pending.clear()
+
+        if not runner.pending_results:
+            failures = 0
+            delay = RESULT_RETRY_MAX_SECONDS
+        else:
+            delivered = 0
+            waiting = 0
+            for task_id in list(runner.pending_results):
+                if runner.awaiting_ack(task_id):
+                    # Already on the wire and still inside its grace period.
+                    # Resending now is what put every result on the wire twice
+                    # before Decision #116.
+                    waiting += 1
+                    continue
+                if await _submit_result(identity, runner, task_id):
+                    delivered += 1
+                else:
+                    # No session, or a socket that just died. Everything after
+                    # this one would fail the same way.
+                    break
+
+            # Waiting for an ack is not a failure, so it must not climb the
+            # backoff — but the loop does have to come back once the grace
+            # period is up, which is what the floor below is for.
+            failures = 0 if (delivered or waiting) else failures + 1
+            delay = _full_jitter(
+                failures, RESULT_RETRY_BASE_SECONDS, RESULT_RETRY_FACTOR, RESULT_RETRY_MAX_SECONDS
+            )
+            if waiting and not delivered:
+                delay = max(delay, RESULT_ACK_GRACE_SECONDS)
+            if delivered or failures:
+                _log(
+                    "task_result_retry_scheduled",
+                    worker_id=identity["worker_id"],
+                    pending=len(runner.pending_results),
+                    delivered=delivered,
+                    awaiting_ack=waiting,
+                    consecutive_failures=failures,
+                    delay_seconds=round(delay, 2),
+                )
+
+        # **Both branches park on the same event, and that is the fix for a
+        # defect a live outage test found** (Decision #117). This used to wait
+        # on `stop_event` while only the idle branch waited on
+        # `results_pending`, so `attach` setting the event on reconnect woke
+        # nothing: the loop was already inside a backoff sleep it had climbed
+        # to during the outage, and the result sat undelivered for up to a
+        # full `RESULT_RETRY_MAX_SECONDS` after the coordinator was back. The
+        # retry still worked, so nothing failed — it was just slow in exactly
+        # the scenario the criterion is about. Shutdown cancels this task, so
+        # nothing is owed to `stop_event` here.
+        try:
+            await asyncio.wait_for(runner.results_pending.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _execute_task(
     identity: dict,
     runner: TaskRunner,
@@ -540,19 +862,21 @@ async def _execute_task(
 ) -> None:
     """Run one task in the pool and report what happened.
 
-    The result is computed and **discarded** (Decision #98) — the result
-    envelope, its persistence and its retry are Step 2.5's, and a buffer
-    built here would be half of 2.5 with none of its design, as well as the
-    one thing that breaks the flat-memory criterion. What survives is a
-    12-hex fingerprint in the log (Decision #106): deterministic, so a live
-    run can be checked against a known-answer vector, and disclosing
-    nothing about the bytes, because `opaque_payload` echoes caller-supplied
-    data and payload data must never reach a log (§12).
+    Step 2.4 computed the result and threw it away (Decision #98). Step 2.5
+    is where it is kept: a success now builds a result envelope, records it as
+    pending, and submits it. The 12-hex fingerprint stays in the log
+    (Decision #106) because it is still the thing a live run is checked
+    against, and it still discloses nothing about the bytes — `opaque_payload`
+    echoes caller-supplied data, and payload data must never reach a log
+    (§12).
 
     Three outcomes, three different reports:
 
-    * success  → `capacity`, releasing the credit. The task row stays
-      `RUNNING` until Step 2.5 writes a result and completes it.
+    * success  → `task_result`. It carries the credit release **implicitly**:
+      the coordinator frees the slot when it processes the result, so no
+      separate `capacity` is sent. Sending both would be a second release for
+      the same task — harmless, since a keyed release is exactly-once, but it
+      would put the credit accounting on two messages instead of one.
     * raised   → `task_failed` carrying the **exception type only**, never
       a message and never a traceback (Decision #102, §12).
     * cancelled → nothing. The worker is shutting down and the socket is
@@ -594,23 +918,25 @@ async def _execute_task(
             )
         )
     else:
+        duration = time.monotonic() - task.started_at
         _log(
             "task_execution_completed",
             worker_id=identity["worker_id"],
             task_id=task.task_id,
             task_type=task.task_type,
-            elapsed_seconds=round(time.monotonic() - task.started_at, 3),
+            elapsed_seconds=round(duration, 3),
             result_fingerprint=executors.fingerprint(result),
             correlation_id=task.correlation_id,
         )
-        await runner.report(
-            Envelope(
-                message_type="capacity",
-                worker_id=identity["worker_id"],
-                correlation_id=task.correlation_id,
-                payload={"task_id": task.task_id, "freed": 1},
-            )
-        )
+        envelope = _build_result_envelope(task, result, duration)
+        # The correlation id travels beside the envelope rather than inside
+        # it: it belongs to the *message* (§11), and the envelope is what gets
+        # persisted verbatim as the result body.
+        envelope["correlation_id"] = task.correlation_id
+        # Recorded **before** the send, so a submission that fails is already
+        # queued for retry rather than depending on the send to enqueue it.
+        runner.record_result(task.task_id, envelope)
+        await _submit_result(identity, runner, task.task_id)
     finally:
         # Local task state is deleted here and nowhere else, on every path
         # including cancellation — the "temporary state deleted after
@@ -694,6 +1020,12 @@ async def _handle_assignment(
         task_type=task_type,
         correlation_id=correlation_id,
         started_at=time.monotonic(),
+        # Coordinator-sourced, not invented: `attempt` comes off the
+        # assignment (always 0 in M2 — nothing writes `attempt_count`) and
+        # the epoch is the session that admitted this task. Both are echoed
+        # back in the result envelope so Phase 3 needs no protocol change.
+        attempt=_coerce_int(payload.get("attempt")),
+        session_epoch=runner.session_epoch,
     )
     runner.running[task_id] = task
 
@@ -750,6 +1082,37 @@ def _execution_finished(execution: asyncio.Task) -> None:
     exc = execution.exception()
     if exc is not None:
         _log("task_execution_supervisor_error", error_type=type(exc).__name__)
+
+
+async def _handle_result_ack(identity: dict, runner: TaskRunner, message: dict) -> None:
+    """The coordinator has answered for a result — stop retrying it.
+
+    Dropped on a **rejection** too, and the asymmetry is the point: a
+    rejection means the envelope was not a result the coordinator would
+    accept, and it will not become one on the tenth attempt. Retrying forever
+    would burn the worker's own submission loop on a verdict that is already
+    final, and would keep a slot in the bounded pending buffer that a
+    recoverable result could use. The task is left RUNNING coordinator-side,
+    visible, and Phase 3 owns reclaiming it.
+    """
+    payload = message.get("payload") or {}
+    task_id = str(payload.get("task_id") or "")
+    accepted = bool(payload.get("accepted", False))
+    known = runner.result_acknowledged(task_id)
+
+    _log(
+        "task_result_acknowledged" if accepted else "task_result_refused",
+        worker_id=identity["worker_id"],
+        task_id=task_id,
+        outcome=payload.get("outcome"),
+        reason_code=payload.get("reason_code"),
+        # False means the ack named something this worker is not holding —
+        # a duplicate ack, or an ack for a result already cleared. Harmless
+        # and idempotent (§3.7), recorded rather than acted on.
+        was_pending=known,
+        pending=len(runner.pending_results),
+        correlation_id=message.get("correlation_id"),
+    )
 
 
 async def _progress_reporter_loop(identity: dict, runner: TaskRunner) -> None:
@@ -849,10 +1212,12 @@ async def _hold_connection(
             correlation_id=correlation_id,
         )
 
-        # Redirect completion reports to this session. Anything a task
-        # finished while there was no session is already excluded from the
-        # `hello` above, so nothing is owed here — see `TaskRunner.report`.
-        runner.attach(ws, send_lock)
+        # Redirect completion reports to this session, and stamp its epoch on
+        # every task admitted from here. Any *state* report a task finished
+        # while there was no session is already excluded from the `hello`
+        # above; any *result* it produced is in `pending_results` and this
+        # attach is what wakes the retry loop to deliver it.
+        runner.attach(ws, send_lock, _coerce_int(ack.get("session_epoch")))
 
         heartbeat_task = asyncio.create_task(
             _heartbeat_ws_loop(ws, identity, send_lock, correlation_id)
@@ -879,6 +1244,9 @@ async def _hold_connection(
                         ws, identity, send_lock, runner, message, correlation_id
                     )
                     continue
+                if message_type == "task_result_ack":
+                    await _handle_result_ack(identity, runner, message)
+                    continue
                 if message_type == "session_evicted":
                     _log(
                         "ws_session_evicted",
@@ -902,17 +1270,25 @@ async def _hold_connection(
                     pass
 
 
-def _backoff_delay_seconds(consecutive_failures: int) -> float:
+def _full_jitter(consecutive_failures: int, base: float, factor: float, maximum: float) -> float:
     """Full-jitter exponential backoff (AWS's "full jitter" algorithm):
-    the delay is a random draw from `[0, cap)`, not the cap itself — this
-    is also the thundering-herd mitigation for a mass reconnect after a
-    coordinator restart, since a fleet of workers all failing at once get
-    spread across that window instead of all retrying in lockstep.
-    `consecutive_failures=0` (the tier right after a successful session)
-    still jitters within `[0, BASE)` rather than reconnecting instantly,
-    so even the "just disconnected cleanly" case doesn't thunder."""
-    cap = min(WS_BACKOFF_MAX_SECONDS, WS_BACKOFF_BASE_SECONDS * (WS_BACKOFF_FACTOR**consecutive_failures))
-    return random.uniform(0, cap)
+    the delay is a random draw from `[0, cap)`, not the cap itself.
+
+    The jitter is the thundering-herd mitigation, and it matters for both
+    callers for the same reason: a coordinator coming back after an outage
+    faces the whole fleet at once — reconnecting in Phase 1.7, and now also
+    submitting every result that completed while it was away.
+    `consecutive_failures=0` still jitters within `[0, base)` rather than
+    firing instantly, so even the "just disconnected cleanly" case doesn't
+    thunder."""
+    return random.uniform(0, min(maximum, base * (factor**consecutive_failures)))
+
+
+def _backoff_delay_seconds(consecutive_failures: int) -> float:
+    """The Phase 1.7 reconnect backoff. See `_full_jitter`."""
+    return _full_jitter(
+        consecutive_failures, WS_BACKOFF_BASE_SECONDS, WS_BACKOFF_FACTOR, WS_BACKOFF_MAX_SECONDS
+    )
 
 
 async def _run_ws_forever(identity: dict, stop_event: asyncio.Event, runner: TaskRunner) -> None:
@@ -1010,6 +1386,9 @@ async def _async_main(identity: dict) -> None:
 
     heartbeat_task = asyncio.create_task(_heartbeat_loop(stop_event))
     ws_task = asyncio.create_task(_run_ws_forever(identity, stop_event, runner))
+    # Process-level like the runner, and for the same reason: the retries
+    # matter exactly when there is no session to have started them from.
+    results_task = asyncio.create_task(_result_submission_loop(identity, runner, stop_event))
 
     await stop_event.wait()
     # Cooperative cancel first, then stop waiting for the pool: a thread
@@ -1021,10 +1400,22 @@ async def _async_main(identity: dict) -> None:
             worker_id=identity["worker_id"],
             tasks_in_flight=runner.tasks_in_flight,
         )
+    if runner.pending_results:
+        # Stated rather than swallowed: results that never reached the
+        # coordinator die with the process (§3.6 — workers are stateless
+        # between tasks, and persisting a buffer to disk would break that).
+        # Their tasks stay RUNNING and are Phase 3's to reclaim.
+        _log(
+            "task_results_abandoned_on_shutdown",
+            worker_id=identity["worker_id"],
+            pending=len(runner.pending_results),
+            task_ids=",".join(runner.pending_results),
+        )
     runner.shutdown()
     heartbeat_task.cancel()
     ws_task.cancel()
-    for task in (heartbeat_task, ws_task):
+    results_task.cancel()
+    for task in (heartbeat_task, ws_task, results_task):
         try:
             await task
         except asyncio.CancelledError:

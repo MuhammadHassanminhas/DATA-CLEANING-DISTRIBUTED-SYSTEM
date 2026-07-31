@@ -45,6 +45,12 @@ services:
       # assignment safety-net poll. Neither is changed for normal dev.
       REGISTER_RATE_LIMIT_PER_MINUTE: ${REGISTER_RATE_LIMIT_PER_MINUTE:-5}
       ASSIGNMENT_POLL_INTERVAL_SECONDS: ${ASSIGNMENT_POLL_INTERVAL_SECONDS:-30}
+      # Phase 2.5 result retention. Defaults match app/config.py (7 days,
+      # hourly sweep); exposed here so the sweep can be demonstrated in a
+      # local session without waiting a week for the first pass.
+      RESULT_RETENTION_DAYS: ${RESULT_RETENTION_DAYS:-7}
+      RESULT_RETENTION_SWEEP_INTERVAL_SECONDS: ${RESULT_RETENTION_SWEEP_INTERVAL_SECONDS:-3600}
+      TASK_RESULT_MAX_BYTES: ${TASK_RESULT_MAX_BYTES:-131072}
     ports:
       - "${COORDINATOR_PORT}:8443"
     volumes:

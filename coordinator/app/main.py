@@ -35,6 +35,7 @@ from app.assignment import (
     handle_task_ack,
     handle_task_failed,
     handle_task_progress,
+    handle_task_result,
     handle_task_started,
     log_unacknowledged,
     notification_listener,
@@ -51,6 +52,8 @@ from app.config import (
     heartbeat_suspect_threshold_seconds,
     heartbeat_sweep_interval_seconds,
     register_rate_limit_per_minute,
+    result_retention_days,
+    result_retention_sweep_interval_seconds,
     run_migrations_on_startup,
     task_dequeue_max_batch,
     task_enqueue_max_batch,
@@ -61,7 +64,7 @@ from app.config import (
 )
 from app.db import engine, get_session
 from app.logging_config import configure_logging
-from app.metrics import MetricsMiddleware, metrics_endpoint
+from app.metrics import RESULTS_PURGED, MetricsMiddleware, metrics_endpoint
 from app.middleware import (
     CorrelationIDMiddleware,
     _caller_ip,
@@ -92,6 +95,8 @@ from app.task_queue import (
     counts_by_status,
     dequeue,
     enqueue_batch,
+    get_task,
+    purge_expired_results,
     queue_depth,
 )
 from app.task_types import InvalidTaskParameters, UnknownTaskType
@@ -133,6 +138,46 @@ def _run_migrations() -> None:
     command.upgrade(cfg, "head")
 
 
+async def _result_retention_loop() -> None:
+    """Delete result bodies past `RESULT_RETENTION_DAYS` (Phase 2.5).
+
+    Retention is a **documented period the system actually enforces**, not
+    a paragraph in a design note — a retention policy nothing implements is
+    a hypothesis, and this project has been careful not to record those as
+    results (§10).
+
+    Every replica runs its own sweep. That is deliberate and consistent with
+    the assignment engine (Decision #89): the DELETE is idempotent and
+    row-scoped, so concurrent sweeps race harmlessly, and adding leader
+    election here would buy nothing but a failure mode. A pass that raises is
+    logged and retried on the next tick — an unreachable database must not
+    kill the loop for the life of the process.
+    """
+    interval = result_retention_sweep_interval_seconds()
+    days = result_retention_days()
+    logger.info(
+        "result_retention_started",
+        extra={"retention_days": days, "sweep_interval_seconds": interval},
+    )
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            async with get_session() as session:
+                purged = await purge_expired_results(session, retention_days=result_retention_days())
+                if purged:
+                    await session.commit()
+            if purged:
+                RESULTS_PURGED.inc(purged)
+                logger.info(
+                    "result_retention_purged",
+                    extra={"rows": purged, "retention_days": result_retention_days()},
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a bad sweep must not kill the loop
+            logger.warning("result_retention_sweep_failed", extra={"detail": str(exc)})
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
@@ -168,6 +213,9 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     # request, it just stops handing out work (§3.9).
     assignment_task = asyncio.create_task(assignment_loop())
     notification_task = asyncio.create_task(notification_listener())
+    # Step 2.5. Same shape as the two above and for the same reason: it holds
+    # no state, and a replica without it still serves every request.
+    retention_task = asyncio.create_task(_result_retention_loop())
     yield
     # No app-level connection drain here: uvicorn's own `Server.shutdown()`
     # calls `connection.shutdown()` on every live WebSocket (a proper
@@ -176,7 +224,7 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     # verified live (Decisions Log #21). By this point every `ws_connect`
     # handler has already run its own `finally` cleanup below, so there is
     # nothing left here to drain.
-    for background in (sweep_task, assignment_task, notification_task):
+    for background in (sweep_task, assignment_task, notification_task, retention_task):
         background.cancel()
         try:
             await background
@@ -963,6 +1011,16 @@ async def ws_connect(websocket: WebSocket) -> None:
                 await handle_task_failed(local_session, message)
                 continue
 
+            # Step 2.5. The message that completes a task: validate the
+            # result envelope, persist the body, move RUNNING -> COMPLETED,
+            # release the credit, acknowledge. A pre-2.5 worker sends
+            # `capacity` instead and is handled above — the coordinator
+            # cannot tell one worker generation from another (§3.5), and
+            # must not need to.
+            if message_type == "task_result":
+                await handle_task_result(local_session, message)
+                continue
+
             logger.info("worker_message_received", extra={"worker_id": worker_id, "message_type": message_type})
     except WebSocketDisconnect:
         logger.info("worker_disconnected", extra={"worker_id": worker_id})
@@ -1168,4 +1226,77 @@ async def dequeue_tasks(body: DequeueTaskRequest, response: Response) -> dict[st
             for task in claimed
         ],
         "coordinator_instance": COORDINATOR_INSTANCE_ID,
+    }
+
+
+@app.get("/tasks/{task_id}")
+async def inspect_task(
+    task_id: str, response: Response, x_admin_secret: str = Header(default="")
+) -> dict[str, object]:
+    """One task with its persisted result envelope (Phase 2.5).
+
+    Declared **after** `/tasks/depth` on purpose: FastAPI matches routes in
+    declaration order, so a path parameter registered first would swallow
+    the literal path.
+
+    This is the minimum read that makes Step 2.5's "execution duration
+    recorded and visible" criterion verifiable rather than asserted — the
+    duration is inside the stored envelope, so without a read path there is
+    nowhere to see it but the database. It is a **primitive**, in the same
+    sense `POST /tasks/dequeue` was kept as one in Step 2.2: Step 2.6 owns
+    the operator task API — filters, batch listing, full lifecycle history,
+    cancellation — and builds on this rather than around it.
+
+    Two durations come back and they are not the same measurement, which is
+    why both are reported rather than one being presented as "the" duration
+    (§10 and §12):
+
+    * `duration_seconds` inside `result` is **worker-reported**. It is the
+      execution time proper, and it is untrusted.
+    * `observed_duration_seconds` is **coordinator-observed**, from
+      `assigned_at` to `completed_at`. It includes delivery, queueing inside
+      the worker's admission path and the result round trip, so it is always
+      the larger of the two, and it is the one that cannot be lied about.
+    """
+    if not verify_admin_secret(x_admin_secret):
+        response.status_code = 401
+        logger.warning("task_inspect_rejected_invalid_admin_secret", extra=_admin_log())
+        return {"detail": "invalid admin credential"}
+
+    async with get_session() as session:
+        task = await get_task(session, task_id)
+
+    if task is None:
+        response.status_code = 404
+        return {"detail": "task not found"}
+
+    assigned_at = task["assigned_at"]
+    completed_at = task["completed_at"]
+    observed = (
+        round((completed_at - assigned_at).total_seconds(), 3)
+        if assigned_at is not None and completed_at is not None
+        else None
+    )
+
+    return {
+        "task_id": str(task["id"]),
+        "task_type": task["task_type"],
+        "status": task["status"],
+        "priority": task["priority"],
+        "assigned_worker_id": str(task["assigned_worker_id"]) if task["assigned_worker_id"] else None,
+        "assigned_at": assigned_at.isoformat() if assigned_at else None,
+        "completed_at": completed_at.isoformat() if completed_at else None,
+        "created_at": task["created_at"].isoformat(),
+        "updated_at": task["updated_at"].isoformat(),
+        "attempt_count": task["attempt_count"],
+        "correlation_id": task["correlation_id"],
+        "observed_duration_seconds": observed,
+        # None once the retention sweep has removed the body. The task row
+        # survives as the audit trail — that is the documented behaviour of
+        # `RESULT_RETENTION_DAYS`, not a lost result.
+        "result": task["result_payload"],
+        "result_size_bytes": task["result_size_bytes"],
+        "result_submitted_at": (
+            task["result_submitted_at"].isoformat() if task["result_submitted_at"] else None
+        ),
     }
