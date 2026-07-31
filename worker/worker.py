@@ -538,6 +538,13 @@ class TaskRunner:
         while len(self.pending_results) >= MAX_PENDING_RESULTS:
             dropped, _ = next(iter(self.pending_results.items()))
             del self.pending_results[dropped]
+            # Dropped here as well, or `result_sent_at` outlives the entry it
+            # describes: nothing else removes it except an ack that will now
+            # never come or the next reconnect, so a long-lived session that
+            # overflows repeatedly would grow this dict without bound — the
+            # exact leak `MAX_PENDING_RESULTS` exists to prevent, reintroduced
+            # through the back door.
+            self.result_sent_at.pop(dropped, None)
             _log(
                 "task_result_buffer_overflow",
                 task_id=dropped,

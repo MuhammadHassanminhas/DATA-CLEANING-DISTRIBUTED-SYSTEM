@@ -750,8 +750,18 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
         envelope = validate_result(payload, max_bytes=task_result_max_bytes())
     except MalformedResult as exc:
         TASK_RESULTS.labels("rejected").inc()
-        # Rejected, but the slot is still free — see the docstring.
-        _release_credit(session, raw_task_id)
+        # The slot is free, but **only release it if the message names a task
+        # this session actually delivered.** A malformed result may carry no
+        # task id at all, or a garbage one, and `_release_credit` cannot tell
+        # those apart from a legitimate id: an empty string takes its unnamed
+        # best-effort branch and pops an arbitrary held credit, and an
+        # unrecognised string draws down the reconnect residue. Either would
+        # free the slot of a task that is genuinely still running, on the say-so
+        # of a message the coordinator has just rejected as not being a result
+        # (§12). Same discipline as `NOT_OWNER`/`NOT_FOUND` on the failure path:
+        # if the report cannot identify a slot, it releases none.
+        if raw_task_id and raw_task_id in session.credited:
+            _release_credit(session, raw_task_id)
         session.current_tasks.pop(raw_task_id, None)
         session.saturated = False
         await _publish_current_tasks(session)

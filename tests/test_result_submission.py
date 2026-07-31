@@ -459,6 +459,45 @@ def test_a_malformed_result_is_refused_definitively_and_frees_the_slot():
     run(_body)
 
 
+def test_a_malformed_result_that_names_no_task_releases_no_credit():
+    """A rejected message cannot identify a slot, so it must not free one.
+
+    `_release_credit` cannot tell a missing id from a real one: an empty
+    string takes its unnamed best-effort branch and pops an arbitrary held
+    credit, and an unrecognised string draws down the reconnect residue.
+    Either would free the slot of a task that is genuinely still running, on
+    the say-so of a message the coordinator has just rejected as not being a
+    result at all (§12).
+    """
+
+    def _body(sessionmaker):
+        async def inner(sm):
+            session, task_id = await _assigned_and_running(sm)
+            session.residual_in_flight = 2  # two tasks running since before this session
+            assert session.in_flight == 3
+
+            # No task id at all, then a garbage one, then someone else's.
+            await handle_task_result(session, {"payload": {"status": "COMPLETED"}})
+            await handle_task_result(
+                session, {"payload": {"task_id": "not-a-uuid", "status": "COMPLETED"}}
+            )
+            await handle_task_result(
+                session, result_message(str(uuid.uuid4()), idempotency_token=None)
+            )
+
+            assert session.in_flight == 3  # nothing was freed
+            assert session.residual_in_flight == 2
+            assert await _statuses(sm) == {"RUNNING": 1}
+
+            # The named case still releases: the slot really is free there.
+            await handle_task_result(session, result_message(task_id, status="RUNNING"))
+            assert session.in_flight == 2
+
+        return inner(sessionmaker)
+
+    run(_body)
+
+
 def test_a_rejection_never_logs_the_result_body(caplog):
     """§12. A result payload is caller data — the reason may be logged, the
     body may not."""

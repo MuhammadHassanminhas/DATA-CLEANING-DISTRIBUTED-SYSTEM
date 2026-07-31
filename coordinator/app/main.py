@@ -161,6 +161,10 @@ async def _result_retention_loop() -> None:
     )
     while True:
         await asyncio.sleep(interval)
+        # Bound before the try: if opening the session raises, an unbound
+        # `purged` would raise NameError inside the handler below and that is
+        # what would get logged — masking the real reason the sweep failed.
+        purged = 0
         try:
             async with get_session() as session:
                 purged = await purge_expired_results(session, retention_days=result_retention_days())

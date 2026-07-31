@@ -418,6 +418,28 @@ def test_the_pending_buffer_is_bounded_and_drops_the_oldest():
     asyncio.run(body())
 
 
+def test_eviction_also_drops_the_sent_at_stamp():
+    """Otherwise `result_sent_at` outlives the entry it describes. Nothing
+    else removes it except an ack that will now never come, so a long-lived
+    session that overflows repeatedly grows it without bound — the exact leak
+    the cap exists to prevent, reintroduced through the back door."""
+
+    async def body():
+        runner = worker.TaskRunner(1)
+        cap = worker.MAX_PENDING_RESULTS
+        for index in range(cap):
+            runner.record_result(f"t{index}", {"task_id": f"t{index}"})
+            runner.result_sent_at[f"t{index}"] = 0.0
+
+        runner.record_result("overflow", {"task_id": "overflow"})
+
+        assert "t0" not in runner.pending_results
+        assert "t0" not in runner.result_sent_at
+        assert len(runner.result_sent_at) <= cap
+
+    asyncio.run(body())
+
+
 def test_an_oversize_result_is_truncated_rather_than_dropped_or_sent():
     """Truncation, not rejection: the task genuinely completed, so refusing
     to report it would strand real work over a payload size — and sending it
