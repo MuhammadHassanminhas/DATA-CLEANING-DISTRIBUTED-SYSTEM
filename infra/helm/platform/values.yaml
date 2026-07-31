@@ -40,6 +40,24 @@ dashboard:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 200m, memory: 128Mi }
 
+# In-cluster demo worker (templates/demo-worker.yaml). Disabled by default;
+# staging turns it on. Was a hand-applied root manifest until it drifted to a
+# pre-2.3 image — it is in the chart so CD retags it every rollout.
+demoWorker:
+  enabled: false
+  replicas: 1
+  image:
+    repository: ghcr.io/muhammadhassanminhas/data-cleaning-distributed-system-worker
+    tag: latest
+    pullPolicy: IfNotPresent
+  # 500m is half a core, so one CPU task at a time. The old 100m limit
+  # throttled a ceiling `hash_rounds` task hard. maxConcurrent must track this:
+  # the worker declares it as credits and the coordinator assigns against it.
+  maxConcurrent: 1
+  resources:
+    requests: { cpu: 100m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
 postgres:
   image: postgres:16-alpine
   storage: 1Gi

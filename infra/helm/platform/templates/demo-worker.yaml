@@ -1,0 +1,55 @@
+{{- if .Values.demoWorker.enabled }}
+# In-cluster demo worker. Previously a hand-applied manifest at the repo root
+# with a HARDCODED image tag, which is why it drifted to a pre-2.3 image and
+# silently parked every task it was assigned (Decision #92's compatibility
+# path). It lives in the chart now so CD sets its tag from the deployed SHA on
+# every rollout, exactly like coordinator and dashboard.
+#
+# It reaches the coordinator by in-cluster service name (the dev CA cert SAN
+# covers `coordinator`) and uses the worker-facing Secret already in the
+# namespace. It is NOT a substitute for the §8 Internet worker.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-worker
+  labels: { app: demo-worker }
+spec:
+  replicas: {{ .Values.demoWorker.replicas }}
+  selector: { matchLabels: { app: demo-worker } }
+  template:
+    metadata:
+      labels: { app: demo-worker }
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: "{{ .Values.demoWorker.image.repository }}:{{ .Values.demoWorker.image.tag }}"
+          imagePullPolicy: {{ .Values.demoWorker.image.pullPolicy }}
+          env:
+            - name: COORDINATOR_URL
+              value: https://coordinator:8443
+            - name: WORKER_CA_FILE
+              value: /certs/dev-ca.crt
+            - name: WORKER_AGENT_VERSION
+              # Carries the deployed SHA so drift is visible on the dashboard
+              # instead of needing a kubectl to detect (this is how the old
+              # drift went unnoticed across four steps).
+              value: "demo-worker-{{ .Values.demoWorker.image.tag }}"
+            - name: WORKER_MAX_CONCURRENT
+              # Must not exceed what the CPU limit below can actually serve:
+              # credits are handed out per max_concurrent, so an over-declared
+              # worker starves the tasks it claims.
+              value: "{{ .Values.demoWorker.maxConcurrent }}"
+            - name: ENROLLMENT_SECRET
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.secretNames.app }}, key: ENROLLMENT_SECRET }
+          volumeMounts:
+            - { name: tls, mountPath: /certs, readOnly: true }
+          resources: {{ toYaml .Values.demoWorker.resources | nindent 12 }}
+      volumes:
+        - name: tls
+          secret: { secretName: {{ .Values.secretNames.tls }} }
+{{- end }}

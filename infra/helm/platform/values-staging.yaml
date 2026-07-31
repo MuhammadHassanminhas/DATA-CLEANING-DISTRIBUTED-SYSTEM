@@ -18,6 +18,11 @@ coordinator:
 config:
   logLevel: DEBUG
 
+# The in-cluster demo worker runs in staging only. Its image.tag is set by CD
+# to the deployed SHA, same as coordinator/dashboard.
+demoWorker:
+  enabled: true
+
 # Observability ON for staging (Step 1.5.6) — this is the env the stack is
 # demoed against. Emits the coordinator ServiceMonitor + alert rules.
 observability:

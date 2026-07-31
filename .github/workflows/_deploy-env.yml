@@ -71,6 +71,7 @@ jobs:
             --values "infra/helm/platform/values-${NS}.yaml" \
             --set coordinator.image.tag="$SHA" \
             --set dashboard.image.tag="$SHA" \
+            --set demoWorker.image.tag="$SHA" \
             --atomic --timeout 5m
 
       - name: Smoke test + version assert (criteria 3 & 4)
