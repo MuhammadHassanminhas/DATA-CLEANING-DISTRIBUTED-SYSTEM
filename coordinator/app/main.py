@@ -26,6 +26,8 @@ from typing import Any
 from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI, Header, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, text
 
 from app.assignment import (
@@ -258,6 +260,34 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(title="Coordinator", version="0.2.0", lifespan=lifespan)
 app.add_middleware(CorrelationIDMiddleware)
 app.add_middleware(MetricsMiddleware)
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_without_echo(_: Request, exc: RequestValidationError) -> JSONResponse:
+    """422 responses that name the problem without repeating the input.
+
+    FastAPI's default handler echoes the offending value back in each
+    error's `input` field. That is convenient and, on a credential-bearing
+    endpoint, dangerous: during session 13 a demo helper sent `ADMIN_SECRET`
+    under the wrong field name, and the validation error handed the live
+    secret straight back in the response body — where it was then captured
+    in a transcript and had to be rotated (Decision #119).
+
+    CLAUDE.md §12 says credentials are never logged and never rendered. A
+    response body is a rendering. So `input` and `ctx` are dropped and only
+    the location, the message and the error type survive — which is all a
+    caller needs to fix its own request, since it already knows what it
+    sent.
+
+    This is a whole-app handler rather than a per-endpoint one on purpose: a
+    future endpoint that takes a secret should not have to remember.
+    """
+    safe = [
+        {"loc": error.get("loc"), "msg": error.get("msg"), "type": error.get("type")}
+        for error in exc.errors()
+    ]
+    logger.warning("request_validation_failed", extra={"errors": safe})
+    return JSONResponse(status_code=422, content={"detail": safe})
+
 
 # Prometheus scrape target (Step 1.5.6). Unauthenticated — exposes only
 # aggregate operational counters, never worker credentials or tokens, and

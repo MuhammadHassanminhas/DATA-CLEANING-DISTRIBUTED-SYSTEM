@@ -41,9 +41,16 @@ class EnqueueTaskRequest(BaseModel):
     10,000-task exit criterion is reachable through the rate-limited
     public ingress, and so Step 2.8's harness has a bulk path that does
     not require loosening the edge limit.
+
+    `admin_secret` is **optional here and required by the endpoint** — the
+    credential may instead arrive in the `X-Admin-Secret` header, which is
+    the documented path since Step 2.6. Optional rather than required also
+    means a caller that omits it gets a 401 from the auth check rather than
+    a 422 from pydantic; a 422 is the response that used to quote the
+    request back (see `main._validation_error_without_echo`).
     """
 
-    admin_secret: str
+    admin_secret: str = ""
     task_type: str
     parameters: dict | None = None
     payload: dict | None = None
