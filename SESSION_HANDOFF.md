@@ -18,15 +18,66 @@ recorded in #128 as a scope call on §9's approval half. Suite **288 passed**
 
 ### ⇒ START HERE NEXT SESSION
 
-1. **Nothing is committed.** Every change from this session is in the
-   working tree, along with the three doc files left uncommitted by session
-   17. Commit, push, open a PR, get CI green, deploy.
+1. **PR #42 is open** — branch `phase-2.7-dashboard-v2`, five commits, one
+   concern each. Check CI, merge, delete the branch local **and** remote (a
+   surviving base branch is what stopped PR #15 auto-retargeting in session
+   9), then let CD deploy and approve the production gate.
 2. **Run the demo and failure demo yourself** — this is now **both 2.6's and
    2.7's**, which is what you deferred them for. Both scripts are in
    `docs/phase-2-task-distribution.md` under their own steps.
 3. **Step 2.8 — load testing harness. NOT STARTED. Do not begin without an
    explicit go-ahead (§9).** It also inherits a number this step could not
    produce: the coordinator's real saturation point (#135).
+
+### ⚠ One test flaked once and was NOT reproduced
+
+`test_every_operator_endpoint_rejects_a_missing_credential` failed on the
+first post-commit full run and then **passed 9 consecutive full runs**, and
+passes in isolation. It could not be reproduced.
+
+The failing run is the one where fresh Postgres/Redis containers were
+started behind a plain `sleep 6` rather than a health check, so container
+warm-up is the leading suspect — CI uses proper `services:` health probes,
+which is stricter than that harness was. **Recorded so a CI red on that
+test is read as a known open question rather than a surprise**, not as a
+diagnosis: the assertion that failed was never captured, so nothing here is
+claimed as the cause.
+
+Worth knowing if it recurs: the operator API rate-limits **before** it
+authenticates (`_operator_guard`), so a tripped bucket turns an expected
+401 into a 429. `test_operator_api.py`'s autouse `_clear_rate_limits`
+fixture is what normally prevents that.
+
+### The demo stack — leave it up, and how to stop it
+
+Compose project **`dcds27`** is deliberately **left running** for the
+team-lead demo: coordinator, dashboard, 4 workers, Postgres, Redis, on
+ports **9443** (coordinator) and **9444** (dashboard).
+
+- Fleet view: `https://localhost:9444/`
+- Task console: `https://localhost:9444/ui/tasks`
+
+Both serve the **private dev CA**, so the browser shows a certificate
+warning — click through it. That is expected locally and is not what the
+public staging endpoint does.
+
+Its env file lives in the session scratchpad, **not** in `.env`, so a
+recreate needs `--env-file` pointing at a copy of it. Its credentials are
+throwaway and appear nowhere else.
+
+```powershell
+# stop, keep the data (tasks and worker identities survive)
+docker compose -p dcds27 stop
+
+# start it again after a stop
+docker compose -p dcds27 start
+
+# tear it down completely, removing the volumes
+docker compose -p dcds27 down -v
+```
+
+`down -v` is the one to use when finished — it removes the Postgres volume
+and the worker identities with it.
 
 ### What shipped
 
