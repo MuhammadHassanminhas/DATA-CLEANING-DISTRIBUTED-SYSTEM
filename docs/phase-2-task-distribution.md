@@ -1271,6 +1271,60 @@ behaviour is **not watchable in a browser** — the same gap recorded for Step
 completed tasks to Step 2.7. Nothing is added to 2.7's scope by this; the
 demo below is an API-and-terminal demo.
 
+### Shipped and verified on the deployed system 2026-07-31
+
+PR #40 merged, **`main` at `34d8a0486e7ebaed93ad89ef5539d5eb553d88a0`**, CI
+green on all 7 checks with **275 passed in CI** against ephemeral
+Postgres/Redis — the same count as locally, read from the job log rather
+than inferred from the green tick. Branch deleted local and remote. CD run
+`30623912130` completed **`success` on BOTH `staging / deploy` and
+`production / deploy`**.
+
+**The tick was not the check.** What was read back from the running system:
+
+- Public staging `/health` returns `34d8a0486e7ebaed93ad89ef5539d5eb553d88a0`
+  **with no `-k`**, so the Let's Encrypt certificate genuinely validated.
+- **The new routes exist and are guarded**: unauthenticated `GET /tasks` and
+  `POST /tasks/{id}/cancel` return **401**, not the 405/404 a pre-2.6 build
+  would give. That distinction is the point — a 401 cannot be produced by
+  the old image.
+- **The queries actually run**, which a 401 does not prove: an authenticated
+  `GET /tasks?status=COMPLETED&limit=2` over the public endpoint returned
+  real rows with the filters echoed and `has_more: true`, `GET /tasks/depth`
+  returned `{"depth":0,"counts":{"COMPLETED":5,"RUNNING":4,"ASSIGNED":20636}}`,
+  and `?status=RUNING` returned **400** rather than an empty list.
+- **Migration `0004` is applied in both namespaces** — `alembic_version`
+  reads `0004`, `tasks.started_at` exists, and `ix_tasks_created_at` is
+  `btree (created_at, id)` in staging *and* production.
+- **Decision #123 confirmed live and unflattering**: those returned rows are
+  pre-`0004` tasks and carry `started_at: null`. The timeline omits their
+  RUNNING entry rather than inventing one, which is exactly what was
+  promised and is visible in production data.
+
+**Two limitations carried from earlier sessions are now closed**, because
+`kubectl exec` into a *production* pod was permitted this time where it was
+denied in sessions 14 and 15:
+
+- Production **reports its own version** — `/health` from inside a
+  production pod returns `34d8a048…`, rather than the version being inferred
+  from the Deployment spec as it was for Step 2.5.
+- `coordinator_admin_credential_separate` reads **1.0 on production**, which
+  session 15 could record for staging only.
+
+**§8, stated honestly rather than claimed.** The operator API was exercised
+**over the public Internet from outside the cluster**, which is what this
+step's surface is. **No worker outside the local network was run for Step
+2.6**, because nothing in its six criteria needs one — so §8 in its literal
+"at least one worker running outside the local network" form is **not**
+claimed for this step. Step 2.5 satisfied it with the shipped ghcr image,
+and Step 2.7's demo is where the fleet comes back into it.
+
+**The demo and failure demo (§15 items 3–4) are outstanding**, deferred by
+the user on 2026-07-31 to be run together with Step 2.7's, when the same
+behaviour is watchable in a browser. Recorded as a **user scope call, not as
+a satisfied criterion** (§10) — the same family as Decisions #34–35, #77,
+#118 and #120.
+
 ### Demo you run yourself
 
 With the stack up (`docker compose up -d`) and `$env:ADMIN_SECRET` to hand.
@@ -1323,14 +1377,304 @@ Extend the GUI so the full lifecycle is watchable live.
 - Throughput chart: tasks completed per minute.
 
 **Exit criteria**
-- [ ] A task is watchable from queued through running to completed with
+- [x] A task is watchable from queued through running to completed with
       no page refresh.
-- [ ] Per-worker current task visible and accurate.
-- [ ] Queue depth updates live as tasks drain.
-- [ ] Tasks are submittable from the browser without a CLI.
-- [ ] Task detail shows the complete timeline.
-- [ ] Readable with 100 workers and 1,000 tasks.
-- [ ] Throughput chart matches measured reality.
+- [x] Per-worker current task visible and accurate.
+- [x] Queue depth updates live as tasks drain.
+- [x] Tasks are submittable from the browser without a CLI.
+- [x] Task detail shows the complete timeline.
+- [x] Readable with 100 workers and 1,000 tasks — **with a measured
+      coordinator-capacity ceiling recorded below, not a clean pass.**
+- [x] Throughput chart matches measured reality.
+
+### Design gate — Decisions #128–#133
+
+The step opened with a short architecture gate (§9). **The user delegated
+every design decision to the agent on 2026-07-31**, asking for the most
+suitable option to be chosen and implemented. Recorded as a user scope call
+on §9's "compare then recommend" step: the alternatives below were compared
+and decided, but **not** presented for approval before building (§10).
+
+**#128 — the task console is a second page at `/ui/tasks`, not a rewrite of
+`/`.** Alternatives: one page with tabs; a page at `/tasks`.
+
+`/tasks` is impossible and the reason matters — the public ingress routes
+that whole prefix to the coordinator's operator API (Step 1.5.5, extended
+in 2.6). A dashboard page there would work perfectly in Docker Compose and
+be unreachable in staging and production, which is exactly the
+environment-dependent difference §3.5 exists to prevent. `/ui/*` falls under
+the dashboard's `/` catch-all in every environment, so **no ingress rule
+changes and no new path is added to the coordinator's list**.
+
+Two pages rather than tabs because `index.html` was already 677 lines and
+this step adds a table, a detail view, a form and a chart. The shared
+colour tokens, tiles, table and chip styles moved to `static/console.css`,
+which both pages link; each page keeps only what is its own.
+
+**#129 — the browser never holds the operator credential.** Every call goes
+through a dashboard proxy under `/api`, exactly as Phase 1.8's
+`/api/workers` did. `ADMIN_SECRET` is attached server-side by
+`dashboard/app/main.py` and appears in no response and no page (§12).
+
+The listing proxy forwards a **whitelist** of the documented filters rather
+than passing `request.query_params` through. A proxy is not a tunnel: an
+undocumented parameter silently forwarded is worse than one the API
+rejects.
+
+**#130 — submission makes the dashboard a write surface, which needs a
+guard the edge does not provide.** The dashboard is protected by HTTP basic
+auth at the ingress, and a browser attaches those credentials to *any*
+request to that origin — **including a form another site submits**. So the
+moment `POST /api/tasks` existed, an operator with the dashboard open could
+be made to enqueue or cancel work by visiting an unrelated page. Basic auth
+authenticates the browser, not the intent.
+
+Writes therefore require a header the page sets itself. A cross-site HTML
+form cannot add headers at all, and a cross-origin `fetch` that adds one
+becomes preflighted, which fails because no CORS origin is allowed. The
+value is fixed and public — this is a forgery guard, not a second
+authentication, and it is documented as such in `_reject_unless_same_origin`.
+
+**#131 — throughput is a coordinator query over `completed_at`, not a
+counter the browser accumulates.** The alternative — differencing the
+`COMPLETED` count between polls — needs no backend work, and was rejected
+on three counts: the history dies on reload, two operators watching see
+different charts, and the number is derived from poll timing rather than
+from the rows.
+
+The query groups `tasks.completed_at` into per-minute buckets, so **a bucket
+is exactly the set of rows `GET /tasks?status=COMPLETED` would list for that
+minute**. That is what makes "the chart matches measured reality" something
+an operator can check against another endpoint rather than take on trust,
+and it is how the criterion was verified below. Buckets are cut by
+Postgres's clock — the same one that stamped the rows — so a browser in
+another time zone cannot shift them. Empty minutes come back as zero rather
+than being omitted: a chart with the quiet minutes missing draws a busy
+fleet and an idle one identically.
+
+`completed_at` is stamped by `complete_task` and nowhere else, so a `FAILED`
+task never enters the series. It means "produced a result", not "stopped
+moving"; failure counts belong to the lifecycle totals.
+
+**Migration `0005`** adds `ix_tasks_completed_at`. The window the chart
+shows is minutes wide; the table it would otherwise scan grows for the
+lifetime of the system (Decision #79). Those two diverging is the whole
+reason for the index — the same reasoning that put
+`ix_task_results_submitted_at` in `0003`.
+
+**#132 — polling again, not a dashboard WebSocket.** Phase 1.8's reasoning
+is unchanged: a short poll already reads as real-time, and "the view
+recovers when the browser connection drops" is then "the next poll
+succeeds", not a second reconnect protocol to build and verify alongside
+the one Phase 1.7 built for workers. Two intervals, because the reads answer
+different questions: 2s for the list and lifecycle counts, **15s for the
+chart**, which is bucketed per minute and would otherwise be fetched 30
+times to redraw the same bar.
+
+**#133 — readability at 1,000 tasks is server-side paging and server-side
+filters, not virtualisation.** The browser never holds 1,000 rows: a page is
+50, the filters are pushed to `GET /tasks`, and the chip row and correlation
+box map onto its `status` and `correlation_id` parameters. Nothing is
+filtered client-side, so what is on screen is what the coordinator returned.
+
+### Built
+
+- **`dashboard/app/static/tasks.html`** — lifecycle tiles with live queue
+  depth, a filterable paged task table, a detail drawer (full timeline,
+  correlation id, both durations, result summary, cancel), the submission
+  form, and an inline-SVG throughput chart. No chart library: the page is
+  self-contained, as the fleet view already was.
+- **`dashboard/app/static/console.css`** — the shared design tokens and
+  table/tile/chip styles, extracted from `index.html` unchanged.
+- **`dashboard/app/main.py`** — six proxies, the write guard, a static
+  mount, and the `/ui/tasks` route.
+- **`index.html`** — a view switch, and the current-task cell is now a link
+  into `#/task/<id>`. That link is the whole join between the two pages:
+  "this worker is busy" and "this is the task, its timeline and its result"
+  stop being separate questions.
+- **Coordinator** — `GET /tasks/throughput`, `task_queue.completions_per_minute`,
+  migration `0005`, and the connection-pool change below.
+- **`tests/test_dashboard_api.py`** — the dashboard's first tests, 9 of them.
+
+### One defect found by the live run, and it was not in this step's code
+
+**Decision #134.** Measured during criterion 6, with 100 workers connected
+and a 1,000-task batch draining: an operator page took **0.83s to 48.8s**
+through `GET /tasks`, while the SQL behind it — checked with
+`EXPLAIN ANALYZE` in the same window — ran in **0.198 ms**. Five orders of
+magnitude apart, so the query was never the problem.
+
+`pg_stat_activity` showed the coordinator holding exactly **15**
+connections. That is SQLAlchemy's default `pool_size=5` plus
+`max_overflow=10`, unchanged since Phase 1.2 and never sized. Every worker
+message that writes takes a session — `task_started`, `task_result` — so a
+busy fleet holds the pool and an operator read waits behind it.
+
+The pool is now `DB_POOL_SIZE` (15) and `DB_MAX_OVERFLOW` (5), sized against
+Postgres's budget rather than picked: `3 replicas × 20 = 60` against a
+default `max_connections` of 100, leaving room for migrations, psql and the
+scrapes. Both are environment variables because the ceiling is a property of
+the deployment, not of the code.
+
+**It helped and it did not fix it, and both halves are reported (§10).**
+After the change, the same burst measured **median 0.849s, p95 9.912s, max
+12.503s** over 40 samples. The pool was a real constraint and no longer the
+binding one — the remaining cost is elsewhere, see the ceiling below.
+
+### Measured, not asserted
+
+All local, Docker Compose project `dcds27`, against a real coordinator,
+dashboard, worker fleet, Postgres and Redis over TLS. Every figure below was
+read through the **dashboard's own API** — the path the browser uses — not
+against the coordinator directly, except where stated.
+
+**Criterion 1 — watchable queued → running → completed, no refresh.** A
+14-task batch of `sleep(6)` against a 4-slot worker, sampled on the page's
+own 2s timer. Queue depth went **10 → 6 → 2 → 0** while one task picked
+*because it was still QUEUED* was watched through
+**`QUEUED -> RUNNING -> COMPLETED`**. The first attempt failed to
+demonstrate this and the reason is recorded because it is a property of the
+system: with a single task and a free slot, `QUEUED -> ASSIGNED` took **9
+ms**, so no poll at any human interval can see it. Watching a queue requires
+a queue.
+
+**Criterion 3 — queue depth updates live as tasks drain.** The same run;
+`depth` and the `QUEUED`/`ASSIGNED`/`RUNNING`/`COMPLETED` counts moved
+together, ending `depth=0, running=0, completed=14`.
+
+**Criterion 2 — per-worker current task visible and accurate.** Checked
+rather than eyeballed: for every worker reporting a current task, the task
+id was fetched and its own row compared. **16 of 16 matched** on both status
+(`RUNNING`) and `assigned_worker_id`. This is the check that would catch a
+stale Redis current-task entry, which is what the column reads.
+
+**Criterion 4 — submittable from the browser.** `POST /api/tasks` returned
+**201** with the correlation id, for single tasks and for 1,000-task
+batches. The refusal path was exercised in the same shape: the identical
+request **without** the page header returned **403 and never reached the
+coordinator**.
+
+**Criterion 5 — detail shows the complete timeline.** All four entries with
+timestamps and the column each came from:
+
+```
+QUEUED     2026-07-31T11:02:52.195821+00:00  created_at
+ASSIGNED   2026-07-31T11:02:52.204716+00:00  assigned_at
+RUNNING    2026-07-31T11:02:52.221777+00:00  started_at
+COMPLETED  2026-07-31T11:03:04.221512+00:00  completed_at
+```
+
+**Criterion 7 — the chart matches measured reality.** Cross-checked twice,
+against the API and against the database directly. At 1,016 completions the
+chart's `completed_in_window` equalled the listing count **and** the SQL
+`GROUP BY date_trunc('minute', completed_at)` bucket for bucket. Repeated at
+2,278 completions across 8 minutes: **7 of the 8 buckets identical**, the
+differing one being the **current, still-filling minute** (chart 33, database
+36, read three seconds later). The index is used, measured rather than
+assumed — `Index Only Scan using ix_tasks_completed_at`, **0.714 ms**.
+
+**Criterion 6 — readable with 100 workers and 1,000 tasks, with a ceiling.**
+
+The page itself is bounded by construction and measured to be: one page is
+**50 rows / ~22 KB** whatever the table holds, and paging to `offset=950` of
+1,000 tasks cost **0.056s**. The fleet view rendered **110 registered
+workers, 96 ONLINE**, at **52 KB in 0.175s** — more rows than the criterion
+names.
+
+**The honest part.** With **100 workers** connected and a 1,000-task burst
+draining, operator reads degrade badly: **median 0.849s, p95 9.912s, max
+12.503s**. The cause was isolated rather than guessed, by re-running the
+identical burst against the identical 2,800-row table with the fleet scaled
+to **4 workers**:
+
+| fleet | median | p95 | max | coordinator CPU |
+|---|---|---|---|---|
+| 100 workers | 0.849s | 9.912s | 12.503s | **76–91%** of a core |
+| 4 workers | **0.025s** | **0.045s** | **0.126s** | **1.84%** |
+
+Same table, same batch, same query. **The degradation tracks fleet size, not
+task count** — so the "1,000 tasks" half of the criterion passes cleanly and
+the "100 workers" half is bounded by **one coordinator process saturating
+one CPU core** while serving 95 WebSocket sessions plus TLS plus JSON
+logging. It is a coordinator-capacity ceiling, not a dashboard one, and the
+project's answer to it already exists and is already proven: §3.9 horizontal
+scaling, demonstrated in Step 1.5.7 with three replicas autoscaling to five.
+A single Compose container has no horizontal anything.
+
+**Recorded, not fixed.** Making one process serve 100 workers faster is not
+Step 2.7's scope, and Step 2.8's load harness is what should produce the
+defensible saturation number (§10).
+
+**A second observation from the same run, and it is not a defect.** 1,372
+tasks ended stranded in `ASSIGNED` with `task_assign_delivery_failed`
+("Cannot call send once a close message has been sent"), because 100 worker
+containers on one laptop churned their sockets — 226 disconnects. That is
+exactly Decision #91's designed outcome: commit before send, so a task
+recorded `ASSIGNED` that never arrived is **visible and reclaimable**, and
+Phase 3 is what reclaims it. A host-capacity artefact demonstrating the
+documented behaviour, not a fault.
+
+### Failure demo — run and measured
+
+1. **Cancel something already running** → **409** naming its state:
+   `task is RUNNING: only a QUEUED task can be cancelled`. The task stayed
+   `RUNNING`; refused, not half-cancelled.
+2. **Cancel the same queued task twice** → first **200**
+   (`previous_status: QUEUED`), second **409** reporting `CANCELLED`.
+3. **Write without the page header** → **403**, and the coordinator was
+   never called. With the header, the identical request → **201**.
+4. **Coordinator stopped under a running task** → the dashboard returned
+   `{"error": "coordinator_unreachable"}`, which is what raises the page's
+   banner. On restart the view resumed with no action, **and the task that
+   had been executing through the outage completed** — its result landed on
+   reconnect, appearing in the 11:05 throughput bucket. Step 2.5's
+   outage-survival path, re-demonstrated through the GUI's own data path.
+
+### What is NOT claimed
+
+- **No browser screenshot was captured by the agent.** Playwright cannot
+  validate the private dev CA, and no page render was observed. What was
+  verified instead: both pages are served, `console.css` is served, both
+  scripts **parse** (`node --check`), and every data path behind them was
+  measured. **Seeing the pages is your demo (§15 items 3–4).**
+- **§8 is not claimed.** No worker outside the local network was run for
+  this step; the fleet was local Docker.
+- **Not deployed.** No CI run, no staging or production deploy at the time
+  of writing.
+- **Step 2.6's demo and failure demo** remain outstanding and are to be run
+  alongside this step's, as agreed on 2026-07-31.
+
+### Demo you run yourself
+
+`docker compose up -d`, then open `https://localhost:8444/` and
+`https://localhost:8444/ui/tasks`. Accept the dev-CA warning.
+
+1. **Watch a task's whole life.** On the tasks page, submit
+   `count_to_n {"n": 2000}`. It appears within one poll; click the row for
+   the timeline and the result. **To watch it sit in `QUEUED`, submit more
+   than the fleet can run at once** — with one 4-slot worker, submit 14
+   `sleep {"seconds": 6}` and watch the depth tile drain.
+2. **Queue depth live.** Keep the tiles in view during that drain.
+3. **Per-worker current task.** Open the fleet view alongside it; each busy
+   worker names its task, and **clicking it opens that task's detail**.
+4. **Filter and page.** Submit 1,000 with `count`, then use the correlation
+   id from the form's confirmation, or "show everything this batch created"
+   in any detail drawer. Page with newer/older.
+5. **Throughput.** The chart fills a bar per minute. Check it: the window
+   total must equal what `GET /tasks?status=COMPLETED` reports over the same
+   minutes.
+
+**Failure demo**
+
+1. **Cancel a running task** — start a `sleep {"seconds": 60}`, wait for
+   `RUNNING`, open it, press cancel: **409** naming its state.
+2. **Stop the coordinator** (`docker compose stop coordinator`) — the banner
+   appears within two polls; start it again and the view resumes with no
+   reload.
+3. **Submit invalid parameters** — `count_to_n` with `{"n": -5}`: the form
+   shows the coordinator's own rejection, not a dashboard paraphrase.
+4. **Prove the credential is not in the browser** — view source on both
+   pages and search the network tab: `ADMIN_SECRET` appears in neither.
 
 ---
 

@@ -280,7 +280,43 @@ its status is read, so a task is never both cancelled and handed out.
 against 320,025 rows. `counts` groups the whole table and is the more
 expensive read; they are separate so the cheap path stays cheap.
 
-### 5.6 `POST /tasks/dequeue` — queue primitive (not for normal operation)
+### 5.6 `GET /tasks/throughput` — completions per minute
+
+The read behind the dashboard's throughput chart (Step 2.7).
+
+```bash
+curl -sk "https://localhost:8443/tasks/throughput?minutes=30" \
+  -H "X-Admin-Secret: $ADMIN_SECRET"
+```
+
+```json
+{"window_minutes":30,
+ "series":[{"minute":"2026-07-31T11:42:00+00:00","completed":159},
+           {"minute":"2026-07-31T11:43:00+00:00","completed":287}],
+ "completed_in_window":446}
+```
+
+| Query parameter | Notes |
+|---|---|
+| `minutes` | default 30, max `TASK_THROUGHPUT_MAX_MINUTES` (default 1440) |
+
+**Every minute in the window is present, including the empty ones.** A
+series with the quiet minutes omitted draws a busy fleet and an idle one
+identically. Oldest first, so a chart reads left to right.
+
+**A bucket is exactly the rows `GET /tasks?status=COMPLETED` would list for
+that minute**, because the count comes from `tasks.completed_at` — which
+`complete_task` stamps and nothing else does. That is deliberate: the chart
+is checkable against §5.2 rather than merely plausible.
+
+**A `FAILED` task is not in here.** `completed_at` means "produced a
+result", not "stopped moving", so failures never enter the series rather
+than entering it as zeroes. Failure counts are in §5.5's `counts`.
+
+Buckets are cut by Postgres's clock — the same one that stamped the rows —
+so a caller in another time zone gets the same buckets.
+
+### 5.7 `POST /tasks/dequeue` — queue primitive (not for normal operation)
 
 Atomically claims queued tasks for a **named** worker. It exists so the
 "three replicas never double-assign" property can be proven against real
@@ -294,7 +330,7 @@ task for a worker by hand bypasses that and the worker will never be told.
 {"admin_secret":"…","worker_id":"ae0c0a8d-…","limit":10}
 ```
 
-### 5.7 `GET /workers` — the fleet
+### 5.8 `GET /workers` — the fleet
 
 Phase 1.8. Same credential. Returns every registered worker with its live
 status, last heartbeat, CPU/memory, latency, declared capabilities and
@@ -347,6 +383,7 @@ what will produce defensible numbers.
 |---|---|---|
 | `TASK_ENQUEUE_MAX_BATCH` | 10000 | max `count` on one `POST /tasks` |
 | `TASK_LIST_MAX_LIMIT` | 200 | max `limit` on `GET /tasks` |
+| `TASK_THROUGHPUT_MAX_MINUTES` | 1440 | widest `minutes` on `GET /tasks/throughput` |
 | `TASK_API_RATE_LIMIT_PER_MINUTE` | 300 | operator API requests per source IP per minute |
 | `TASK_DEQUEUE_MAX_BATCH` | 100 | max `limit` on `POST /tasks/dequeue` |
 | `TASK_RESULT_MAX_BYTES` | 131072 | result body cap before truncation |
@@ -367,5 +404,11 @@ Stated so none of it is mistaken for an oversight:
 * **No per-operator identity.** `ADMIN_SECRET` is one shared credential, so
   logs record *that* an operator acted and from which apparent address,
   never *which human*.
-* **No browser view of tasks yet.** The dashboard shows workers; queue
-  depth, running tasks and completed tasks arrive in Step 2.7.
+* **No per-source throttling of the dashboard's own calls.** The dashboard
+  proxies these endpoints from one pod, so the whole GUI shares one
+  rate-limit bucket. §3's default of 300/minute is set for that; a
+  deployment that puts many operators behind one dashboard should raise it.
+
+Since Step 2.7 there **is** a browser view of all of this — the task console
+at `/ui/tasks` on the dashboard. It reads the endpoints above through a
+server-side proxy, so the operator credential never reaches the browser.
