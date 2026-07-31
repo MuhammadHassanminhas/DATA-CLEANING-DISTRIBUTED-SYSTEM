@@ -8,11 +8,24 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-07-31 (session 15) — PR #37 merged, `ADMIN_SECRET` ROTATED
+## ⇒ 2026-07-31 (session 15) — Step 2.5 DONE, PR #37 merged, `ADMIN_SECRET` ROTATED
 
-Two housekeeping items, both done. **Step 2.5's status is unchanged: the
-only thing left on it is your own demo and failure demo (§15 items 3–4),
-which you said you will run yourself.**
+### Step 2.5 is DONE and APPROVED — Decision #120
+
+Marked done **on your instruction**, after you said you would run the
+demo yourself. **Recorded honestly and it matters when you read this
+back: §15 items 3–4 were closed as a user scope call, not as an observed
+demo. No demo and no failure demo were run in my presence and none is
+claimed** (§10). Weaker than Step 2.4's approval, which you demonstrated
+personally end to end.
+
+Everything else on 2.5 stands verified: 6 of 6 exit criteria measured,
+253 passed in CI, deployed to staging and production, §8 satisfied over
+the public Internet with the shipped ghcr image. The §6 dashboard gap
+stays deferred to 2.7 (#118) — 2.5 is still not watchable in a browser.
+
+**Next: Step 2.6 — operator task APIs. NOT STARTED. Do not begin without
+an explicit go-ahead (§9).**
 
 ### PR #37 merged
 
