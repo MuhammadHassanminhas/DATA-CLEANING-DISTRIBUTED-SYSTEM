@@ -128,6 +128,14 @@ class Task(Base):
     assigned_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Phase 2.6. Stamped on the `ASSIGNED -> RUNNING` transition, inside the
+    # UPDATE that already performs it. It exists because the transition was
+    # otherwise unrecoverable once the task finished: it wrote `updated_at`,
+    # and completion overwrote that. NULL for tasks that predate migration
+    # 0004, and for tasks that never started.
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Phase 3 columns. Present, indexed nowhere, written by nothing in M2.
     lease_expires_at: Mapped[datetime | None] = mapped_column(

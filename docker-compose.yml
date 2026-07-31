@@ -51,6 +51,11 @@ services:
       RESULT_RETENTION_DAYS: ${RESULT_RETENTION_DAYS:-7}
       RESULT_RETENTION_SWEEP_INTERVAL_SECONDS: ${RESULT_RETENTION_SWEEP_INTERVAL_SECONDS:-3600}
       TASK_RESULT_MAX_BYTES: ${TASK_RESULT_MAX_BYTES:-131072}
+      # Phase 2.6 operator API. Defaults match app/config.py; exposed here
+      # so the rate limit can be demonstrated locally without issuing 300
+      # requests, and so a listing page size can be shrunk to show paging.
+      TASK_API_RATE_LIMIT_PER_MINUTE: ${TASK_API_RATE_LIMIT_PER_MINUTE:-300}
+      TASK_LIST_MAX_LIMIT: ${TASK_LIST_MAX_LIMIT:-200}
     ports:
       - "${COORDINATOR_PORT}:8443"
     volumes:

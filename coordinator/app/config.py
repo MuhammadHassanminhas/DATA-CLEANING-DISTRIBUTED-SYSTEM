@@ -107,6 +107,50 @@ def task_dequeue_max_batch() -> int:
     return int(os.environ.get("TASK_DEQUEUE_MAX_BATCH", "100"))
 
 
+def task_api_rate_limit_per_minute() -> int:
+    """Recommendation, not a measured value (Phase 2.6). Requests per
+    minute per source IP across the operator task API.
+
+    **This is the second layer, not the only one.** ingress-nginx already
+    rate-limits per source IP at the edge (`limitRps`, Step 1.5.5). This one
+    exists because the edge is not in the path for a Docker Compose run, an
+    in-cluster caller, or a port-forward — so without it, "the operator API
+    is rate limited" would be a property of one deployment topology rather
+    than of the coordinator.
+
+    Set well above what a human operator generates because a *program* is
+    the realistic caller: Step 2.7's dashboard will proxy these endpoints
+    from a single pod, so the whole dashboard shares one bucket — the same
+    trap the registration limiter fell into before `_caller_ip` was fixed
+    (see `middleware._caller_ip`). 300/minute leaves room for a 2-second
+    poll plus operators on the same address. Revise against Step 2.8's
+    harness.
+
+    **`POST /tasks/dequeue` is deliberately exempt**, and is the only task
+    endpoint that is. It is a queue primitive rather than part of the
+    operator surface, and `scripts/queue_harness.py` — the versioned harness
+    that proves three replicas never double-assign — drives roughly a
+    thousand claim calls as fast as it can. Limiting it would break a
+    reproducible verification for no security gain: it is admin-
+    authenticated already, and the edge limit still applies on the public
+    path.
+    """
+    return int(os.environ.get("TASK_API_RATE_LIMIT_PER_MINUTE", "300"))
+
+
+def task_list_max_limit() -> int:
+    """Recommendation, not a measured value (Phase 2.6). Hard ceiling on
+    how many tasks one `GET /tasks` page may return.
+
+    Bounds the response an operator can ask the coordinator to build, in
+    the same spirit as the enqueue and dequeue caps. 200 rows of task
+    metadata is a response of a few hundred kilobytes; result bodies are
+    never joined into a listing, which is what keeps that true (see
+    `task_queue.list_tasks`).
+    """
+    return int(os.environ.get("TASK_LIST_MAX_LIMIT", "200"))
+
+
 def task_result_max_bytes() -> int:
     """Ceiling on one persisted result body, in bytes (Phase 2.5).
 
