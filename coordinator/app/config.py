@@ -175,6 +175,23 @@ def db_max_overflow() -> int:
     return int(os.environ.get("DB_MAX_OVERFLOW", "5"))
 
 
+def task_throughput_max_minutes() -> int:
+    """Recommendation, not a measured value (Phase 2.7). Widest window
+    `GET /tasks/throughput` will chart, in minutes.
+
+    The response is one entry per minute in the window including the empty
+    ones, so the window is also the response size: 1,440 is a day of
+    per-minute buckets, a few tens of kilobytes, and the point past which
+    a caller wanting a longer view wants a coarser bucket rather than a
+    bigger list. The dashboard asks for 30.
+
+    It also bounds the range scan the query performs, which is the reason
+    a cap exists at all rather than only a default — an uncapped window is
+    a full-table aggregate wearing a filter.
+    """
+    return int(os.environ.get("TASK_THROUGHPUT_MAX_MINUTES", "1440"))
+
+
 def task_result_max_bytes() -> int:
     """Ceiling on one persisted result body, in bytes (Phase 2.5).
 

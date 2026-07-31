@@ -62,6 +62,7 @@ from app.config import (
     task_dequeue_max_batch,
     task_enqueue_max_batch,
     task_list_max_limit,
+    task_throughput_max_minutes,
     worker_claim_ttl_seconds,
     ws_ping_interval_seconds,
     ws_pong_timeout_seconds,
@@ -108,6 +109,7 @@ from app.task_queue import (
     TRANSITIONED,
     QueueLimitExceeded,
     cancel_queued_task,
+    completions_per_minute,
     counts_by_status,
     dequeue,
     enqueue_batch,
@@ -1395,6 +1397,57 @@ async def task_queue_depth(
         counts = await counts_by_status(session)
 
     return {"depth": depth, "counts": counts}
+
+
+@app.get("/tasks/throughput")
+async def task_throughput(
+    request: Request,
+    response: Response,
+    minutes: int = Query(default=30, ge=1),
+    x_admin_secret: str = Header(default=""),
+) -> dict[str, object]:
+    """Completed tasks per minute over a recent window (Phase 2.7).
+
+    Declared before `/tasks/{task_id}` for the same reason `/tasks/depth`
+    is — FastAPI matches in declaration order.
+
+    This is the read behind the dashboard's throughput chart, and it is a
+    query over `tasks.completed_at` rather than a counter the dashboard
+    accumulates while a browser tab happens to be open. Three consequences,
+    all of them the reason for the choice:
+
+    * The chart survives a page reload, and two operators watching see the
+      same numbers.
+    * A bucket is exactly the rows `GET /tasks?status=COMPLETED` would list
+      for that minute, so "the chart matches measured reality" — this
+      step's exit criterion — is something an operator can check against
+      another endpoint rather than take on trust.
+    * The buckets are cut by Postgres's clock, the same one that stamped
+      the rows, so a browser in another time zone cannot shift them.
+
+    Empty minutes come back as zero rather than being omitted; see
+    `task_queue.completions_per_minute`.
+    """
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="task_throughput"
+    )
+    if rejection is not None:
+        return rejection
+
+    try:
+        async with get_session() as session:
+            series = await completions_per_minute(
+                session, minutes=minutes, max_minutes=task_throughput_max_minutes()
+            )
+    except QueueLimitExceeded as exc:
+        response.status_code = 400
+        return {"detail": str(exc)}
+
+    return {
+        "window_minutes": minutes,
+        "series": series,
+        "completed_in_window": sum(int(point["completed"]) for point in series),
+    }
 
 
 @app.post("/tasks/dequeue")
