@@ -44,19 +44,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Task
 from app.task_states import (
     ASSIGNED,
+    CANCELLED,
     COMPLETED,
     QUEUED,
     RUNNING,
+    TASK_STATES,
     InvalidTaskTransition,
+    UnknownTaskState,
     check_transition,
 )
-from app.task_types import validate_parameters
+from app.task_types import TASK_TYPES, UnknownTaskType, validate_parameters
 
 # Recommendations, not measured values (CLAUDE.md §10). They bound how
 # much work one call can ask for so a single request cannot monopolise a
 # connection or a transaction. Step 2.8's harness is what produces
 # defensible numbers; revise there.
 DEFAULT_DEQUEUE_LIMIT = 1
+# Phase 2.6. Page size when an operator does not ask for one. Small enough
+# to be a readable answer in a terminal, large enough that the common
+# "what happened to my last batch" question is one call. The hard ceiling
+# is configuration (`task_list_max_limit`), not this.
+DEFAULT_LIST_LIMIT = 50
 
 
 class QueueLimitExceeded(ValueError):
@@ -286,6 +294,11 @@ ILLEGAL = "illegal"
 # worker's point of view — the task is completed, so the worker should stop
 # retrying — whereas NOOP is a state report that changed nothing.
 DUPLICATE = "duplicate"
+# Phase 2.6. The task exists but is past the point where a coordinator-side
+# write alone can cancel it — see `cancel_queued_task`. Distinct from
+# ILLEGAL because nothing was attempted: this is a refusal, not a rejected
+# transition, and the caller is told the status that caused it.
+NOT_CANCELLABLE = "not_cancellable"
 
 
 async def mark_status(
@@ -311,12 +324,14 @@ async def mark_status(
       rather than an error, which is what makes duplicate reports harmless
       (§3.7).
 
-    Writes `status` and `updated_at`, and nothing else. In particular it
-    does not touch `lease_expires_at` or `attempt_count` — a Phase 2.1 exit
-    criterion holds those untouched through all of M2 — and it does not
-    stamp `completed_at`, even on `FAILED`: that column belongs to Step
-    2.5's completion path, and `updated_at` already records when the
-    transition happened.
+    Writes `status` and `updated_at`, plus `started_at` on the move to
+    `RUNNING` (Phase 2.6 — inside this same statement, so the hot path gains
+    no extra round trip). In particular it does not touch
+    `lease_expires_at` or `attempt_count` — a Phase 2.1 exit criterion holds
+    those untouched through all of M2 — and it does not stamp
+    `completed_at`, even on `FAILED`: that column belongs to Step 2.5's
+    completion path, and `updated_at` already records when the transition
+    happened.
     """
     try:
         parsed = uuid.UUID(str(task_id))
@@ -344,9 +359,15 @@ async def mark_status(
     if not should_write:
         return NOOP
 
+    # Phase 2.6: the RUNNING transition also stamps when it happened. Set
+    # unconditionally rather than with COALESCE — a task can only reach this
+    # branch from ASSIGNED (a same-state report is the NOOP above), and when
+    # Phase 3 makes a second attempt possible, the start of *this* attempt is
+    # the useful answer.
+    started = ", started_at = now()" if new_status == RUNNING else ""
     await session.execute(
         text(
-            "UPDATE tasks SET status = :status, updated_at = now() "
+            f"UPDATE tasks SET status = :status, updated_at = now(){started} "
             "WHERE id = CAST(:id AS uuid)"
         ),
         {"status": new_status, "id": str(parsed)},
@@ -441,10 +462,17 @@ async def complete_task(
     # `completed_at` is stamped here and nowhere else — Step 2.4 deliberately
     # left it alone, including on failure, because it means "this task
     # produced a result", not "this task stopped moving".
+    #
+    # `started_at` is COALESCEd rather than set (Phase 2.6): when the path
+    # above walked ASSIGNED -> RUNNING, the `task_started` report was lost and
+    # nothing stamped it, so now is the closest true answer available. When
+    # the report did arrive, the real start time is already there and must not
+    # be overwritten with the completion time.
     await session.execute(
         text(
             "UPDATE tasks SET status = :status, result_id = CAST(:result_id AS uuid), "
-            "completed_at = now(), updated_at = now() WHERE id = CAST(:id AS uuid)"
+            "completed_at = now(), updated_at = now(), "
+            "started_at = COALESCE(started_at, now()) WHERE id = CAST(:id AS uuid)"
         ),
         {"status": COMPLETED, "result_id": str(result_id), "id": str(parsed)},
     )
@@ -455,10 +483,9 @@ async def get_task(session: AsyncSession, task_id: str) -> dict[str, Any] | None
     """One task with its result envelope, or None (Phase 2.5).
 
     The minimum read that makes "execution duration recorded and visible"
-    verifiable rather than asserted. It is a **primitive**, in the same
-    sense `POST /tasks/dequeue` was kept as one in Step 2.2: Step 2.6 owns
-    the operator task API with filtering, batch views and full lifecycle
-    history, and will build on this rather than around it.
+    verifiable rather than asserted, and since Phase 2.6 the row the
+    operator API's lifecycle timeline is built from — which is why
+    `started_at` is selected here.
     """
     try:
         parsed = uuid.UUID(str(task_id))
@@ -469,7 +496,7 @@ async def get_task(session: AsyncSession, task_id: str) -> dict[str, Any] | None
         await session.execute(
             text(
                 "SELECT t.id, t.task_type, t.status, t.priority, t.assigned_worker_id, "
-                "t.assigned_at, t.completed_at, t.created_at, t.updated_at, "
+                "t.assigned_at, t.started_at, t.completed_at, t.created_at, t.updated_at, "
                 "t.attempt_count, t.correlation_id, t.result_id, "
                 "r.payload AS result_payload, r.size_bytes AS result_size_bytes, "
                 "r.submitted_at AS result_submitted_at "
@@ -480,6 +507,146 @@ async def get_task(session: AsyncSession, task_id: str) -> dict[str, Any] | None
         )
     ).mappings().one_or_none()
     return dict(row) if row is not None else None
+
+
+async def list_tasks(
+    session: AsyncSession,
+    *,
+    statuses: list[str] | None = None,
+    task_type: str | None = None,
+    worker_id: uuid.UUID | str | None = None,
+    correlation_id: str | None = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+    max_limit: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """List tasks newest-first, filtered (Phase 2.6).
+
+    Returns `(rows, has_more)`.
+
+    **No total count is returned, and that is a decision rather than an
+    omission.** A filtered `COUNT(*)` over `tasks` costs more than the page
+    it describes, and `tasks` grows for the lifetime of the system by design
+    (Decision #79) — so a "3 of 412,905" header would make every listing pay
+    for a number nobody acts on. `has_more` answers the only question a
+    paging caller actually has, and it costs one extra row: the query asks
+    for `limit + 1` and reports whether it got it.
+
+    **The result body is deliberately not joined in.** A page of 200 results
+    at the 128 KB cap is 25 MB of response for a listing. `has_result` says
+    whether one exists, and `GET /tasks/{id}` fetches it. That also keeps
+    this query off `task_results` entirely.
+
+    **Order is fixed at `created_at DESC, id DESC`**, not caller-selectable.
+    `id` breaks ties so a page boundary cannot repeat or skip a row when
+    several tasks share a creation timestamp — which a bulk enqueue
+    guarantees, since one multi-row INSERT stamps them all identically.
+
+    Filters are validated against the same authorities the rest of the
+    system uses — `task_states.TASK_STATES` and the task-type registry — so
+    an unknown value is refused rather than silently matching nothing. An
+    operator who typos a status must be told, not shown an empty list.
+    """
+    if limit < 1:
+        raise QueueLimitExceeded("limit must be at least 1")
+    if limit > max_limit:
+        raise QueueLimitExceeded(f"limit {limit} exceeds the {max_limit}-task listing cap")
+    if offset < 0:
+        raise QueueLimitExceeded("offset must not be negative")
+
+    query = select(
+        Task.id,
+        Task.task_type,
+        Task.status,
+        Task.priority,
+        Task.assigned_worker_id,
+        Task.assigned_at,
+        Task.started_at,
+        Task.completed_at,
+        Task.created_at,
+        Task.updated_at,
+        Task.attempt_count,
+        Task.correlation_id,
+        Task.result_id,
+    )
+
+    if statuses:
+        for state in statuses:
+            if state not in TASK_STATES:
+                raise UnknownTaskState(f"unknown task state: {state!r}")
+        query = query.where(Task.status.in_(statuses))
+    if task_type is not None:
+        if task_type not in TASK_TYPES:
+            raise UnknownTaskType(f"unknown task type: {task_type!r}")
+        query = query.where(Task.task_type == task_type)
+    if worker_id is not None:
+        query = query.where(Task.assigned_worker_id == worker_id)
+    if correlation_id is not None:
+        query = query.where(Task.correlation_id == correlation_id)
+
+    query = query.order_by(Task.created_at.desc(), Task.id.desc()).limit(limit + 1).offset(offset)
+
+    rows = [dict(row) for row in (await session.execute(query)).mappings().all()]
+    has_more = len(rows) > limit
+    return rows[:limit], has_more
+
+
+async def cancel_queued_task(session: AsyncSession, *, task_id: str) -> tuple[str, str | None]:
+    """Cancel a task that is still waiting in the queue (Phase 2.6).
+
+    Returns `(outcome, current_status)`. Does not commit.
+
+    **Only `QUEUED` is cancellable in M2**, and the restriction is
+    deliberate. `task_states` also permits `ASSIGNED -> CANCELLED` and
+    `RUNNING -> CANCELLED`, but a coordinator-side write is not a
+    cancellation: the worker holding that task keeps executing, keeps its
+    credit, and eventually submits a result for a task the database calls
+    terminal — which `complete_task` would then refuse as `ILLEGAL`, losing
+    real work and stranding the credit. Cancelling in-flight work needs a
+    wire message and a worker-side cancel path (the executors already carry
+    the cooperative flag, Decision #94). That is not in Step 2.6's scope, so
+    an in-flight task is refused with its current status rather than
+    half-cancelled.
+
+    **The race against the assignment engine is settled by the row lock, not
+    by timing.** This locks the row `FOR UPDATE` before reading its status;
+    `dequeue` claims with `FOR UPDATE SKIP LOCKED`. Whichever gets there
+    first wins cleanly — a dequeue in flight steps over a row being
+    cancelled, and a cancel arriving mid-dequeue blocks, then sees
+    `ASSIGNED` and refuses. There is no window in which a task is both
+    cancelled and handed out.
+
+    `completed_at` is not stamped: it means "this task produced a result"
+    (Step 2.5), which a cancelled task did not. `updated_at` records when
+    the cancellation happened, and nothing writes the row afterwards.
+    """
+    try:
+        parsed = uuid.UUID(str(task_id))
+    except (ValueError, AttributeError):
+        return NOT_FOUND, None
+
+    row = (
+        await session.execute(
+            text("SELECT status FROM tasks WHERE id = CAST(:id AS uuid) FOR UPDATE"),
+            {"id": str(parsed)},
+        )
+    ).mappings().one_or_none()
+    if row is None:
+        return NOT_FOUND, None
+
+    current = row["status"]
+    if current != QUEUED:
+        return NOT_CANCELLABLE, current
+
+    check_transition(QUEUED, CANCELLED)
+    await session.execute(
+        text(
+            "UPDATE tasks SET status = :status, updated_at = now() "
+            "WHERE id = CAST(:id AS uuid)"
+        ),
+        {"status": CANCELLED, "id": str(parsed)},
+    )
+    return TRANSITIONED, current
 
 
 async def purge_expired_results(session: AsyncSession, *, retention_days: int) -> int:
