@@ -555,6 +555,12 @@ async def shutdown_fleet(runners: list[asyncio.Task], stop: asyncio.Event,
     # that ignores the flag, and `asyncio.wait` is used rather than
     # `gather` because it hands back stragglers instead of waiting on them.
     stop.set()
+    if not runners:
+        # `asyncio.wait` raises on an empty set where `gather` accepted one,
+        # so replacing the second with the first introduced this. It is
+        # reachable from the documented `--workers 0` failure demo, which
+        # must reach its verdict rather than a traceback.
+        return
     _, pending = await asyncio.wait(runners, timeout=timeout)
     if pending:
         for runner in pending:
