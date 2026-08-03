@@ -8,7 +8,107 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-08-03 (session 22) — M2 CLOSE MERGED TO `main`, CI GREEN, DEPLOYED TO BOTH ENVIRONMENTS
+## ⇒ 2026-08-03 (session 23) — PR #48 MERGED, PRODUCTION-VERIFICATION ITEM CLOSED (#151), NO FEATURE WORK
+
+**Three things were asked for and three were done: merge the session-22
+closing record, stop the AKS cluster, and decide how production's version
+gets verified.** No application code was touched, no test was run, no demo
+was performed. `main` is at **`4fb1a927982da3263a0183acd815281c71a069b6`**.
+
+### ⇒ START HERE NEXT SESSION
+
+1. **`production / deploy` for `4fb1a92` is PARKED on its required-reviewer
+   gate.** Production still runs `94ce48a`. The difference is documentation
+   only — no application code changed — so approving it is tidiness, not a
+   fix. **The cluster must be started again before approving it, or the
+   deploy fails on the cluster-up guard.**
+2. **Milestone 3 — Fault Tolerance. NOT STARTED. Do not begin without an
+   explicit go-ahead (§9).**
+3. Still open and unchanged: the **user-run demo including a remote
+   Internet worker** (session 21b's eighteen failure demos were agent-run
+   and local-only), `GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`
+   rotation, and staging's ~20,636 stranded `ASSIGNED` rows for M3 to
+   reclaim.
+
+### PR #48 — merged, after one red check that was not a code failure
+
+The PR arrived with `scan` **failed** and `mergeStateStatus=BLOCKED`. It
+was not the code:
+
+```
+docker: Error response from daemon: Get "https://registry-1.docker.io/v2/": net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)
+Process completed with exit code 125
+```
+
+A docker.io pull of `aquasec/trivy:latest` timed out on the runner, and
+**the identical commit's other CI run had already completed that same step
+successfully** — two runs existed on the head. Re-running that one job
+turned the rollup green with nothing rebuilt and nothing changed.
+
+- **14 of 14 checks pass**, `mergeable=MERGEABLE`, `mergeStateStatus=CLEAN`.
+- Merge commit **`4fb1a927982da3263a0183acd815281c71a069b6`**, its own CI
+  run `30807194447` `success`.
+- CD run `30807252888`: **`staging / deploy` `success`**, and **public
+  staging `/health` returns `4fb1a927982da3263a0183acd815281c71a069b6`
+  with no `-k`** — checked after the deploy, not taken off CD's tick.
+  `production / deploy` is **waiting on its reviewer gate**.
+- Branch `docs/session-22-close` deleted local and remote, ref pruned.
+
+**Worth keeping: a red check here is worth reading before it is worth
+fixing.** `scan` is a report-only Trivy step (`--exit-code 0`); the job
+failed on the registry pull, not on a finding.
+
+### Production version verification — DECIDED (#151), and the item had been miscarried
+
+**The check already existed. It has existed since Step 1.5.4.**
+
+`.github/workflows/_deploy-env.yml`'s "Smoke test + version assert" step
+execs into the already-running coordinator Deployment, requests `/ready`
+and `/health` over localhost, and **fails the deploy unless the deployed
+SHA appears in the response** — the same reusable workflow for staging and
+production alike. Read out of the **production** job's own log for run
+`30805802696`:
+
+```
+{"status":"ready","checks":{"database":"ok","redis":"ok"}}
+{"status":"healthy","version":"94ce48a1e4b55167bb56021813c8c3eff27fb6f2"}
+```
+
+So "production's own version has never been read from a `/health`
+response", carried for four sessions, was **wrong as written**. What was
+true: *the agent* had never read it interactively, because `kubectl exec`,
+`port-forward` and the PowerShell `kubectl get ingress` were each denied by
+the harness permission classifier. The conclusion drawn from that — that
+production rested on CD's green tick alone — did not follow.
+
+**Decision: production keeps no ingress; CD's in-cluster `/health` assert
+is the permanent check.** A public route to production would add a DNS
+label, a certificate and public attack surface, cost student credit, and
+verify nothing the assert does not already verify. Re-confirmed live with
+the Bash form of `kubectl get ingress -A`: **staging has `coordinator` and
+`dashboard` on `4.240.120.113`, production has none.**
+
+**Stated plainly (§10): production is still not reachable from outside the
+cluster, so §8 stays satisfied through staging only.** If M3 or M4 needs an
+off-network worker against production, that is a new decision.
+
+### Cluster and local state at close
+
+- **AKS was STOPPED after the staging deploy finished** — `az aks stop`
+  issued and then confirmed by reading the cluster back: `powerState`
+  **`Stopped`**. See the note above about `production / deploy` needing it
+  started again.
+- **Consequence for THIS entry's own PR: merging it triggers CD, and CD
+  will fail on its cluster-up guard while the cluster is stopped.** Either
+  start the cluster before merging, or expect a red CD and re-run it after.
+- On `main`, in sync with `origin/main` at `4fb1a92`. **Nothing running
+  locally** — no compose stack was started, no container, volume or network
+  was created.
+- **`.env` was not read and not modified, and no secret was printed.**
+
+---
+
+## 2026-08-03 (session 22) — M2 CLOSE MERGED TO `main`, CI GREEN, DEPLOYED TO BOTH ENVIRONMENTS
 
 **The one thing session 21b left owing is discharged: CI has now run on
 the M2 close, it passed, and it is merged.** PR **#46** opened and merged,
