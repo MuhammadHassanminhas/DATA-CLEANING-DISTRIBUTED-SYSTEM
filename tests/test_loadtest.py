@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import pathlib
 import sys
+import urllib.error
 
 import pytest
 
@@ -217,3 +219,31 @@ class TestParser:
         monkeypatch.delenv("COORDINATOR_URL", raising=False)
         assert loadtest.main(["burst", "--enrollment-secret", "e",
                               "--admin-secret", "a"]) == 2
+
+    def test_a_coordinator_that_dies_mid_run_fails_and_still_reports(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """Stopping the coordinator mid-drain is a documented failure demo.
+
+        Found by running that demo: the harness died with a bare traceback,
+        wrote no report and printed nothing to stdout. Exiting non-zero is
+        not enough — a run with no verdict is the one outcome a harness
+        whose whole job is honest reporting must never produce.
+        """
+        async def dies(_args):
+            raise urllib.error.URLError("target machine actively refused it")
+
+        monkeypatch.setitem(loadtest.SCENARIOS, "burst", dies)
+        out = tmp_path / "report.json"
+        code = loadtest.main([
+            "burst", "--url", "https://x", "--enrollment-secret", "e",
+            "--admin-secret", "a", "--json-out", str(out),
+        ])
+
+        assert code == 1
+        report = json.loads(out.read_text(encoding="utf-8"))
+        assert report["aborted"] == "coordinator_unreachable"
+        assert report["checks"]["coordinator_reachable_throughout"] is False
+        captured = capsys.readouterr()
+        assert "coordinator_unreachable" in captured.out
+        assert "FAIL: coordinator_reachable_throughout" in captured.err
