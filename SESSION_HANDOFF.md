@@ -112,6 +112,62 @@ done.
 an htpasswd hash, so there is no plaintext to recover — pick a new one and
 re-seal if local dashboard auth is wanted.
 
+### A real latent defect surfaced — the suite's long-standing flake has a cause
+
+**The follow-up PR's own CI went red, and it was not this PR's doing.**
+`test_a_near_miss_credential_is_rejected_like_a_wild_one` failed with
+
+```
+RuntimeError: <asyncio.locks.Lock ...> is bound to a different event loop
+```
+
+in run `30804364008`, while **the identical commit passed in run
+`30804327884`**. A docs-and-gitignore PR cannot cause that, so it is a
+pre-existing race that this PR happened to expose.
+
+**Root cause, read off the stack rather than inferred:**
+
+```
+coordinator/app/main.py:458        count = await redis_client.incr(key)
+redis/asyncio/client.py:641        conn = self.connection or await pool.get_connection()
+redis/asyncio/connection.py:1096   async with self._lock:
+```
+
+`coordinator/app/redis_client.py:63` builds the Redis client **at import
+time**, so the whole test session shares one `ConnectionPool`, and that
+pool holds an `asyncio.Lock`. `test_coordinator_integration.py` and
+`test_operator_api.py` each run the app under their own `TestClient`, and
+each `TestClient` brings its own event loop.
+
+**Why it is intermittent, which is the part worth keeping:**
+`asyncio.Lock.acquire()` reaches `_get_loop()` **only on the contended
+path** — an uncontended acquire returns without ever looking at the loop.
+Binding therefore requires two coroutines to want a Redis connection at
+the same instant, which the coordinator's **background heartbeat sweep**
+supplies at unpredictable moments. Once bound it is permanent: neither
+`ConnectionPool.reset()` nor `Redis.aclose()` replaces the lock.
+
+**Fixed in the tests, not in the coordinator, and deliberately so** — a
+deployed coordinator has one event loop for the life of the process, so
+the production path cannot reach this. Running one process across many
+loops is a property of the suite alone. It is the same remedy
+`test_operator_api.py` already applies to `assignment._work_available`.
+`tests/conftest.py` (new) hands each module a fresh, unbound lock, and
+`tests/test_event_loop_isolation.py` (new) reproduces the failure
+deterministically and opens no socket.
+
+**Relationship to the session-18 flake, stated carefully:** session 18 saw
+`test_every_operator_endpoint_rejects_a_missing_credential` fail once in
+the same module and never reproduce, and session 20 hypothesised the
+60-second rate-limit window turning a 401 into a 429. **That assertion was
+never captured, so this is NOT proof the two are the same defect.** What
+can be said: a genuine, timing-dependent, order-dependent race in that
+exact module has now been found and closed, and it is the first mechanism
+for flakiness there that has been demonstrated rather than guessed.
+
+**Fifth time a live run has found something the review and the suite both
+missed** — after #144, #145, #146 and #149.
+
 ### One safety gap found and closed
 
 `.env.bak-*` was **not gitignored**. Today's backup holds only
