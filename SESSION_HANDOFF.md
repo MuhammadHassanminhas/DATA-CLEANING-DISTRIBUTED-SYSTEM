@@ -15,19 +15,50 @@ the M2 close, it passed, and it is merged.** PR **#46** opened and merged,
 `main` at **`d0d45b1b3feb5d7488935af98c6f2a50bbc88897`**. No new feature
 work. `.env` was restored from the cluster.
 
+**Two PRs shipped: #46 (the M2 close) and #47 (this record plus a real
+test fix). `main` finished at `94ce48a1e4b55167bb56021813c8c3eff27fb6f2`,
+CI green and deployed to both environments.**
+
 ### ⇒ START HERE NEXT SESSION
 
 1. **⚠ The AKS cluster was RUNNING at close and was NOT stopped.** It was
-   already up when this session started — not started by me — and both CD
-   jobs have finished, so a stop interrupts nothing:
+   already up when this session started — not started by me — and every CD
+   job has finished, so a stop interrupts nothing:
    ```powershell
    az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
    ```
-2. **Merge the follow-up PR carrying this entry** once CI is green. It
-   cannot be inside PR #46 — it records that PR's own merge and deploy.
-   Same call sessions 9, 10, 12, 17 and 20 made.
-3. **Milestone 3 — Fault Tolerance. NOT STARTED. Do not begin without an
+2. **Merge the small PR carrying this closing entry** once CI is green.
+   It cannot be inside PR #47 — it records that PR's own merge and deploy.
+   Same call sessions 9, 10, 12, 17 and 20 made. **Until it lands,
+   `main`'s copy of this entry stops at PR #46 and does not know #47 was
+   merged** (§14).
+3. **Decide how production's version gets verified.** See the ingress
+   finding below. It has been carried four sessions and is now a decision,
+   not an unknown.
+4. **Milestone 3 — Fault Tolerance. NOT STARTED. Do not begin without an
    explicit go-ahead (§9).**
+
+### PR #47 — merged, and it carried more than docs
+
+Five commits, one concern each: the `.gitignore` line, the `.env` recovery
+fix, this session record, **the event-loop lock fix**, and its own record.
+
+- Head `f10552f`: **14 of 14 checks pass**, `mergeable=MERGEABLE`,
+  `mergeStateStatus=CLEAN`.
+- `test` job: **`323 passed, 1 warning in 10.61s`** — 321 before, plus the
+  two new regression tests.
+- Merge commit **`94ce48a1e4b55167bb56021813c8c3eff27fb6f2`**, its own CI
+  run `30805746999` `success`.
+- **CD run `30805802696` `success` on BOTH `staging / deploy` and
+  `production / deploy`.**
+- **Public staging `/health` returns
+  `94ce48a1e4b55167bb56021813c8c3eff27fb6f2` with no `-k`**; production's
+  coordinator image tag is the same SHA. Both checked after the deploy,
+  not taken off CD's tick.
+- Branch `docs/m2-deploy-record` deleted local and remote, ref pruned.
+
+**Suite size is now 323 in CI**, not 321. Anything quoting 321 is
+pre-`94ce48a`.
 
 ### PR #46 — merged on evidence, not on a green tick
 
@@ -189,9 +220,13 @@ repository root. Now ignored.
 
 ### Local state at close
 
-On branch `docs/m2-deploy-record` carrying this entry. **Nothing is
-running locally** — no compose stack was started this session. **The AKS
-cluster is UP and billing.**
+On branch `docs/session-22-close` carrying the final part of this entry;
+`main` is at **`94ce48a`** and in sync with `origin/main`. **Nothing is
+running locally** — no compose stack was started this session, and no
+Docker container, volume or network was created. `.env` is restored (four
+of five recoverable keys) with a gitignored `.env.bak-*` beside it.
+**The AKS cluster is UP and billing** — 2 nodes `Ready`, staging 7 pods,
+production 5.
 
 ---
 
