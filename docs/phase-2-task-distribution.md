@@ -1687,14 +1687,160 @@ documented behaviour, not a fault.
 - Runs in CI on a schedule.
 
 **Exit criteria**
-- [ ] A documented single command runs a load scenario.
-- [ ] 10,000 tasks across 100 workers complete with zero loss — counted.
-- [ ] Throughput and p50/p95/p99 latency measured and recorded in
+- [x] A documented single command runs a load scenario.
+- [x] 10,000 tasks across 100 workers complete with zero loss — counted.
+- [x] Throughput and p50/p95/p99 latency measured and recorded in
       `PHASE_STATE.md`.
-- [ ] Saturation point identified and documented honestly.
-- [ ] Results reproducible across runs.
-- [ ] Load test passes against staging over the real Internet, not only
+- [x] Saturation point identified and documented honestly.
+- [x] Results reproducible across runs.
+- [x] Load test passes against staging over the real Internet, not only
       locally.
+
+### What shipped
+
+`scripts/loadtest.py` — four scenarios, one JSON report, its own pass/fail
+verdict, exit 0/1/2. `tests/test_loadtest.py` covers the verdict logic.
+`.github/workflows/loadtest.yml` runs it weekly and on demand.
+**`docs/load-testing.md` is the document for this step** — the single
+command, every measured table, and what each number does and does not mean.
+Nothing below repeats those tables; this section records how the criteria
+were met and what is *not* claimed.
+
+**No application code changed.** The harness drives the shipped operator
+API and the shipped wire protocol, and imports the real executors from
+`worker/executors.py`. That is deliberate: a load test that needed the
+system modified to accept it would be measuring something else.
+
+### How the fleet is produced, and the ceiling on it
+
+Every simulated worker registers through `POST /workers/register`, refreshes
+a real token, opens a real WebSocket, sends `hello` with declared credits
+and task types, acknowledges assignments, sends `task_started`, executes,
+and submits a real result envelope that it retries until acknowledged. The
+coordinator cannot tell one from a container or a laptop — invariant §3.5.
+
+**Honest ceiling (§10): it is N sessions from one process, not N machines**,
+and the report says so on every run. Two simplifications are marked in the
+code rather than hidden: `sleep` is awaited instead of executed (a no-CPU
+workload simulates faithfully; 400 slots would otherwise need 400 threads),
+and there is no bounded pending-result buffer (Decision #112 is worker-side
+state that does not change the load the coordinator sees). The harness's own
+CPU was **measured** at 45.3% of one core while the coordinator was pinned,
+so it is not the thing being measured.
+
+### The criteria, and how each was met
+
+1. **Single documented command** — `docs/load-testing.md` §1.
+2. **10,000 across 100 workers, zero loss, counted** — three runs, each
+   **10,000 of 10,000 `COMPLETED`** with 10,000 stored results, 10,000
+   distinct task rows and **0 duplicate assignments**. The count is the
+   coordinator's own rows, paged back through `GET /tasks` by correlation
+   id — not the harness's tally of what it was told.
+3. **Throughput and p50/p95/p99 recorded** — in `PHASE_STATE.md`'s Measured
+   Benchmarks and in `docs/load-testing.md` §4.
+4. **Saturation point identified honestly** — §4.3 there. **~110–124 tasks
+   per second for one coordinator process, reached at five workers**, with
+   the component attribution measured (§4.4): coordinator 92–112% of a core,
+   Postgres 43–60%, Redis 3–7%.
+5. **Reproducible across runs** — and the honest form of that claim is in
+   §4.1: the **pass/fail properties reproduce perfectly** (three runs, three
+   times zero loss and zero duplicates) while **the throughput figure
+   reproduces to about ±26%**. Both halves are recorded.
+6. **Passes against staging over the real Internet** — §5 there, with no
+   `-k` and no `--insecure`, so the run is also a certificate validation.
+
+### Two things the run found that were not in the plan
+
+**The saturation ceiling is not what Decision #135 predicted, and both are
+right.** #135 measured operator *page latency* degrading with fleet size and
+concluded the degradation tracked fleet size. Measured here as *pipeline
+throughput*, the ceiling is flat from 5 to 100 workers: one Python process
+on one core, whatever is attached to it. Same underlying constraint seen
+from two directions, and **#135's outstanding number is now that table**.
+The answer is unchanged and already proven — §3.9 horizontal scaling, Step
+1.5.7.
+
+**A defect in the harness's own verdict, found by a real run and fixed.**
+The first `sustained` implementation judged whether the queue kept up using
+the depth sample taken *after* the offer stopped. A run whose queue climbed
+monotonically to **2,116** therefore reported `queue_kept_up: true`, because
+by the last sample it had drained back to zero. The verdict now uses only
+the samples inside the offering window, and
+`tests/test_loadtest.py::TestKeptUp` is the regression guard, built from
+that run's own numbers. Recorded because it is the same shape as Decisions
+#116 and #117: **a check that passes for the wrong reason is worse than no
+check**, and only a live run showed it.
+
+### What is NOT claimed
+
+- **The Internet run is small, and that is a finding rather than a
+  shortcut.** Staging runs the shipped defaults —
+  `REGISTER_RATE_LIMIT_PER_MINUTE` **5 per source IP** plus the ingress's
+  `limit-rps: 5` — and a harness on one laptop is one source address. The
+  control is working correctly; a hundred-worker fleet from one address is
+  exactly the mass fake registration §12 says to refuse. **The Internet run
+  proves the path, not the throughput ceiling**, which the local run owns.
+  Staging was deliberately left as deployed rather than tuned for the test.
+- **Coordinator CPU and memory are `null` in the Internet run.** `/metrics`
+  is not routed on the public ingress, on purpose. Absent, not zero, and not
+  estimated.
+- **No fault injection.** Killing a coordinator mid-drain, partitioning a
+  worker, expiring a lease — Phase 3 owns those.
+- **No performance budget is asserted.** There is no agreed target to assert
+  against, and one invented from a single laptop's numbers would be
+  arbitrary. The scheduled CI job asserts the loss and duplication
+  properties only.
+- **Every published figure is from one laptop** (Intel i5-4460S, 4 cores)
+  and transfers to no other machine.
+
+### Demo you run yourself
+
+From a fresh clone with the stack up (`docker compose up -d`) and a venv
+holding `worker/requirements.txt`:
+
+```bash
+# 1. The single command, small enough to watch.
+python scripts/loadtest.py burst --url https://localhost:8443 \
+  --enrollment-secret "$ENROLLMENT_SECRET" --admin-secret "$ADMIN_SECRET" \
+  --workers 10 --tasks 500 --insecure
+```
+
+1. **Watch it in the browser while it runs.** Open
+   `https://localhost:8444/ui/tasks` first. The queue-depth tile spikes and
+   drains, the throughput chart grows a bar, and the fleet view fills with
+   `loadtest` workers — Step 2.7's console is how this step is watchable
+   (§6).
+2. **Check the harness against the GUI.** Take `correlation_id` from the
+   report and paste it into the console's correlation box: the task count
+   there must equal `read_back.rows`.
+3. **See the pipeline keep up, then not.** Run `sustained --rate 60` and
+   then `--rate 150`, both `--workers 25 --seconds 60`. The first reports
+   `queue_kept_up: true` with sub-second p95; the second reports `false`
+   with the depth series climbing — **and both complete every task.**
+4. **Find the ceiling.** `saturation --ramp 5,10,25,50,100 --tasks 2000`
+   prints each step as it finishes. Throughput does not improve with fleet
+   size, and coordinator CPU sits near one core throughout.
+
+**Failure demo**
+
+1. **Take the workers away** — run `burst --workers 0 --tasks 50
+   --timeout 30`. Every task stays `QUEUED`, the depth tile holds at 50, and
+   the harness exits **1** with `FAIL: every_task_completed` on stderr.
+   Nothing is lost; the work is waiting. (Verified: 20 tasks, all read back
+   `QUEUED`, `every_task_completed: false`, exit 1. Pass `--timeout` or the
+   default makes it wait ten minutes to tell you.)
+2. **Stop the coordinator mid-drain** (`docker compose stop coordinator`
+   during a 10,000-task burst). The harness reports the tasks that never
+   completed and **fails**; `GET /tasks/depth` after restart shows the queue
+   intact. This is a demonstration of the harness's honesty as much as the
+   queue's durability — it must not report a green run.
+3. **Offer more than the pipeline can take** — `sustained --rate 300
+   --seconds 60`. `queue_kept_up` is `false`, the depth series climbs, and
+   **every task still completes** after the offer stops. Over-capacity load
+   is queued, not dropped.
+4. **Prove the limiter is real** — set `REGISTER_RATE_LIMIT_PER_MINUTE` back
+   to `5` and run `--workers 100`. Registration is refused with 429s and
+   `rate_limited_retries` climbs. That is §12 working, not a bug.
 
 ---
 
