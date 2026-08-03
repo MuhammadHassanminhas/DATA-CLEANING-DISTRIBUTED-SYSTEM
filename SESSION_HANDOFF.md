@@ -8,7 +8,141 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-08-03 (session 21) — MILESTONE 2 CLOSED. Docs only, no code, nothing measured.
+## ⇒ 2026-08-03 (session 21b) — ALL 18 FAILURE DEMOS RUN, §13 FRESH CLONE DONE, M2 PROPERLY CLOSED
+
+**You judged the first close a mistake and directed that the skipped
+failure demos actually be performed. They were.** All **eighteen**
+documented failure-demo items across Steps 2.6, 2.7, 2.8 and 2.9 were run
+against a real stack, plus the §13 fresh-clone run. Decisions **#149**
+(a real defect the demos found) and **#150** (the close, superseding
+#148). Suite **321 passed**, `ruff` clean.
+
+### ⚠⚠ READ THIS FIRST — I DESTROYED YOUR `.env`
+
+**`.env` is gone. I overwrote it with `.env.example` by mistake, it is
+gitignored, there is no backup, and I could not recover it.**
+
+What happened: a `git clone` into the scratchpad failed with `Filename
+too long` (the `.git` commit-graph path overflowed MAX_PATH). The `cd`
+into the clone therefore also failed, and because that command sequence
+had **no guard**, the next two commands ran **in the live repository** —
+`cp .env.example .env` and `bash infra/dev-ca/generate-dev-ca.sh`. My
+error, not a tool failure.
+
+**What was lost:** the plaintext `ADMIN_SECRET` rotated in session 15,
+which that file was the only local copy of, plus the staging endpoint
+credentials.
+
+**What is recoverable, and how:** the same `ADMIN_SECRET` value is still
+live in the cluster Secret in both namespaces. With the cluster up:
+
+```powershell
+kubectl -n staging get secret platform-secrets -o jsonpath='{.data.ADMIN_SECRET}'
+# then base64-decode it, and put it back in .env
+```
+
+If you would rather not read it back, rotate it — `docs/runbook.md` has
+the procedure, and it is now an exercised one (Decision #119).
+
+**What was NOT damaged:** the dev CA itself was untouched (`dev-ca.crt`
+and `dev-ca.key` still carry their 22 Jul mtime — the script is
+idempotent for the CA). Only the leaf `coordinator.crt` and
+`dashboard.crt` were reissued, they still verify against the same CA
+(`openssl verify` → OK), and the running stack was unaffected. **No
+secret was printed to the transcript at any point.**
+
+### ⇒ START HERE NEXT SESSION
+
+1. **Restore `.env`** — see above.
+2. **The work is on branch `docs/m2-close`, three commits, NOT pushed and
+   NOT merged.** `main` is still at `39d8360`. **CI has never run on
+   these commits** — that is the one 2.9 criterion still owing evidence.
+   Push, open a PR, get CI green, merge.
+3. **⚠ Check whether the AKS cluster is running and billing.** Not
+   checked this session.
+4. **Milestone 3 — Fault Tolerance. NOT STARTED. Do not begin without an
+   explicit go-ahead (§9).**
+
+### What the demos actually showed
+
+Full record in `docs/phase-2-task-distribution.md` **§2.9.1**. The
+measurements that matter:
+
+- **10-minute task (Decision #100's two-part shape, one window):**
+  `sleep(600)` `COMPLETED` at a coordinator-observed **600.037s**
+  alongside 120 ceiling `hash_rounds`; worker **`ONLINE` in all 118
+  samples**, **114 heartbeats, worst gap 10.52s** against a 12s SUSPECT
+  threshold. **That margin is 1.48s** — far tighter than Step 2.4's
+  5.26s, because 2.4 pinned the worker to `--cpus=1` and this saturated
+  four slots on a 4-core laptop. It passed; it is not comfortable.
+- **5,000 tasks / 5 workers:** 5,000/5,000 `COMPLETED`, **0 duplicate
+  assignments**, depth drained monotonically 4,783 → 0 at 107.0 tasks/s,
+  coordinator at 92.3% of one core. First time this criterion was met at
+  its own number rather than by the harder 10,000-task run.
+- **Coordinator killed mid-drain:** 10,000 accounted for **exactly** —
+  1,689 `COMPLETED` + 8,265 `QUEUED` + 20 `ASSIGNED` + 26 `RUNNING`.
+- **Over-capacity:** offered 300/s, `queue_kept_up` **false**, depth
+  climbed 0 → 12,840, and **18,000/18,000 still completed**.
+- **§13 fresh clone:** clone with no `.env` and no `certs/`, three
+  documented steps only → 5/5 containers, dashboard 200, worker
+  `ONLINE`, task `QUEUED` → `COMPLETED` in **~198 ms**.
+
+### One real defect, found by the demo and not by review (#149)
+
+Step 2.8's own "stop the coordinator mid-drain" demo made the harness
+**die with a bare `URLError` traceback — zero bytes on stdout, no JSON
+report, no verdict at all.** For a harness whose whole job is deciding
+its own pass/fail honestly, that is the one outcome it must never
+produce. Fixed in `main()` (so every scenario is covered, not just
+`burst`), with a regression test. **Fourth time a live run has found
+something on this harness that review and the suite both missed** —
+after #144, #145 and #146.
+
+### Two gotchas worth keeping
+
+- **The task-API rate limiter's window lives in Redis and survives a
+  coordinator restart.** A rate-limit demo re-run too soon sees the
+  previous window's count — the first attempt showed 429 on call 2
+  instead of call 6. Not a defect. Wait for the 60s window.
+- **`burst --workers 0` wrongly PASSED on the first run**, because the
+  stack's own worker container drained the tasks. The documented demo
+  assumes an empty fleet — Decision #146's lesson from the other side.
+  `docker compose stop worker` first.
+
+### What is still NOT satisfied, in the criterion's own words
+
+- **The demos were run by ME, not by you.** §15 items 3–4 ask for your
+  hands on it.
+- **No remote Internet worker took part in any of it.** Everything was
+  local Docker, so 2.9's "including remote Internet workers" clause is
+  **not** claimed. §8 rests on Step 2.8's 300/300 over the public
+  ingress.
+- **CI has not run on these commits.**
+- No fault injection, no multi-host fleet, no asserted performance
+  budget. Every figure is from this one laptop.
+
+### Local state
+
+- Compose project **`dcds29`** is **still up** (coordinator, dashboard,
+  Postgres, Redis, worker) on ports **9447**/**9448**, with a throwaway
+  env file in the scratchpad — **not** `.env`. Teardown:
+  `docker compose -p dcds29 down -v`
+- Standalone test containers **`dcds29-pg`** (15432) and
+  **`dcds29-redis`** (16379) on network `dcds29-test` are also up:
+  `docker rm -f dcds29-pg dcds29-redis && docker network rm dcds29-test`
+- The fresh-clone stack `dcdsfresh` and its clone at `/c/Temp/fc` were
+  **torn down** (`down -v`, volumes removed).
+- **`.venv-loadtest` now also carries the coordinator, dashboard and dev
+  requirements**, so `pytest` runs from it. It is gitignored.
+
+### Still to rotate
+
+`GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD` — unchanged. **And now
+`ADMIN_SECRET` needs restoring or rotating because of my `.env` error.**
+
+---
+
+## 2026-08-03 (session 21) — MILESTONE 2 CLOSED on recorded evidence (SUPERSEDED same day by 21b)
 
 **Short session. Step 2.9 closed and M2 marked COMPLETE by your direction
 (Decision #148), on recorded evidence plus your own demo — not on a full
