@@ -54,12 +54,27 @@ secret was printed to the transcript at any point.**
 ### ⇒ START HERE NEXT SESSION
 
 1. **Restore `.env`** — see above.
-2. **The work is on branch `docs/m2-close`, three commits, NOT pushed and
-   NOT merged.** `main` is still at `39d8360`. **CI has never run on
-   these commits** — that is the one 2.9 criterion still owing evidence.
-   Push, open a PR, get CI green, merge.
-3. **⚠ Check whether the AKS cluster is running and billing.** Not
-   checked this session.
+2. **Open the PR for `docs/m2-close` and merge it once CI is green.** The
+   branch is **pushed** (`origin/docs/m2-close`, three commits) but **no
+   PR exists yet** and `main` is still at `39d8360`.
+   `https://github.com/MuhammadHassanminhas/DATA-CLEANING-DISTRIBUTED-SYSTEM/pull/new/docs/m2-close`
+   **Why it matters, beyond tidiness:**
+   - `PHASE_STATE.md` on `main` still says 2.9 NOT STARTED and M2 IN
+     PROGRESS, so anyone reading `main` gets stale status (§14).
+   - `780f793` is a **real code fix**, not docs. The scheduled `Load
+     test` workflow runs **from the default branch** — that is why it
+     was not registered at all until PR #43 merged — so the weekly run
+     keeps using the version that dies with a bare traceback until this
+     lands.
+   - **CI has never run on these commits.** That is the one 2.9
+     criterion still owing evidence. Do not merge on red; a failure is
+     a finding, not a formality.
+   Past sessions: `gh pr merge` and the GitHub MCP merge have both been
+   denied by the permission classifier, unpredictably. Assume the merge
+   is yours to click.
+3. **⚠ Check whether the AKS cluster is running and billing.**
+   Deliberately **not touched this session at your instruction**, so its
+   state is unknown.
 4. **Milestone 3 — Fault Tolerance. NOT STARTED. Do not begin without an
    explicit go-ahead (§9).**
 
@@ -121,19 +136,26 @@ after #144, #145 and #146.
 - No fault injection, no multi-host fleet, no asserted performance
   budget. Every figure is from this one laptop.
 
-### Local state
+### Local state at close — everything torn down
 
-- Compose project **`dcds29`** is **still up** (coordinator, dashboard,
-  Postgres, Redis, worker) on ports **9447**/**9448**, with a throwaway
-  env file in the scratchpad — **not** `.env`. Teardown:
-  `docker compose -p dcds29 down -v`
-- Standalone test containers **`dcds29-pg`** (15432) and
-  **`dcds29-redis`** (16379) on network `dcds29-test` are also up:
-  `docker rm -f dcds29-pg dcds29-redis && docker network rm dcds29-test`
-- The fresh-clone stack `dcdsfresh` and its clone at `/c/Temp/fc` were
-  **torn down** (`down -v`, volumes removed).
+**Nothing is left running.** Verified by count, not assumed: **0**
+containers, **0** volumes and **0** networks matching `dcds29` or
+`dcdsfresh`.
+
+- Compose project **`dcds29`** (coordinator, dashboard, Postgres, Redis,
+  worker on 9447/9448) — `down -v`, both volumes removed. Every task row
+  behind this session's numbers went with it; the measurements live in
+  `docs/phase-2-task-distribution.md` §2.9.1.
+- Standalone **`dcds29-pg`** / **`dcds29-redis`** and network
+  `dcds29-test` — removed.
+- Fresh-clone stack **`dcdsfresh`** and its clone at `/c/Temp/fc` —
+  removed.
+- **The AKS cluster was deliberately not touched**, at your instruction.
 - **`.venv-loadtest` now also carries the coordinator, dashboard and dev
-  requirements**, so `pytest` runs from it. It is gitignored.
+  requirements**, so `pytest` runs from it directly. Gitignored; it is
+  what the 321-passed run used.
+- Working tree clean, branch `docs/m2-close` pushed and tracking
+  `origin/docs/m2-close`.
 
 ### Still to rotate
 
