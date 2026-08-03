@@ -189,6 +189,7 @@ def test_every_operator_endpoint_rejects_a_missing_credential(client):
     task_id = str(uuid.uuid4())
     assert client.get("/tasks").status_code == 401
     assert client.get("/tasks/depth").status_code == 401
+    assert client.get("/tasks/throughput").status_code == 401
     assert client.get(f"/tasks/{task_id}").status_code == 401
     assert client.post(f"/tasks/{task_id}/cancel").status_code == 401
     assert client.post("/tasks", json={"task_type": "count_to_n"}).status_code == 401
@@ -474,6 +475,74 @@ def test_cancelling_an_unknown_task_is_a_404(client):
 # --------------------------------------------------------------------------
 # The 422 that leaked a live credential in session 13
 # --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# Throughput (Phase 2.7) — the read behind the dashboard's chart
+# --------------------------------------------------------------------------
+
+
+def test_throughput_counts_the_same_completions_the_listing_returns(client):
+    """The exit criterion is "the throughput chart matches measured
+    reality", so the check is not that the endpoint returns a plausible
+    number — it is that its number equals what `GET /tasks?status=COMPLETED`
+    lists over the same window. Two independent reads of the same rows."""
+    reset_tasks()
+    worker_id = register_worker(client)
+    enqueue(client, count=3)
+    for task in dequeue_for(client, worker_id, limit=3):
+        finish_task(task["task_id"], worker_id)
+
+    chart = client.get("/tasks/throughput", headers=AUTH, params={"minutes": 30}).json()
+    listed = client.get(
+        "/tasks", headers=AUTH, params={"status": "COMPLETED", "limit": 200}
+    ).json()
+
+    assert chart["completed_in_window"] == len(listed["tasks"]) == 3
+    assert sum(point["completed"] for point in chart["series"]) == 3
+
+
+def test_throughput_returns_every_minute_in_the_window_including_empty_ones(client):
+    """A chart that omits the quiet minutes draws a busy fleet and an idle
+    one the same way. The series length is the window, not the number of
+    minutes that happened to have completions."""
+    reset_tasks()
+    body = client.get("/tasks/throughput", headers=AUTH, params={"minutes": 10}).json()
+    assert body["window_minutes"] == 10
+    assert len(body["series"]) == 10
+    assert body["completed_in_window"] == 0
+    assert all(point["completed"] == 0 for point in body["series"])
+    minutes = [point["minute"] for point in body["series"]]
+    assert minutes == sorted(minutes), "oldest first, so a chart reads left to right"
+
+
+def test_a_failed_task_is_not_counted_as_throughput(client):
+    """`completed_at` means "produced a result", not "stopped moving" — so a
+    failure must not appear in a completions-per-minute series at all."""
+    reset_tasks()
+    worker_id = register_worker(client)
+    enqueue(client, count=1)
+    claimed = dequeue_for(client, worker_id, limit=1)
+
+    async def fail(sessionmaker):
+        async with sessionmaker() as session:
+            assert await mark_status(
+                session, task_id=claimed[0]["task_id"], worker_id=worker_id, new_status="FAILED"
+            ) == "transitioned"
+            await session.commit()
+
+    db(fail)
+
+    body = client.get("/tasks/throughput", headers=AUTH, params={"minutes": 30}).json()
+    assert body["completed_in_window"] == 0
+
+
+def test_a_window_past_the_cap_is_refused(client):
+    """An uncapped window is a full-table aggregate wearing a filter."""
+    r = client.get("/tasks/throughput", headers=AUTH, params={"minutes": 100000})
+    assert r.status_code == 400
+    assert "exceeds" in r.json()["detail"]
+    assert client.get("/tasks/throughput", headers=AUTH, params={"minutes": 0}).status_code == 422
 
 
 def test_a_validation_error_does_not_quote_the_request_back(client):

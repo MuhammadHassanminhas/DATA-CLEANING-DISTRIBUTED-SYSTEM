@@ -1,0 +1,795 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Tasks — Coordinator Console</title>
+<link rel="stylesheet" href="/static/console.css" />
+<style>
+  /* Page-specific only. Everything shared with the fleet view — colour
+     tokens, tiles, table, chips, banner — lives in console.css. */
+
+  .layout { display: grid; grid-template-columns: 1fr; gap: 18px; }
+
+  @media (min-width: 1100px) {
+    .layout { grid-template-columns: minmax(0, 1fr) 340px; align-items: start; }
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+
+  .panel h2 {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin: 0 0 12px;
+    font-weight: 600;
+  }
+
+  /* ---------- submit form ---------- */
+
+  .field { margin-bottom: 10px; }
+
+  .field label {
+    display: block;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+
+  .field input, .field select, .field textarea {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 8px 10px;
+  }
+
+  .field textarea { resize: vertical; min-height: 60px; }
+
+  button.go {
+    width: 100%;
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 9px 12px;
+    cursor: pointer;
+  }
+
+  button.go:hover { background: color-mix(in srgb, var(--accent) 30%, var(--panel)); }
+  button.go:disabled { opacity: 0.5; cursor: default; }
+
+  .form-note {
+    font-family: var(--mono);
+    font-size: 11px;
+    margin-top: 10px;
+    word-break: break-all;
+    color: var(--text-dim);
+  }
+
+  .form-note.ok { color: var(--online); }
+  .form-note.bad { color: var(--offline); }
+
+  /* ---------- throughput chart ---------- */
+
+  .chart { width: 100%; height: 120px; display: block; }
+  .chart rect { fill: var(--accent); }
+  .chart .axis { stroke: var(--border); stroke-width: 1; }
+  .chart .grid-label { fill: var(--text-faint); font-family: var(--mono); font-size: 9px; }
+
+  .chart-caption {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 8px;
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  /* ---------- task table extras ---------- */
+
+  .tid { font-family: var(--mono); font-size: 12px; color: var(--text-dim); cursor: pointer; }
+  .tid:hover { color: var(--accent); }
+
+  .task-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .task-state .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--dot-color);
+    box-shadow: 0 0 6px var(--dot-color);
+    flex: none;
+  }
+
+  .pager { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+
+  .pager button {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+
+  .pager button:hover:not(:disabled) { color: var(--text); border-color: var(--border-bright); }
+  .pager button:disabled { opacity: 0.4; cursor: default; }
+
+  .pager .where { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+
+  /* ---------- detail drawer ---------- */
+
+  .drawer-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 40;
+  }
+
+  .drawer-backdrop.show { display: block; }
+
+  .drawer {
+    position: fixed;
+    top: 0; right: 0; bottom: 0;
+    width: min(560px, 100%);
+    background: var(--panel);
+    border-left: 1px solid var(--border-bright);
+    padding: 20px 22px 40px;
+    overflow: auto;
+    z-index: 41;
+  }
+
+  .drawer h2 { margin-top: 0; }
+
+  .drawer .close {
+    position: absolute;
+    top: 14px; right: 16px;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 20px;
+    cursor: pointer;
+    line-height: 1;
+  }
+
+  .kv { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 4px 12px; font-size: 12.5px; }
+  .kv dt { font-family: var(--mono); color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .kv dd { margin: 0; font-family: var(--mono); word-break: break-all; }
+
+  .timeline { list-style: none; margin: 0; padding: 0 0 0 14px; border-left: 1px solid var(--border-bright); }
+
+  .timeline li { position: relative; padding: 0 0 14px 16px; font-family: var(--mono); font-size: 12px; }
+
+  .timeline li::before {
+    content: "";
+    position: absolute;
+    left: -20px; top: 4px;
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: var(--dot-color, var(--text-faint));
+    box-shadow: 0 0 6px var(--dot-color, transparent);
+  }
+
+  .timeline .at { color: var(--text-dim); display: block; font-size: 11px; }
+  .timeline .src { color: var(--text-faint); font-size: 10.5px; }
+
+  pre.result {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    overflow: auto;
+    max-height: 260px;
+    margin: 0;
+  }
+
+  .drawer .danger {
+    background: color-mix(in srgb, var(--offline) 14%, var(--panel));
+    border: 1px solid var(--offline);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+  }
+
+  .section { margin-top: 22px; }
+
+  .section-title {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="topbar">
+    <svg class="hub" viewBox="0 0 46 46" aria-hidden="true">
+      <circle cx="23" cy="23" r="21" fill="none" stroke="var(--border)" stroke-width="1"/>
+      <circle cx="23" cy="23" r="14" fill="none" stroke="var(--border-bright)" stroke-width="1"/>
+      <g class="sweep">
+        <path d="M23 23 L23 2 A21 21 0 0 1 41.2 12.5 Z" fill="var(--accent)" opacity="0.16"/>
+        <line x1="23" y1="23" x2="23" y2="2" stroke="var(--accent)" stroke-width="1.5" opacity="0.85"/>
+      </g>
+      <circle cx="23" cy="23" r="4" fill="var(--bg)" stroke="var(--accent)" stroke-width="1.5"/>
+      <circle cx="23" cy="23" r="1.6" fill="var(--accent)"/>
+    </svg>
+    <div class="wordmark">
+      <span class="line1">star topology · coordinator</span>
+      <span class="line2">queue <span class="fleet-count" id="depth-count">—</span></span>
+    </div>
+    <div class="topbar-spacer"></div>
+    <nav class="nav">
+      <a href="/">fleet</a>
+      <a href="/ui/tasks" aria-current="page">tasks</a>
+    </nav>
+    <div class="clock" id="clock">
+      <span class="dot"></span><span id="clock-text">connecting…</span>
+    </div>
+  </header>
+
+  <div class="banner" id="banner">
+    ⚠ coordinator unreachable — retrying every 2s, view will resume automatically
+  </div>
+
+  <div class="summary" id="summary"><!-- lifecycle tiles injected --></div>
+
+  <div class="layout">
+    <div>
+      <div class="controls">
+        <input class="search" id="search" type="text" placeholder="filter by correlation id…" autocomplete="off" />
+        <div class="chips" id="chips">
+          <span class="chip active" data-status="all">all</span>
+          <span class="chip" data-status="QUEUED">queued</span>
+          <span class="chip" data-status="ASSIGNED">assigned</span>
+          <span class="chip" data-status="RUNNING">running</span>
+          <span class="chip" data-status="COMPLETED">completed</span>
+          <span class="chip" data-status="FAILED">failed</span>
+          <span class="chip" data-status="CANCELLED">cancelled</span>
+        </div>
+        <div class="controls-spacer"></div>
+        <div class="poll-note" id="poll-note">polling · 2s</div>
+      </div>
+
+      <div class="table-wrap">
+        <table id="task-table" aria-live="polite">
+          <thead>
+            <tr>
+              <th>state</th>
+              <th>task id</th>
+              <th>type</th>
+              <th>worker</th>
+              <th class="num">duration</th>
+              <th>created</th>
+            </tr>
+          </thead>
+          <tbody id="tbody">
+            <tr><td colspan="6" class="loading-state">loading tasks…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="pager">
+        <button id="prev" disabled>◀ newer</button>
+        <button id="next" disabled>older ▶</button>
+        <span class="where" id="where">—</span>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>throughput · completed per minute</h2>
+        <svg class="chart" id="chart" viewBox="0 0 300 120" preserveAspectRatio="none" role="img"
+             aria-label="tasks completed per minute over the last 30 minutes"></svg>
+        <div class="chart-caption">
+          <span id="chart-window">last 30 min</span>
+          <span id="chart-total">—</span>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top: 18px;">
+        <h2>submit a task</h2>
+        <form id="submit-form" autocomplete="off">
+          <div class="field">
+            <label for="task-type">task type</label>
+            <select id="task-type">
+              <option value="count_to_n">count_to_n</option>
+              <option value="hash_rounds">hash_rounds</option>
+              <option value="sleep">sleep</option>
+              <option value="opaque_payload">opaque_payload</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="params">parameters (json)</label>
+            <textarea id="params" spellcheck="false">{"n": 2000}</textarea>
+          </div>
+          <div class="field">
+            <label for="count">count</label>
+            <input id="count" type="number" min="1" value="1" />
+          </div>
+          <div class="field">
+            <label for="priority">priority (lower is more urgent)</label>
+            <input id="priority" type="number" value="0" />
+          </div>
+          <button class="go" type="submit" id="submit-btn">enqueue</button>
+          <div class="form-note" id="form-note"></div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <footer>Phase 2.7 · task lifecycle console · worker state lives on the <a class="task-link" href="/">fleet</a> view</footer>
+</div>
+
+<div class="drawer-backdrop" id="backdrop"></div>
+<aside class="drawer" id="drawer" style="display: none;" aria-label="task detail">
+  <button class="close" id="drawer-close" aria-label="close">×</button>
+  <div id="drawer-body"></div>
+</aside>
+
+<script>
+(function () {
+  "use strict";
+
+  // Phase 1.8's polling decision, unchanged and for the same reason: a
+  // short poll already reads as real-time, and "the view recovers if the
+  // browser connection drops" is then just "the next poll succeeds".
+  //
+  // Two intervals, because the two reads answer different questions. The
+  // list and the lifecycle counts change continuously and are what "watch a
+  // task go from queued to completed with no refresh" means. The throughput
+  // chart is bucketed *per minute* — polling it every 2s would be 30 calls
+  // to redraw the same bar.
+  const POLL_MS = 2000;
+  const CHART_POLL_MS = 15000;
+  const PAGE_SIZE = 50;
+  const CHART_MINUTES = 30;
+
+  const STATE_COLOR = {
+    QUEUED: "var(--registered)",
+    ASSIGNED: "var(--connecting)",
+    RUNNING: "var(--suspect)",
+    COMPLETED: "var(--online)",
+    FAILED: "var(--offline)",
+    CANCELLED: "var(--quarantined)",
+  };
+  const TILE_ORDER = ["QUEUED", "ASSIGNED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"];
+
+  let statusFilter = "all";
+  let correlationFilter = "";
+  let offset = 0;
+  let hasMore = false;
+  let consecutiveFailures = 0;
+  let openTaskId = null;
+
+  const el = {
+    tbody: document.getElementById("tbody"),
+    summary: document.getElementById("summary"),
+    depthCount: document.getElementById("depth-count"),
+    clock: document.getElementById("clock"),
+    clockText: document.getElementById("clock-text"),
+    banner: document.getElementById("banner"),
+    search: document.getElementById("search"),
+    chips: document.getElementById("chips"),
+    prev: document.getElementById("prev"),
+    next: document.getElementById("next"),
+    where: document.getElementById("where"),
+    chart: document.getElementById("chart"),
+    chartWindow: document.getElementById("chart-window"),
+    chartTotal: document.getElementById("chart-total"),
+    form: document.getElementById("submit-form"),
+    formNote: document.getElementById("form-note"),
+    submitBtn: document.getElementById("submit-btn"),
+    taskType: document.getElementById("task-type"),
+    params: document.getElementById("params"),
+    count: document.getElementById("count"),
+    priority: document.getElementById("priority"),
+    drawer: document.getElementById("drawer"),
+    drawerBody: document.getElementById("drawer-body"),
+    backdrop: document.getElementById("backdrop"),
+    drawerClose: document.getElementById("drawer-close"),
+  };
+
+  // ---------- helpers ----------
+
+  function esc(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+  }
+
+  function shortId(id) {
+    return id ? `${id.slice(0, 8)}…${id.slice(-4)}` : "—";
+  }
+
+  function timeAgo(iso) {
+    if (!iso) return "—";
+    const seconds = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (seconds < 60) return seconds.toFixed(0) + "s ago";
+    if (seconds < 3600) return (seconds / 60).toFixed(0) + "m ago";
+    return (seconds / 3600).toFixed(1) + "h ago";
+  }
+
+  async function api(path, options) {
+    const resp = await fetch(path, Object.assign({ cache: "no-store" }, options || {}));
+    const data = await resp.json().catch(() => ({}));
+    return { ok: resp.ok, status: resp.status, data };
+  }
+
+  // Every write carries the header the dashboard backend demands. A
+  // cross-site form cannot set it, which is what stops a page the operator
+  // happens to visit from enqueueing work on their edge basic-auth session.
+  function writeHeaders() {
+    return { "Content-Type": "application/json", "X-Dashboard-Write": "dashboard" };
+  }
+
+  // ---------- lifecycle tiles + queue depth ----------
+
+  function renderSummary(depth, counts) {
+    el.depthCount.textContent = depth;
+    const tiles = [
+      `<div class="tile" style="--tile-color: var(--accent)"><div class="n">${depth}</div><div class="l">queue depth</div></div>`,
+    ];
+    TILE_ORDER.forEach((state) => {
+      tiles.push(
+        `<div class="tile" style="--tile-color: ${STATE_COLOR[state]}"><div class="n">${counts[state] || 0}</div><div class="l">${state.toLowerCase()}</div></div>`
+      );
+    });
+    el.summary.innerHTML = tiles.join("");
+  }
+
+  // ---------- task table ----------
+
+  function renderRows(tasks) {
+    if (tasks.length === 0) {
+      el.tbody.innerHTML = `<tr><td colspan="6" class="empty-state"><div class="big">no tasks match</div>submit one on the right, or clear the filter</td></tr>`;
+      return;
+    }
+    el.tbody.innerHTML = tasks.map((t) => `
+      <tr data-task="${esc(t.task_id)}">
+        <td><span class="task-state" style="--dot-color: ${STATE_COLOR[t.status] || "var(--text-faint)"}"><span class="dot"></span>${esc(t.status.toLowerCase())}</span></td>
+        <td class="tid" title="${esc(t.task_id)}">${esc(shortId(t.task_id))}</td>
+        <td>${esc(t.task_type)}</td>
+        <td class="wid" title="${esc(t.assigned_worker_id || "")}">${esc(shortId(t.assigned_worker_id))}</td>
+        <td class="num">${t.observed_duration_seconds == null ? "—" : t.observed_duration_seconds.toFixed(3) + "s"}</td>
+        <td>${esc(timeAgo(t.created_at))}</td>
+      </tr>`).join("");
+  }
+
+  function listParams() {
+    const params = new URLSearchParams();
+    if (statusFilter !== "all") params.set("status", statusFilter);
+    if (correlationFilter) params.set("correlation_id", correlationFilter);
+    params.set("limit", String(PAGE_SIZE));
+    params.set("offset", String(offset));
+    return params.toString();
+  }
+
+  async function pollTasks() {
+    try {
+      const [list, depth] = await Promise.all([
+        api("/api/tasks?" + listParams()),
+        api("/api/tasks/depth"),
+      ]);
+      if (!list.ok || !depth.ok) throw new Error(list.data.detail || depth.data.detail || "request failed");
+
+      consecutiveFailures = 0;
+      el.banner.classList.remove("show");
+      el.clock.classList.remove("stale");
+      el.clockText.textContent = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
+
+      renderSummary(depth.data.depth, depth.data.counts || {});
+      renderRows(list.data.tasks || []);
+
+      hasMore = Boolean(list.data.has_more);
+      el.prev.disabled = offset === 0;
+      el.next.disabled = !hasMore;
+      const shown = (list.data.tasks || []).length;
+      el.where.textContent = shown === 0
+        ? "no rows"
+        : `rows ${offset + 1}–${offset + shown}${hasMore ? " (more)" : ""}`;
+
+      // A drawer left open must keep up with the task it is showing, or
+      // "watch it run to completion" stops at whatever it said when opened.
+      if (openTaskId) loadDetail(openTaskId, true);
+    } catch (err) {
+      consecutiveFailures++;
+      if (consecutiveFailures >= 2) {
+        el.banner.classList.add("show");
+        el.clock.classList.add("stale");
+        el.clockText.textContent = "disconnected";
+      }
+    }
+  }
+
+  // ---------- throughput chart ----------
+
+  function renderChart(series, total) {
+    const width = 300, height = 120, floor = 104;
+    const peak = Math.max(1, ...series.map((p) => p.completed));
+    const barWidth = width / Math.max(1, series.length);
+
+    const bars = series.map((point, i) => {
+      const barHeight = (point.completed / peak) * (floor - 8);
+      const x = i * barWidth;
+      const y = floor - barHeight;
+      const label = `${point.completed} completed in the minute starting ${point.minute}`;
+      return `<rect x="${(x + 0.6).toFixed(2)}" y="${y.toFixed(2)}" width="${Math.max(0.8, barWidth - 1.2).toFixed(2)}" height="${barHeight.toFixed(2)}"><title>${esc(label)}</title></rect>`;
+    }).join("");
+
+    el.chart.innerHTML = `
+      ${bars}
+      <line class="axis" x1="0" y1="${floor}" x2="${width}" y2="${floor}" />
+      <text class="grid-label" x="2" y="10">peak ${peak}/min</text>`;
+    el.chartTotal.textContent = `${total} completed in window`;
+  }
+
+  async function pollChart() {
+    const resp = await api(`/api/tasks/throughput?minutes=${CHART_MINUTES}`);
+    if (!resp.ok) return;
+    renderChart(resp.data.series || [], resp.data.completed_in_window || 0);
+    el.chartWindow.textContent = `last ${resp.data.window_minutes} min`;
+  }
+
+  // ---------- detail drawer ----------
+
+  function renderTimeline(timeline) {
+    if (!timeline || timeline.length === 0) return "<p class=\"idle\">no timeline</p>";
+    return `<ul class="timeline">${timeline.map((entry) => `
+      <li style="--dot-color: ${STATE_COLOR[entry.state] || "var(--text-faint)"}">
+        ${esc(entry.state)}
+        <span class="at">${esc(entry.at)}</span>
+        <span class="src">from ${esc(entry.source)}</span>
+      </li>`).join("")}</ul>`;
+  }
+
+  let lastDetailJson = "";
+
+  function renderDetail(task, force) {
+    // The drawer is refreshed by the 2s poll so an open task keeps up with
+    // itself, but a re-render throws away scroll position and whatever the
+    // cancel button last reported. Redraw only when the task actually
+    // changed — which, for a task moving through its lifecycle, is exactly
+    // when the operator wants to see it move.
+    const fingerprint = JSON.stringify(task);
+    if (!force && fingerprint === lastDetailJson) return;
+    lastDetailJson = fingerprint;
+
+    const cancellable = task.status === "QUEUED";
+    el.drawerBody.innerHTML = `
+      <h2>task ${esc(shortId(task.task_id))}</h2>
+      <dl class="kv">
+        <dt>task id</dt><dd>${esc(task.task_id)}</dd>
+        <dt>state</dt><dd><span class="task-state" style="--dot-color: ${STATE_COLOR[task.status] || "var(--text-faint)"}"><span class="dot"></span>${esc(task.status.toLowerCase())}</span></dd>
+        <dt>type</dt><dd>${esc(task.task_type)}</dd>
+        <dt>priority</dt><dd>${esc(task.priority)}</dd>
+        <dt>worker</dt><dd>${esc(task.assigned_worker_id || "—")}</dd>
+        <dt>correlation id</dt><dd>${esc(task.correlation_id || "—")}</dd>
+        <dt>observed duration</dt><dd>${task.observed_duration_seconds == null ? "—" : task.observed_duration_seconds + "s (coordinator)"}</dd>
+        <dt>reported duration</dt><dd>${task.result && task.result.duration_seconds != null ? esc(task.result.duration_seconds) + "s (worker, untrusted)" : "—"}</dd>
+        <dt>attempts</dt><dd>${esc(task.attempt_count)}</dd>
+      </dl>
+
+      <div class="section">
+        <div class="section-title">lifecycle</div>
+        ${renderTimeline(task.timeline)}
+      </div>
+
+      <div class="section">
+        <div class="section-title">result</div>
+        ${task.result
+          ? `<pre class="result">${esc(JSON.stringify(task.result, null, 2))}</pre>`
+          : `<p class="idle">${task.has_result ? "result body expired under the retention policy — the task row is the audit trail" : "no result yet"}</p>`}
+      </div>
+
+      ${cancellable ? `<div class="section"><button class="danger" id="cancel-btn">cancel this task</button><div class="form-note" id="cancel-note"></div></div>` : ""}
+      <div class="section">
+        <a class="task-link" href="?correlation_id=${encodeURIComponent(task.correlation_id || "")}"
+           id="batch-link">show everything this batch created</a>
+      </div>`;
+
+    const cancelBtn = document.getElementById("cancel-btn");
+    if (cancelBtn) cancelBtn.addEventListener("click", () => cancelTask(task.task_id));
+
+    const batchLink = document.getElementById("batch-link");
+    if (batchLink) batchLink.addEventListener("click", (e) => {
+      e.preventDefault();
+      correlationFilter = task.correlation_id || "";
+      el.search.value = correlationFilter;
+      offset = 0;
+      closeDrawer();
+      pollTasks();
+    });
+  }
+
+  async function loadDetail(taskId, quiet) {
+    const resp = await api(`/api/tasks/${encodeURIComponent(taskId)}`);
+    if (!resp.ok) {
+      if (!quiet) el.drawerBody.innerHTML = `<h2>task</h2><p class="idle">${esc(resp.data.detail || "not found")}</p>`;
+      return;
+    }
+    renderDetail(resp.data, !quiet);
+  }
+
+  function openDrawer(taskId) {
+    openTaskId = taskId;
+    lastDetailJson = "";
+    el.drawer.style.display = "block";
+    el.backdrop.classList.add("show");
+    el.drawerBody.innerHTML = '<p class="idle">loading…</p>';
+    loadDetail(taskId, false);
+    if (location.hash !== `#/task/${taskId}`) location.hash = `#/task/${taskId}`;
+  }
+
+  function closeDrawer() {
+    openTaskId = null;
+    el.drawer.style.display = "none";
+    el.backdrop.classList.remove("show");
+    if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+  }
+
+  async function cancelTask(taskId) {
+    const note = document.getElementById("cancel-note");
+    const resp = await api(`/api/tasks/${encodeURIComponent(taskId)}/cancel`, {
+      method: "POST",
+      headers: writeHeaders(),
+      body: "{}",
+    });
+    note.className = "form-note " + (resp.ok ? "ok" : "bad");
+    note.textContent = resp.ok
+      ? `cancelled (was ${resp.data.previous_status})`
+      : resp.data.detail || `refused with ${resp.status}`;
+    loadDetail(taskId, true);
+    pollTasks();
+  }
+
+  // ---------- submit ----------
+
+  const DEFAULT_PARAMS = {
+    count_to_n: '{"n": 2000}',
+    hash_rounds: '{"rounds": 200000}',
+    sleep: '{"seconds": 5}',
+    opaque_payload: '{"payload_b64": "aGVsbG8gd29ybGQ="}',
+  };
+
+  el.taskType.addEventListener("change", () => {
+    el.params.value = DEFAULT_PARAMS[el.taskType.value] || "{}";
+  });
+
+  el.form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    let parameters;
+    try {
+      parameters = JSON.parse(el.params.value || "{}");
+    } catch (err) {
+      el.formNote.className = "form-note bad";
+      el.formNote.textContent = "parameters are not valid JSON";
+      return;
+    }
+
+    el.submitBtn.disabled = true;
+    const resp = await api("/api/tasks", {
+      method: "POST",
+      headers: writeHeaders(),
+      body: JSON.stringify({
+        task_type: el.taskType.value,
+        parameters: parameters,
+        count: Number(el.count.value) || 1,
+        priority: Number(el.priority.value) || 0,
+      }),
+    });
+    el.submitBtn.disabled = false;
+
+    if (resp.ok) {
+      el.formNote.className = "form-note ok";
+      el.formNote.textContent = `queued ${resp.data.count} · correlation ${resp.data.correlation_id}`;
+      offset = 0;
+      pollTasks();
+    } else {
+      el.formNote.className = "form-note bad";
+      // The coordinator's own message, not a dashboard paraphrase — it is
+      // the authority on task types and their parameter bounds.
+      const detail = resp.data.detail;
+      el.formNote.textContent = typeof detail === "string"
+        ? detail
+        : JSON.stringify(detail || `request failed with ${resp.status}`);
+    }
+  });
+
+  // ---------- wiring ----------
+
+  el.chips.addEventListener("click", (e) => {
+    const chip = e.target.closest(".chip");
+    if (!chip) return;
+    statusFilter = chip.dataset.status;
+    offset = 0;
+    [...el.chips.children].forEach((c) => c.classList.toggle("active", c === chip));
+    pollTasks();
+  });
+
+  el.search.addEventListener("change", () => {
+    correlationFilter = el.search.value.trim();
+    offset = 0;
+    pollTasks();
+  });
+
+  el.prev.addEventListener("click", () => {
+    offset = Math.max(0, offset - PAGE_SIZE);
+    pollTasks();
+  });
+
+  el.next.addEventListener("click", () => {
+    if (hasMore) { offset += PAGE_SIZE; pollTasks(); }
+  });
+
+  el.tbody.addEventListener("click", (e) => {
+    const row = e.target.closest("tr[data-task]");
+    if (row) openDrawer(row.dataset.task);
+  });
+
+  el.backdrop.addEventListener("click", closeDrawer);
+  el.drawerClose.addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
+
+  // `#/task/<id>` is the deep link the fleet view's current-task column
+  // points at, so a worker row leads straight to the task it is running.
+  function openFromHash() {
+    const match = /^#\/task\/(.+)$/.exec(location.hash);
+    if (match) openDrawer(decodeURIComponent(match[1]));
+  }
+  window.addEventListener("hashchange", openFromHash);
+
+  const initialCorrelation = new URLSearchParams(location.search).get("correlation_id");
+  if (initialCorrelation) {
+    correlationFilter = initialCorrelation;
+    el.search.value = initialCorrelation;
+  }
+
+  pollTasks();
+  pollChart();
+  openFromHash();
+  setInterval(pollTasks, POLL_MS);
+  setInterval(pollChart, CHART_POLL_MS);
+})();
+</script>
+</body>
+</html>
