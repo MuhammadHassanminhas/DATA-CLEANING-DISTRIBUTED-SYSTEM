@@ -1185,7 +1185,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     started = time.time()
-    report = asyncio.run(SCENARIOS[args.scenario](args))
+    try:
+        report = asyncio.run(SCENARIOS[args.scenario](args))
+    except urllib.error.URLError as exc:
+        # The coordinator became unreachable mid-run — the documented
+        # failure demo (stop it mid-drain) walks straight into this. A
+        # bare traceback would be the one outcome the harness must never
+        # produce: no verdict at all. Report the failure and exit 1, so a
+        # killed coordinator reads as FAIL and never as a green run.
+        report = {
+            "scenario": args.scenario,
+            "aborted": "coordinator_unreachable",
+            "detail": str(exc.reason),
+            "checks": {"coordinator_reachable_throughout": False},
+        }
     report["started_at"] = datetime.fromtimestamp(started).astimezone().isoformat()
     report["wall_seconds"] = round(time.time() - started, 2)
     report["target"] = args.url
