@@ -12,19 +12,27 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 **Three things were asked for and three were done: merge the session-22
 closing record, stop the AKS cluster, and decide how production's version
-gets verified.** No application code was touched, no test was run, no demo
-was performed. `main` is at **`4fb1a927982da3263a0183acd815281c71a069b6`**.
+gets verified.** A fourth then arrived on its own — **stopping the cluster
+while the production gate was parked broke the production deploy, and it
+was diagnosed and fixed.** No application code was touched, no test was
+run, no demo was performed. `main` is at
+**`4fb1a927982da3263a0183acd815281c71a069b6`**, and **both environments now
+run it.**
 
 ### ⇒ START HERE NEXT SESSION
 
-1. **`production / deploy` for `4fb1a92` is PARKED on its required-reviewer
-   gate.** Production still runs `94ce48a`. The difference is documentation
-   only — no application code changed — so approving it is tidiness, not a
-   fix. **The cluster must be started again before approving it, or the
-   deploy fails on the cluster-up guard.**
-2. **Milestone 3 — Fault Tolerance. NOT STARTED. Do not begin without an
+1. **⚠ The AKS cluster is RUNNING and was deliberately NOT stopped**, at
+   your explicit instruction at the end of the session. It is billing.
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+2. **Merge PR #49** (this entry plus Decision #151) once CI is green. It
+   cannot be inside itself — it records its own predecessor's merge and
+   deploy. **Merging it triggers CD, so the cluster must be up when you do,
+   or CD fails on its cluster-up guard.**
+3. **Milestone 3 — Fault Tolerance. NOT STARTED. Do not begin without an
    explicit go-ahead (§9).**
-3. Still open and unchanged: the **user-run demo including a remote
+4. Still open and unchanged: the **user-run demo including a remote
    Internet worker** (session 21b's eighteen failure demos were agent-run
    and local-only), `GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`
    rotation, and staging's ~20,636 stranded `ASSIGNED` rows for M3 to
@@ -51,12 +59,71 @@ turned the rollup green with nothing rebuilt and nothing changed.
 - CD run `30807252888`: **`staging / deploy` `success`**, and **public
   staging `/health` returns `4fb1a927982da3263a0183acd815281c71a069b6`
   with no `-k`** — checked after the deploy, not taken off CD's tick.
-  `production / deploy` is **waiting on its reviewer gate**.
+  `production / deploy` waited on its reviewer gate, then **failed on
+  approval and was fixed — see the next section.**
 - Branch `docs/session-22-close` deleted local and remote, ref pruned.
 
 **Worth keeping: a red check here is worth reading before it is worth
 fixing.** `scan` is a report-only Trivy step (`--exit-code 0`); the job
 failed on the registry pull, not on a finding.
+
+### Stopping the cluster with a gate parked broke the production deploy — cause and fix
+
+**This is a real operational trap and it is mine: the cluster was stopped
+while `production / deploy` was still waiting for its reviewer.** Approving
+the gate later started a Helm upgrade against a cluster that was going
+away.
+
+What Helm's history shows, read from the release itself rather than
+inferred:
+
+| rev | time | status | description |
+|---|---|---|---|
+| 43 | 10:32 | superseded | Upgrade complete (`94ce48a`) |
+| 44 | 10:56 | **pending-upgrade** | Preparing upgrade — never finished |
+| 45 | 11:04 | superseded | **Rollback to 43** |
+| 46 | 11:07 | **deployed** | Upgrade complete (`4fb1a92`) |
+
+- Rev **44** is the upgrade that died with the node. The release was left
+  `pending-upgrade`.
+- The next attempt therefore failed **before touching anything**:
+  `Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is
+  in progress`. Helm refuses to proceed when the latest revision is
+  pending. **Not a chart, manifest or image fault.**
+- The workflow's own `if: failure()` step then ran `helm rollback`, giving
+  rev **45** and leaving production on `94ce48a`, healthy and serving.
+  **That rollback is what unstuck it** — the latest revision became
+  `deployed` again, so Helm's guard no longer fired.
+
+**Fix: re-run the failed job. No manual Helm surgery, nothing deleted.**
+`gh run rerun 30807252888 --failed` → **both `staging / deploy` and
+`production / deploy` `success`**, rev **46 "Upgrade complete"**.
+
+Verified on the running system:
+
+```
+{"status":"ready","checks":{"database":"ok","redis":"ok"}}
+{"status":"healthy","version":"4fb1a927982da3263a0183acd815281c71a069b6"}
+```
+
+and the live Deployment's image tag is
+`…coordinator:4fb1a927982da3263a0183acd815281c71a069b6`. **Both
+environments are on the same SHA.**
+
+**Decision #151's check proved itself under fault the same day it was
+made** — the in-cluster version assert is exactly what stands between a
+half-applied upgrade and a green tick.
+
+**Two things left alone deliberately:** rev 44's `pending-upgrade` record
+is still in the history (harmless now that 46 is latest, and it is the
+evidence of what happened — delete `sh.helm.release.v1.platform.v44` only
+for tidiness), and the deploy step still passes `--atomic`, which now warns
+`Flag --atomic has been deprecated, use --rollback-on-failure instead`.
+Cosmetic today; rename it next time `_deploy-env.yml` is touched.
+
+**The lesson worth carrying: never `az aks stop` while a deploy gate is
+parked.** Approve or cancel the gate first. The cluster-up guard protects
+a deploy that has not started; it does nothing for one already in flight.
 
 ### Production version verification — DECIDED (#151), and the item had been miscarried
 
@@ -94,13 +161,13 @@ off-network worker against production, that is a new decision.
 
 ### Cluster and local state at close
 
-- **AKS was STOPPED after the staging deploy finished** — `az aks stop`
-  issued and then confirmed by reading the cluster back: `powerState`
-  **`Stopped`**. See the note above about `production / deploy` needing it
-  started again.
-- **Consequence for THIS entry's own PR: merging it triggers CD, and CD
-  will fail on its cluster-up guard while the cluster is stopped.** Either
-  start the cluster before merging, or expect a red CD and re-run it after.
+- **The AKS cluster is UP and BILLING at close.** It was stopped
+  mid-session (`az aks stop`, confirmed `powerState: Stopped`), then
+  started again to fix the production deploy, and **left running at your
+  explicit instruction.** Stop command is in START HERE above.
+- Production: 2 coordinator replicas, dashboard, Postgres and Redis all
+  `1/1 Running` on `4fb1a92`.
+- **Merging PR #49 triggers CD**, which needs the cluster up. It is up now.
 - On `main`, in sync with `origin/main` at `4fb1a92`. **Nothing running
   locally** — no compose stack was started, no container, volume or network
   was created.
