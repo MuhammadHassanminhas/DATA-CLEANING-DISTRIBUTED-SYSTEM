@@ -37,9 +37,36 @@ credentials.
 live in the cluster Secret in both namespaces. With the cluster up:
 
 ```powershell
-kubectl -n staging get secret platform-secrets -o jsonpath='{.data.ADMIN_SECRET}'
+kubectl -n staging get secret admin-secret -o jsonpath='{.data.ADMIN_SECRET}'
 # then base64-decode it, and put it back in .env
 ```
+
+**⚠ This command was WRONG until 2026-08-03 (session 22).** It named a
+Secret `platform-secrets` that **does not exist in either namespace** —
+the procedure documented for recovering a credential I destroyed was
+itself broken, and it was only found because you ran it and got
+`Error from server (NotFound)`. Same family as the `docs/runbook.md`
+defects found in sessions 11 and 15: a recovery step is a hypothesis
+until someone executes it.
+
+The real secrets, with the key names and byte counts read from the
+cluster:
+
+| `.env` key | Secret | Key | Bytes | Recoverable |
+|---|---|---|---|---|
+| `ADMIN_SECRET` | `admin-secret` | `ADMIN_SECRET` | 43 | yes |
+| `ENROLLMENT_SECRET` | `app-secrets` | `ENROLLMENT_SECRET` | 43 | yes |
+| `CREDENTIAL_PEPPER` | `app-secrets` | `CREDENTIAL_PEPPER` | 28 | yes |
+| `POSTGRES_PASSWORD` | `postgres-secret` | `POSTGRES_PASSWORD` | 18 | yes |
+| `DASHBOARD_PASSWORD` | `dashboard-basic-auth` | `auth` | 46 | **no — htpasswd hash, the plaintext is gone** |
+
+`TF_API_TOKEN`, `ALERTMANAGER_WEBHOOK_URL` and `GRAFANA_ADMIN_PASSWORD`
+are in none of these and are **not** recoverable from the cluster.
+
+**Note before restoring `POSTGRES_PASSWORD`:** that writes the *cluster's*
+value into your *local* `.env`, so a later local stack would use the
+cluster password locally. Harmless while no local stack exists; leave the
+line alone if you want them kept separate.
 
 If you would rather not read it back, rotate it — `docs/runbook.md` has
 the procedure, and it is now an exercised one (Decision #119).
