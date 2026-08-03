@@ -1,0 +1,139 @@
+name: Load test
+
+# Step 2.8 — the load harness on a schedule.
+#
+# Deliberately NOT part of the required checks on `main`. A load test is a
+# timing measurement on shared, noisy hardware, and a flaky timing gate on
+# every pull request would train people to re-run it until it passed. What
+# runs here is the part that is *not* a timing measurement and must never
+# regress: every task enqueued is read back, completed, carries a result,
+# and was assigned exactly once. Those are pass/fail properties of the
+# pipeline, and they hold at any speed.
+#
+# The throughput and latency figures the job also produces are recorded as
+# an artifact rather than asserted against a threshold. A hosted runner is
+# not the machine any published number was measured on — see
+# `docs/load-testing.md` for where the recorded figures come from.
+
+on:
+  schedule:
+    # 04:17 UTC every Monday. Off the hour on purpose: the top of the hour
+    # is when every other scheduled workflow on the platform starts, and a
+    # queued runner would be measured as latency.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Scenario to run
+        type: choice
+        options: [burst, sustained, mixed, saturation]
+        default: burst
+      workers:
+        description: Simulated workers
+        default: "20"
+      tasks:
+        description: Tasks (per step, for saturation)
+        default: "2000"
+
+concurrency:
+  group: loadtest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  loadtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SCENARIO: ${{ inputs.scenario || 'burst' }}
+      WORKERS: ${{ inputs.workers || '20' }}
+      TASKS: ${{ inputs.tasks || '2000' }}
+      COMPOSE_PROJECT: loadtest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install harness dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt
+
+      - name: Generate the dev CA and service certificates
+        run: bash infra/dev-ca/generate-dev-ca.sh
+
+      # Throwaway credentials, generated here and never leaving the runner.
+      # Written to a file rather than exported: a real environment variable
+      # beats --env-file and has silently handed the coordinator the wrong
+      # password before (recorded in SESSION_HANDOFF.md).
+      - name: Write a throwaway environment file
+        run: |
+          {
+            echo "LOG_LEVEL=WARNING"
+            echo "POSTGRES_USER=coordinator"
+            echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
+            echo "POSTGRES_DB=coordinator"
+            echo "COORDINATOR_PORT=8443"
+            echo "DASHBOARD_PORT=8444"
+            echo "ENROLLMENT_SECRET=$(openssl rand -hex 24)"
+            echo "CREDENTIAL_PEPPER=$(openssl rand -hex 24)"
+            echo "ADMIN_SECRET=$(openssl rand -hex 24)"
+            # The registration limiter is a real control against mass fake
+            # registration (§12) and a fleet arriving from one source
+            # address is exactly what it refuses. A harness is that shape
+            # by construction, so it is raised for this run only.
+            echo "REGISTER_RATE_LIMIT_PER_MINUTE=10000"
+            echo "TASK_API_RATE_LIMIT_PER_MINUTE=3000"
+            echo "ASSIGNMENT_POLL_INTERVAL_SECONDS=5"
+          } > loadtest.env
+
+      - name: Start the stack
+        run: |
+          docker compose -p "$COMPOSE_PROJECT" --env-file loadtest.env \
+            up -d --build postgres redis coordinator
+          for _ in $(seq 1 60); do
+            if curl -sk --max-time 5 https://localhost:8443/health | grep -q healthy; then
+              echo "coordinator healthy"; exit 0
+            fi
+            sleep 2
+          done
+          echo "coordinator never became healthy"; docker compose -p "$COMPOSE_PROJECT" logs coordinator; exit 1
+
+      - name: Run the load scenario
+        run: |
+          set -a; . ./loadtest.env; set +a
+          export COORDINATOR_URL=https://localhost:8443
+          python scripts/loadtest.py "$SCENARIO" \
+            --workers "$WORKERS" --tasks "$TASKS" \
+            --insecure --timeout 900 \
+            --json-out loadtest-report.json
+
+      - name: Summarise the run
+        if: always()
+        run: |
+          if [ -f loadtest-report.json ]; then
+            {
+              echo '### Load test — '"$SCENARIO"
+              echo '```json'
+              python -c "import json;d=json.load(open('loadtest-report.json'));print(json.dumps({k:v for k,v in d.items() if k not in ('coordinator','read_back','by_type')},indent=2))"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-${{ env.SCENARIO }}-${{ github.run_id }}
+          path: loadtest-report.json
+          if-no-files-found: warn
+
+      - name: Coordinator logs on failure
+        if: failure()
+        run: docker compose -p "$COMPOSE_PROJECT" logs --tail 200 coordinator
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p "$COMPOSE_PROJECT" down -v
