@@ -8,7 +8,91 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-08-03 (session 20) — Step 2.8 DONE and APPROVED, MERGED and DEPLOYED to both environments
+## ⇒ 2026-08-03 (session 21) — MILESTONE 2 CLOSED. Docs only, no code, nothing measured.
+
+**Short session. Step 2.9 closed and M2 marked COMPLETE by your direction
+(Decision #148), on recorded evidence plus your own demo — not on a full
+2.9 verification run.** No application code was touched, no test was run,
+nothing was measured. This entry and the `PHASE_STATE.md` rows are the
+whole output.
+
+### ⇒ START HERE NEXT SESSION
+
+1. **The commit is on branch `docs/m2-close`, NOT pushed and NOT merged.**
+   Push, open a PR, get CI green, merge. `main` is at `39d8360`.
+2. **⚠ Check whether the AKS cluster is running and billing.** Not checked
+   this session.
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+3. **Milestone 3 — Fault Tolerance. NOT STARTED. Do not begin without an
+   explicit go-ahead (§9).** `docs/phase-3-fault-tolerance.md` exists.
+
+### What M2's close actually rests on — and what it does not
+
+**You ran the demo yourself on 2026-08-03 and said it worked.** It was
+**not observed by me**, and you did not say whether remote Internet
+workers were part of it, so **neither is claimed** (§10).
+
+**Two of 2.9's nine exit criteria are UNMET and were not quietly waived —
+they are named in the phase doc, the register row and Decision #148:**
+
+- **The user-run failure demo (§15 item 4).** Outstanding since Step 2.6
+  and **never satisfied at any step after 2.4**, now carried five
+  sessions. Your 2026-08-03 demo covered the success path only.
+- **The whole-platform fresh-clone run (§13).** Only the *load harness*
+  was fresh-clone verified (400/400 at Step 2.8). §13 asks this at every
+  milestone boundary, and M2's boundary is being crossed without it.
+
+Both carry into Phase 3 and should be discharged early rather than
+carried further. **This is the weakest milestone close so far** — M1.5's
+at least re-ran part of its failure demo and newly proved the
+database-offline path.
+
+### What was verified this session, and it was little
+
+Three facts, read from the GitHub API rather than assumed:
+
+- **CI `success`** on `main` head `39d8360ff04b21829f5e1963bc5b2f373d56973e`
+  (run `30791973410`).
+- **CD `success`** on the same SHA (run `30792021504`).
+- **`Load test` `success`** on a hosted runner (run `30790101364`) — but
+  at the **previous** SHA `7dce17f`, and it is deliberately **not** a
+  required check on `main` (#143).
+
+Everything else in the close is Step 2.8's measurement, re-recorded, not
+re-run. The throughput and latency figures the criterion asks for are in
+the 2.9 register row.
+
+### `dcds28` was already gone
+
+You asked for it to be stopped. **There was nothing to stop** —
+`docker compose -p dcds28 ps` returned nothing, no container or volume
+carries the `dcds28` project label, and every container on this host is
+`exited`. Its volumes are absent too, so the demo stack was **destroyed,
+not stopped**, and the task rows behind session 20's numbers are gone
+with it. Not a problem: `docs/load-testing.md` holds every measured table.
+
+### Unchanged and still open
+
+`GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD` — still the only
+credentials with known exposure via `.env.example` history, both
+in-cluster only. Postgres needs a coordinated `ALTER USER` *and* Secret
+update or the coordinator drops its connection.
+
+Staging still carries **~20,636 stranded `ASSIGNED` rows** from session
+20's killed run — Decision #91's designed outcome and Phase 3's to
+reclaim, but it will skew any count taken from staging.
+
+Production's own version has **still never been read from a `/health`
+response** and rests on CD's tick.
+
+**`.env` was not read and not modified this session, and no secret was
+printed.**
+
+---
+
+## 2026-08-03 (session 20) — Step 2.8 DONE and APPROVED, MERGED and DEPLOYED to both environments
 
 **Step 2.8 (load testing harness) is built, all six exit criteria measured,
 and awaiting your approval.** Design decisions **#138–#146**. Suite **319

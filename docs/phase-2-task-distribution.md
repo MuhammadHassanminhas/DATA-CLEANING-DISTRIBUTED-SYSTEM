@@ -1868,12 +1868,50 @@ queue depth under load; throughput chart; log excerpt of one task's full
 lifecycle by correlation ID; dashboard showing remote workers executing.
 
 **Exit criteria**
-- [ ] Full demo performed by you, including remote Internet workers.
+- [x] Full demo performed by you, including remote Internet workers.
+      — **PARTIAL, and recorded as such (§10).** You ran the demo yourself
+      on 2026-08-03 and reported it worked. It was **not observed by the
+      agent**, and **the remote-Internet-worker half was not stated**, so
+      it is not claimed. §8 was separately satisfied at Step 2.8 (300/300
+      `COMPLETED` over the public ingress with no `-k`).
 - [ ] Full failure demo performed by you.
-- [ ] Every task lifecycle traceable by a single correlation ID.
-- [ ] Zero duplicate assignments under the 5,000-task load — verified.
-- [ ] Zero task loss across every scenario — counted.
-- [ ] CI green including load test.
+      — **NOT DONE.** Carried unsatisfied since Step 2.6. The scripts are
+      above under each step.
+- [x] Every task lifecycle traceable by a single correlation ID.
+      — **MET at Step 2.5**, not re-run for 2.9: one correlation id spans
+      enqueue → assigned → acknowledged → started → progress → completed
+      across coordinator and worker, and at Step 2.2 one id spanned two
+      different AKS replicas.
+- [x] Zero duplicate assignments under the 5,000-task load — verified.
+      — **MET AND EXCEEDED at Step 2.8**, at 10,000 tasks across 100
+      workers, three runs, **0 duplicate assignments every time**, counted
+      from the coordinator's own rows rather than the harness's tally
+      (#140). **A run at exactly 5,000 was never performed** — the
+      criterion is met by a strictly harder one, not by its own number.
+- [x] Zero task loss across every scenario — counted.
+      — **MET for every scenario actually run**: 10,000/10,000 `COMPLETED`
+      three times, 2,000/2,000 on a hosted CI runner, 300/300 over the
+      public ingress, and 0 lost at an offered 150/s where the queue
+      climbed to 2,116. **Not proven for scenarios never run** — no fault
+      injection, no multi-host fleet.
+- [x] CI green including load test.
+      — **MET, with the shape stated.** CI `success` on `main` head
+      `39d8360` (run `30791973410`) and CD `success` on the same SHA (run
+      `30792021504`). The `Load test` workflow ran **`success` on a hosted
+      runner** (run `30790101364`) — 20 workers, 2,000/2,000 `COMPLETED`,
+      0 duplicates, 129.2 tasks/s — **at the previous SHA `7dce17f`, and
+      it is deliberately not a required check on `main` (#143)**.
 - [ ] Runs from a fresh clone.
-- [ ] `PHASE_STATE.md` updated with measured throughput and latency.
-- [ ] Approval obtained before Phase 3.
+      — **NOT MET at milestone level.** Step 2.8 verified a fresh clone
+      for **the load harness only** (clone → venv → the documented command
+      → 400/400, PASS). The §13 whole-platform fresh-clone run was never
+      performed for M2.
+- [x] `PHASE_STATE.md` updated with measured throughput and latency.
+      — Done in this close; the figures are in the 2.9 register row.
+- [x] Approval obtained before Phase 3.
+      — Given by you 2026-08-03 (Decision #148).
+
+**Closing note (§10).** M2 is closed on recorded evidence plus your own
+demo, **not on a full 2.9 verification run**. Two criteria are unmet and
+stay unmet: the user-run failure demo, and the fresh-clone run. Neither
+was waived quietly — both are named here and in `PHASE_STATE.md`.
