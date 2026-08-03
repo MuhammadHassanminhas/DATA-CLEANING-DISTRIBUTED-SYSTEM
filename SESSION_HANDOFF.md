@@ -8,7 +8,7 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-08-03 (session 20) — Step 2.8 BUILT, VERIFIED, MERGED and DEPLOYED to both environments
+## ⇒ 2026-08-03 (session 20) — Step 2.8 DONE and APPROVED, MERGED and DEPLOYED to both environments
 
 **Step 2.8 (load testing harness) is built, all six exit criteria measured,
 and awaiting your approval.** Design decisions **#138–#146**. Suite **319
@@ -17,13 +17,29 @@ application code changed.**
 
 ### ⇒ START HERE NEXT SESSION
 
-1. **Approve Step 2.8, or ask for changes.** Everything mechanical is done:
-   merged, deployed to both environments, scheduled workflow proven.
+1. **Merge PR #44 if it is still open** — the closing record plus an
+   empty-fleet crash fix. All 7 checks green. See the PR note below.
 2. **The demo and failure demo — now for 2.6, 2.7 AND 2.8.** Fourth session
-   carrying 2.6's and 2.7's. **2.8's is the easy one and the local stack is
-   still up for it** — see below.
+   carrying 2.6's and 2.7's. **2.8's commands are written out in
+   `docs/load-testing.md` and the local stack is still up for them** — see
+   below.
 3. **Step 2.9 — M2 demo and verification. NOT STARTED. Do not begin without
    an explicit go-ahead (§9).**
+
+### Step 2.8 is APPROVED — and on what basis
+
+**Approved by you 2026-08-03 (Decision #147), on the recorded evidence.**
+**Recorded honestly because it matters when you read this back: no demo
+and no failure demo was run in my presence for 2.8, and none is claimed**
+(§15 items 3–4, a user scope call per §10). Same weaker form as Decisions
+#120, #128 and #136; weaker than Step 2.4's, which you demonstrated
+personally end to end.
+
+What it does rest on: six of six exit criteria measured, **320 passing
+tests in CI**, deployment to both environments with public staging
+`/health` verified at the merge SHA with no `-k`, §8 satisfied at 300/300
+over the public ingress, and the scheduled workflow proven green on a
+hosted runner rather than merely configured.
 
 ### Merged and deployed — verified, not taken off CD's green tick
 
@@ -159,7 +175,8 @@ completed, 0 duplicates, PASS**.
 
 ### What is NOT done
 
-- **No demo or failure demo run by you**, for 2.6, 2.7 or 2.8.
+- **No demo or failure demo run by you**, for 2.6, 2.7 or 2.8 — carried a
+  fourth session for 2.6 and 2.7.
 - **Production's own version was not read from a `/health` response** — it
   rests on CD's tick.
 - **No fault injection, no multi-host fleet, no asserted performance
