@@ -152,6 +152,18 @@ Stated so nobody has to discover it during a demo.
    not its own database. Naming it here because "fault tolerance" is
    otherwise easy to read as covering it. Fixing it is a real piece of
    infrastructure work and is not smuggled into this phase.
+   **⇒ ACCEPTED AS A KNOWN RISK by the user on 2026-08-03 (Decision
+   #171). M3 builds nothing for this, tests nothing for it, and no M3
+   exit criterion depends on it.** Recorded here so it is an owned
+   acceptance rather than an assumption. **The cheap upgrade path,
+   written down now so taking it later needs no rediscovery:** a
+   `CronJob` in the chart running `pg_dump` from the image Postgres
+   already uses. That protects against logical loss — a bad migration, an
+   accidental `DELETE`, a corrupt table — and **it does NOT protect
+   against loss of the volume itself unless the dump is written somewhere
+   other than that volume**, which needs external storage and therefore
+   credit. Stated in full so the limitation is not discovered after
+   trusting it.
 4. **A task whose worker completes it while the coordinator is
    permanently gone.** The result buffer is memory-only and bounded at 64
    (`worker.py:241`), abandoned on shutdown by deliberate choice (§3.6,
@@ -478,21 +490,50 @@ happen" is the same read at the same cadence.
 | **#101** — capacity refusal saturates the session | Unchanged and relied upon: it is what absorbs a worker that had a task taken from it |
 | **#105 / #98** | Unchanged |
 
-## 3.0.12 §16 escalations — three things needing your explicit call
+## 3.0.12 §16 escalations — ALL THREE APPROVED 2026-08-03
+
+Raised as three things needing an explicit call. **All three were
+approved by the user on 2026-08-03, in the form each recommendation
+proposed, with the user's instruction being to take the variant that
+costs the least design and implementation time and adds no load to the
+running system.** Decisions **#169**, **#170** and **#171**. The wording
+in Steps 3.3 and 3.4 that each deviation contradicted is corrected in
+this same commit, so no step now asks for something the gate has decided
+against.
 
 1. **`session_epoch` is not used for result fencing** (§3.0.6), which
-   contradicts the wording of Step 3.4 in this document. Using it would
-   break Step 2.5's measured reconnect path. Recommend: approve the
-   deviation and correct 3.4's wording.
-2. **No Redis dedup store** (§3.0.10), which contradicts the wording of
-   Step 3.3. Postgres already answers it structurally and a second store
-   could disagree with the first. Recommend: approve, and re-word 3.3's
-   criterion as "duplicate submission completes the task exactly once —
-   verified in the database", which is what it is actually testing.
+   contradicted the wording of Step 3.4. Using it would break Step 2.5's
+   measured reconnect path. **APPROVED — Decision #169.** Fencing is
+   `worker == assigned_worker_id AND attempt_number == attempt_count`,
+   evaluated inside the row lock the shipped result path already takes.
+   **No new column, no new index, no new query and no extra round trip** —
+   it is the same `UPDATE … WHERE` M2 ships, with two more predicates.
+   `session_epoch` stays on the wire and stays in the logs as a tracing
+   field; it simply is not an input to the accept/reject decision.
+   Step 3.4's third bullet and its epoch exit criterion are re-worded
+   below to match.
+2. **No Redis dedup store** (§3.0.10), which contradicted the wording of
+   Step 3.3. **APPROVED — Decision #170.** Postgres answers duplicate
+   submission structurally: the row lock plus the terminal-state check
+   already measured in Step 2.5. **This is the cheapest possible outcome
+   because it is a deletion, not a build** — there is no dedup store to
+   write, no retention window to tune, no expiry job to run, no extra
+   Redis round trip on the hot result path, and no second store that can
+   disagree with the first after a Redis flush. Step 3.3's Redis bullet
+   and its retention criterion are re-worded below to describe the
+   mechanism that actually exists.
 3. **Postgres has no replica, no PITR and no backup** (§3.0.4 item 3).
-   Not created by M3 and not fixed by it. It should be an explicit
-   accepted risk with a name on it, or a scheduled piece of work — not an
-   assumption that "fault tolerance" covered it.
+   **APPROVED AS AN EXPLICIT ACCEPTED RISK — Decision #171**, accepted by
+   the user on 2026-08-03. **M3 builds nothing for this and claims
+   nothing about it.** The risk is stated plainly in §3.0.4 item 3 and is
+   not covered by any M3 exit criterion. It is not an open question and
+   not a hidden assumption; it is a recorded, owned acceptance. The cheap
+   upgrade path, if it is ever wanted, is written down in §3.0.4 item 3
+   so that taking it later needs no rediscovery.
+
+**Nothing in these three approvals adds a query, a store, a background
+job, a migration or a protocol message.** Two of them remove work that
+the step wording would otherwise have required.
 
 ## 3.0.13 What each later step inherits
 
@@ -516,7 +557,7 @@ happen" is the same read at the same cadence.
 | Crash vs slow-worker distinction objective, not guesswork | §3.0.6 — coordinator-observed message arrival only; progress values and worker status explicitly excluded |
 | Failures explicitly not recovered, with reasoning | §3.0.4, five of them |
 | Delivery guarantee stated accurately | §3.0.5 |
-| Approved before code | **Outstanding — this is what is being asked for** |
+| Approved before code | **MET — Step 3.0 approved by the user 2026-08-03, all three §16 escalations approved with it (#169–#171). No code had been written at the time of approval.** |
 
 ---
 
@@ -570,7 +611,11 @@ happen" is the same read at the same cadence.
 ## Step 3.3 — Idempotency and duplicate suppression
 
 - Enforce the idempotency token that has been carried since Phase 2.
-- Deduplication state in Redis with a documented window and retention.
+- **Deduplication is structural in Postgres — the row lock plus the
+  terminal-state check — and there is NO separate dedup store.** Amended
+  by Decision #170 (§3.0.12); this bullet previously called for
+  deduplication state in Redis with a window and retention. There is no
+  window and no retention because there is nothing to retain.
 - Duplicate submission is a **no-op returning success**, not an error.
 - Resolve the classic race: worker A's result is in flight, the lease
   expires, the task reassigns to worker B, and both results arrive.
@@ -581,7 +626,10 @@ happen" is the same read at the same cadence.
 - [ ] The in-flight-versus-reassignment race has a stated winner rule,
       implemented and tested by deliberately reproducing it.
 - [ ] Duplicate submission returns success, not an error.
-- [ ] Dedup state has a bounded retention and does not grow unbounded.
+- [ ] **No dedup store exists to grow unbounded** — the terminal-state
+      check on the task row is the whole mechanism, and that is asserted
+      rather than assumed (amended by #170; previously "dedup state has a
+      bounded retention").
 - [ ] Dedup works across coordinator replicas.
 - [ ] Result ledger count matches task completion count exactly under
       load.
@@ -590,8 +638,14 @@ happen" is the same read at the same cadence.
 
 ## Step 3.4 — Stale result fencing
 
-- Reject results from superseded attempts using attempt number and
-  session epoch, both present since Phase 2.
+- Reject results from superseded attempts using **task ownership and
+  attempt number** — `worker == assigned_worker_id AND attempt_number ==
+  attempt_count` — both present since Phase 2. Amended by Decision #169
+  (§3.0.12); this bullet previously also named `session_epoch`.
+  **`session_epoch` is deliberately NOT a fencing input**, because Step
+  2.5 measured a legitimate result executed under epoch 4 and submitted
+  on 5 after a reconnect. It stays on the wire and in the logs for
+  tracing.
 - Rejected results never mutate task state.
 - The worker receives an unambiguous rejection response.
 - Rejections are logged and surfaced on the dashboard.
@@ -599,7 +653,11 @@ happen" is the same read at the same cadence.
 **Exit criteria**
 - [ ] A result from a superseded attempt is rejected — verified by
       deliberately reproducing it.
-- [ ] A result from an old session epoch is rejected.
+- [ ] **A result submitted under a NEWER session epoch than the one it
+      was executed under is ACCEPTED** — Step 2.5's measured reconnect
+      path, asserted rather than assumed (amended by #169; previously "a
+      result from an old session epoch is rejected", which would have
+      broken that path).
 - [ ] Rejected results leave task state untouched.
 - [ ] The worker handles rejection gracefully without crashing.
 - [ ] Rejections visible on the dashboard, not buried in logs.
