@@ -10,6 +10,7 @@ run as green while a task went missing.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import pathlib
 import sys
@@ -143,6 +144,22 @@ class TestBurstChecks:
             90, 100, self._rows(rows=90, distinct_task_ids=90, completed=90, with_result=90), []
         )
         assert checks["every_task_accepted"] is False
+
+
+class TestShutdownFleet:
+    def test_an_empty_fleet_shuts_down_without_raising(self):
+        """`burst --workers 0` is a documented failure demo.
+
+        `asyncio.wait` raises `ValueError` on an empty set where `gather`
+        accepted one, so swapping the two — the fix for the shutdown hang —
+        made a zero-worker run die with a traceback instead of reporting
+        `FAIL: every_task_completed`. The exit code was 1 either way, which
+        is exactly why this needs a test rather than an eyeball.
+        """
+        async def go():
+            await loadtest.shutdown_fleet([], asyncio.Event())
+
+        asyncio.run(go())
 
 
 class TestKeptUp:

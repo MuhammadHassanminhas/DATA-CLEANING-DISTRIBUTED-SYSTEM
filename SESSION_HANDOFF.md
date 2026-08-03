@@ -8,6 +8,207 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## ⇒ 2026-08-03 (session 20) — Step 2.8 DONE and APPROVED, MERGED and DEPLOYED to both environments
+
+**Step 2.8 (load testing harness) is built, all six exit criteria measured,
+and awaiting your approval.** Design decisions **#138–#146**. Suite **319
+passed** (was 288 at 2.7) locally **and in CI**, `ruff` clean. **No
+application code changed.**
+
+### ⇒ START HERE NEXT SESSION
+
+1. **Merge PR #44 if it is still open** — the closing record plus an
+   empty-fleet crash fix. All 7 checks green. See the PR note below.
+2. **The demo and failure demo — now for 2.6, 2.7 AND 2.8.** Fourth session
+   carrying 2.6's and 2.7's. **2.8's commands are written out in
+   `docs/load-testing.md` and the local stack is still up for them** — see
+   below.
+3. **Step 2.9 — M2 demo and verification. NOT STARTED. Do not begin without
+   an explicit go-ahead (§9).**
+
+### Step 2.8 is APPROVED — and on what basis
+
+**Approved by you 2026-08-03 (Decision #147), on the recorded evidence.**
+**Recorded honestly because it matters when you read this back: no demo
+and no failure demo was run in my presence for 2.8, and none is claimed**
+(§15 items 3–4, a user scope call per §10). Same weaker form as Decisions
+#120, #128 and #136; weaker than Step 2.4's, which you demonstrated
+personally end to end.
+
+What it does rest on: six of six exit criteria measured, **320 passing
+tests in CI**, deployment to both environments with public staging
+`/health` verified at the merge SHA with no `-k`, §8 satisfied at 300/300
+over the public ingress, and the scheduled workflow proven green on a
+hosted runner rather than merely configured.
+
+### Merged and deployed — verified, not taken off CD's green tick
+
+**PR #43 was merged by you** (I could not: both the GitHub MCP
+`merge_pull_request` *and* `gh pr merge` were **denied by the harness
+permission classifier**, the same non-uniformity recorded in sessions 14,
+15 and 17). Merge commit **`7dce17fc85ecd580783c1f5645a3b9551ca00941`**,
+all 14 CI checks green on head `c0169fa`, branch deleted local and remote.
+
+- **CI `success`** (run `30789275025`) and **CD `success` on BOTH
+  `staging / deploy` and `production / deploy`** (run `30789329354`).
+- **Public staging `/health` returns `7dce17fc85ecd580783c1f5645a3b9551ca00941`
+  with no `-k`**, so the Let's Encrypt certificate genuinely validated and
+  the coordinator reported its own version.
+- **Production was NOT independently checked** and rests on CD's tick
+  alone — the same weaker form as Steps 2.5, 2.6 and 2.7.
+
+### The scheduled workflow gap is CLOSED
+
+At build time `.github/workflows/loadtest.yml` had **never executed**, and
+`gh workflow list` did not show it at all, because GitHub only registers
+`schedule` and `workflow_dispatch` workflows from the default branch.
+After the merge it is registered (**`Load test`, id 325979287**) and has
+now **run green end to end on a hosted runner** — `workflow_dispatch` run
+**`30790101364`**, every step `success` including a clean teardown.
+
+It did real work rather than merely starting: **20 workers connected,
+2,000 tasks, 2,000 rows read back, 2,000 `COMPLETED`, 2,000 stored
+results, 0 duplicate assignments, PASS**, at **129.2 tasks/second** — in
+the same range as this laptop's 110–124/s. So "runs in CI on a schedule"
+is now **demonstrated**, not merely configured.
+
+### ⚠ The AKS cluster is RUNNING and I deliberately left it up
+
+It was **already running when this session started** — not started by me.
+It was left up on purpose so that merging PR #43 could deploy. **Both CD
+jobs have now finished, so nothing is in flight and a stop is safe:**
+
+```powershell
+az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+```
+
+### What shipped
+
+`scripts/loadtest.py` — four scenarios (burst, sustained, mixed,
+saturation), one JSON report, its own pass/fail verdict, exit 0/1/2.
+`tests/test_loadtest.py` (31 tests). `.github/workflows/loadtest.yml`.
+**`docs/load-testing.md` is the document for the step** — every measured
+table lives there, not here.
+
+### The numbers that matter
+
+- **The headline criterion: 10,000 tasks across 100 workers, three runs,
+  10,000 / 10,000 `COMPLETED` every time**, 10,000 stored results, **0
+  duplicate assignments**. Counted from the coordinator's own rows by
+  correlation id, not the harness's tally (#140).
+- **The saturation number #135 deferred to this step now exists:
+  ~110–124 tasks/second for ONE coordinator process, reached at FIVE
+  workers.** Across a 5/10/25/50/100 ramp throughput was **flat and lower
+  at 100 than at 10**. That is a **different** answer from #135's and is
+  recorded as such (#141) — #135 measured operator page latency, this
+  measures pipeline throughput, and both are the same single-process
+  ceiling seen from two directions.
+- **Reproducibility, honestly:** the pass/fail properties reproduce
+  perfectly; **the throughput figure only to ±26%** (114.0 / 84.5 /
+  111.3 tasks/s). What *is* stable is the coordinator at **95.6–97.6% of
+  one core in every run**.
+- **Component attribution, measured not inferred:** coordinator 92–112% of
+  a core, Postgres 43–60%, Redis 3–7%, **the harness itself 45.3%** — so
+  neither the host nor the harness is the bound.
+- **Per-task latency needs `sustained`, not `burst`:** 60/s held exactly at
+  **p50 0.39s / p95 0.71s / p99 1.43s**, against a burst p50 of 45s that is
+  almost entirely queue wait. At 150/s the queue climbs to 2,116 and
+  **still loses nothing**.
+- **§8 satisfied: 300 / 300 `COMPLETED` over the public ingress with no
+  `-k` and no `--insecure`**, p50 1.745s / p95 3.128s, 0 duplicates.
+
+### Three defects, every one found by a live run and none by review
+
+All three were in **the harness**, not the application:
+
+1. **#144** — `queue_kept_up` was judged on the sample taken *after* the
+   offer stopped, so a run whose depth climbed to **2,116** reported
+   `true`. The exit criterion would have been met by a saturated pipeline.
+2. **#145** — cancelling sessions to shut down **hung for nineteen
+   minutes** after every task had completed. `wait_for` waits for its own
+   cancellation to be acted on and `asyncio.run`'s teardown re-gathers
+   survivors, so the run hung *before printing a report it had already
+   computed*. Sessions are now **asked** to stop, not cancelled.
+3. **#146** — the drain check assumed the harness owned the whole fleet.
+   Against staging it could **never finish**: 300 of 300 tasks `COMPLETED`
+   in the database within a minute while it waited on acks that were never
+   coming, because staging's own `demo-worker` executed 78 of them.
+
+### One thing I broke and fixed, worth knowing
+
+My first `test_missing_credentials_exit_two_rather_than_running` read the
+credentials from the environment, **which CI sets** — so it fell through
+the guard and ran a *real load scenario against a bogus host*, adding ~30s
+of DNS failures and pushing two `test_operator_api.py` credential tests
+into failing. It now clears the environment explicitly.
+
+**This is NOT the session-18 flake and I am not claiming to have fixed
+that.** Session 18's `test_every_operator_endpoint_rejects_a_missing_credential`
+failure predates this file. What it does do is **corroborate that session's
+hypothesis**: those credential tests are sensitive to suite wall-time,
+which is consistent with the fixed 60-second rate-limit window turning an
+expected 401 into a 429. Three consecutive clean full runs after the fix.
+
+### The local stack is still up, for your demo
+
+Compose project **`dcds28`**, deliberately left running: coordinator,
+dashboard, Postgres, Redis on ports **9445** (coordinator) and **9446**
+(dashboard). It holds the task rows behind every number above.
+
+- Task console: `https://localhost:9446/ui/tasks` — dev-CA warning, click through
+- Fleet view: `https://localhost:9446/`
+
+Its env file is in the session scratchpad, **not** `.env`, so a recreate
+needs `--env-file` pointing at a copy. Credentials are throwaway.
+
+```powershell
+docker compose -p dcds28 stop          # keep the data
+docker compose -p dcds28 start         # bring it back
+docker compose -p dcds28 down -v       # remove it and its volumes
+```
+
+**To run the harness against it** you need a venv with
+`worker/requirements.txt`; `.venv-loadtest/` in the repo root is one, and
+`.gitignore` now covers `.venv-*/`. Verified from a genuine fresh clone
+this session: clone → venv → the documented command → **400 / 400
+completed, 0 duplicates, PASS**.
+
+### What is NOT done
+
+- **No demo or failure demo run by you**, for 2.6, 2.7 or 2.8 — carried a
+  fourth session for 2.6 and 2.7.
+- **Production's own version was not read from a `/health` response** — it
+  rests on CD's tick.
+- **No fault injection, no multi-host fleet, no asserted performance
+  budget.** Every published figure is from this one laptop (Intel
+  i5-4460S, 4 cores).
+- **This file and `PHASE_STATE.md`'s closing status could not be inside
+  PR #43** — they record that PR's own merge and deploy. They ship as their
+  own follow-up PR, the same call sessions 9, 10, 12 and 17 made.
+
+### Two things I left behind on staging, deliberately recorded
+
+- **My first Internet attempt timed out and was killed**, stranding its
+  tasks in `ASSIGNED` — staging now shows **20,636 `ASSIGNED`** rows. That
+  is Decision #91's designed outcome (commit before send, so a task that
+  never arrived stays visible) and Phase 3's to reclaim, **not** a fault,
+  but it is my doing and it inflates that count.
+- **Staging's `REGISTER_RATE_LIMIT_PER_MINUTE` and every other setting were
+  left exactly as deployed.** Nothing was tuned on a live environment to
+  make the test pass.
+
+### Still to rotate
+
+`GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD` — unchanged, still the
+only credentials with known exposure via `.env.example` history, both
+in-cluster only. Postgres needs a coordinated `ALTER USER` *and* Secret
+update or the coordinator drops its connection.
+
+**`.env` was read this session** (for the staging endpoint's credentials)
+**and never modified, and no secret was printed.**
+
+---
+
 ## ⇒ SESSION CLOSED 2026-08-03 (session 19) — Step 2.7 APPROVED, MERGED and DEPLOYED to both environments
 
 **Short session, no code written.** Step 2.7 was approved, PR #42 merged, the
