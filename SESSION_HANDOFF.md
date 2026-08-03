@@ -8,7 +8,174 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-08-03 (session 22) — M2 CLOSE MERGED TO `main`, CI GREEN, DEPLOYED TO BOTH ENVIRONMENTS
+## ⇒ 2026-08-03 (session 23) — PR #48 MERGED, PRODUCTION-VERIFICATION ITEM CLOSED (#151), NO FEATURE WORK
+
+**Three things were asked for and three were done: merge the session-22
+closing record, stop the AKS cluster, and decide how production's version
+gets verified.** A fourth then arrived on its own — **stopping the cluster
+while the production gate was parked broke the production deploy, and it
+was diagnosed and fixed.** No application code was touched, no test was
+run, no demo was performed. `main` is at
+**`4fb1a927982da3263a0183acd815281c71a069b6`**, and **both environments now
+run it.**
+
+### ⇒ START HERE NEXT SESSION
+
+1. **⚠ The AKS cluster is RUNNING and was deliberately NOT stopped**, at
+   your explicit instruction at the end of the session. It is billing.
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+2. **Merge PR #49** (this entry plus Decision #151) once CI is green. It
+   cannot be inside itself — it records its own predecessor's merge and
+   deploy. **Merging it triggers CD, so the cluster must be up when you do,
+   or CD fails on its cluster-up guard.**
+3. **Milestone 3 — Fault Tolerance. NOT STARTED. Do not begin without an
+   explicit go-ahead (§9).**
+4. Still open and unchanged: the **user-run demo including a remote
+   Internet worker** (session 21b's eighteen failure demos were agent-run
+   and local-only), `GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`
+   rotation, and staging's ~20,636 stranded `ASSIGNED` rows for M3 to
+   reclaim.
+
+### PR #48 — merged, after one red check that was not a code failure
+
+The PR arrived with `scan` **failed** and `mergeStateStatus=BLOCKED`. It
+was not the code:
+
+```
+docker: Error response from daemon: Get "https://registry-1.docker.io/v2/": net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)
+Process completed with exit code 125
+```
+
+A docker.io pull of `aquasec/trivy:latest` timed out on the runner, and
+**the identical commit's other CI run had already completed that same step
+successfully** — two runs existed on the head. Re-running that one job
+turned the rollup green with nothing rebuilt and nothing changed.
+
+- **14 of 14 checks pass**, `mergeable=MERGEABLE`, `mergeStateStatus=CLEAN`.
+- Merge commit **`4fb1a927982da3263a0183acd815281c71a069b6`**, its own CI
+  run `30807194447` `success`.
+- CD run `30807252888`: **`staging / deploy` `success`**, and **public
+  staging `/health` returns `4fb1a927982da3263a0183acd815281c71a069b6`
+  with no `-k`** — checked after the deploy, not taken off CD's tick.
+  `production / deploy` waited on its reviewer gate, then **failed on
+  approval and was fixed — see the next section.**
+- Branch `docs/session-22-close` deleted local and remote, ref pruned.
+
+**Worth keeping: a red check here is worth reading before it is worth
+fixing.** `scan` is a report-only Trivy step (`--exit-code 0`); the job
+failed on the registry pull, not on a finding.
+
+### Stopping the cluster with a gate parked broke the production deploy — cause and fix
+
+**This is a real operational trap and it is mine: the cluster was stopped
+while `production / deploy` was still waiting for its reviewer.** Approving
+the gate later started a Helm upgrade against a cluster that was going
+away.
+
+What Helm's history shows, read from the release itself rather than
+inferred:
+
+| rev | time | status | description |
+|---|---|---|---|
+| 43 | 10:32 | superseded | Upgrade complete (`94ce48a`) |
+| 44 | 10:56 | **pending-upgrade** | Preparing upgrade — never finished |
+| 45 | 11:04 | superseded | **Rollback to 43** |
+| 46 | 11:07 | **deployed** | Upgrade complete (`4fb1a92`) |
+
+- Rev **44** is the upgrade that died with the node. The release was left
+  `pending-upgrade`.
+- The next attempt therefore failed **before touching anything**:
+  `Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is
+  in progress`. Helm refuses to proceed when the latest revision is
+  pending. **Not a chart, manifest or image fault.**
+- The workflow's own `if: failure()` step then ran `helm rollback`, giving
+  rev **45** and leaving production on `94ce48a`, healthy and serving.
+  **That rollback is what unstuck it** — the latest revision became
+  `deployed` again, so Helm's guard no longer fired.
+
+**Fix: re-run the failed job. No manual Helm surgery, nothing deleted.**
+`gh run rerun 30807252888 --failed` → **both `staging / deploy` and
+`production / deploy` `success`**, rev **46 "Upgrade complete"**.
+
+Verified on the running system:
+
+```
+{"status":"ready","checks":{"database":"ok","redis":"ok"}}
+{"status":"healthy","version":"4fb1a927982da3263a0183acd815281c71a069b6"}
+```
+
+and the live Deployment's image tag is
+`…coordinator:4fb1a927982da3263a0183acd815281c71a069b6`. **Both
+environments are on the same SHA.**
+
+**Decision #151's check proved itself under fault the same day it was
+made** — the in-cluster version assert is exactly what stands between a
+half-applied upgrade and a green tick.
+
+**Two things left alone deliberately:** rev 44's `pending-upgrade` record
+is still in the history (harmless now that 46 is latest, and it is the
+evidence of what happened — delete `sh.helm.release.v1.platform.v44` only
+for tidiness), and the deploy step still passes `--atomic`, which now warns
+`Flag --atomic has been deprecated, use --rollback-on-failure instead`.
+Cosmetic today; rename it next time `_deploy-env.yml` is touched.
+
+**The lesson worth carrying: never `az aks stop` while a deploy gate is
+parked.** Approve or cancel the gate first. The cluster-up guard protects
+a deploy that has not started; it does nothing for one already in flight.
+
+### Production version verification — DECIDED (#151), and the item had been miscarried
+
+**The check already existed. It has existed since Step 1.5.4.**
+
+`.github/workflows/_deploy-env.yml`'s "Smoke test + version assert" step
+execs into the already-running coordinator Deployment, requests `/ready`
+and `/health` over localhost, and **fails the deploy unless the deployed
+SHA appears in the response** — the same reusable workflow for staging and
+production alike. Read out of the **production** job's own log for run
+`30805802696`:
+
+```
+{"status":"ready","checks":{"database":"ok","redis":"ok"}}
+{"status":"healthy","version":"94ce48a1e4b55167bb56021813c8c3eff27fb6f2"}
+```
+
+So "production's own version has never been read from a `/health`
+response", carried for four sessions, was **wrong as written**. What was
+true: *the agent* had never read it interactively, because `kubectl exec`,
+`port-forward` and the PowerShell `kubectl get ingress` were each denied by
+the harness permission classifier. The conclusion drawn from that — that
+production rested on CD's green tick alone — did not follow.
+
+**Decision: production keeps no ingress; CD's in-cluster `/health` assert
+is the permanent check.** A public route to production would add a DNS
+label, a certificate and public attack surface, cost student credit, and
+verify nothing the assert does not already verify. Re-confirmed live with
+the Bash form of `kubectl get ingress -A`: **staging has `coordinator` and
+`dashboard` on `4.240.120.113`, production has none.**
+
+**Stated plainly (§10): production is still not reachable from outside the
+cluster, so §8 stays satisfied through staging only.** If M3 or M4 needs an
+off-network worker against production, that is a new decision.
+
+### Cluster and local state at close
+
+- **The AKS cluster is UP and BILLING at close.** It was stopped
+  mid-session (`az aks stop`, confirmed `powerState: Stopped`), then
+  started again to fix the production deploy, and **left running at your
+  explicit instruction.** Stop command is in START HERE above.
+- Production: 2 coordinator replicas, dashboard, Postgres and Redis all
+  `1/1 Running` on `4fb1a92`.
+- **Merging PR #49 triggers CD**, which needs the cluster up. It is up now.
+- On `main`, in sync with `origin/main` at `4fb1a92`. **Nothing running
+  locally** — no compose stack was started, no container, volume or network
+  was created.
+- **`.env` was not read and not modified, and no secret was printed.**
+
+---
+
+## 2026-08-03 (session 22) — M2 CLOSE MERGED TO `main`, CI GREEN, DEPLOYED TO BOTH ENVIRONMENTS
 
 **The one thing session 21b left owing is discharged: CI has now run on
 the M2 close, it passed, and it is merged.** PR **#46** opened and merged,
