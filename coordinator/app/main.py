@@ -121,6 +121,8 @@ from app.task_queue import (
     purge_expired_results,
     queue_depth,
     renew_worker_leases,
+    task_attempts,
+    worker_failure_counts,
 )
 from app.task_policies import (
     InvalidTaskPolicy,
@@ -692,6 +694,58 @@ async def list_workers(response: Response, x_admin_secret: str = Header(default=
         items.append(item)
 
     return {"workers": items, "server_time": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/workers/failures")
+async def worker_failures(
+    request: Request, response: Response, x_admin_secret: str = Header(default="")
+) -> dict[str, object]:
+    """Per-worker failure counters (Phase 3.2 exit criterion).
+
+    One row per worker per outcome, counted from `task_attempts` — the same
+    rows `GET /tasks/{id}` shows on an individual task, aggregated the other
+    way. `REASSIGNED` means a worker lost a task that was tried again;
+    `FAILED` means it held the attempt that used the last one up.
+
+    **Derived, never accumulated.** A counter column on `workers` would be
+    a second write on the recovery path and a number that could disagree
+    with the history it summarises; this cannot drift, because it *is* the
+    history.
+
+    **A separate endpoint from `GET /workers` on purpose.** That one is the
+    dashboard's 2s poll (§6); this is a grouped scan over a table that
+    grows with every abnormal ending. The rare read must not be charged to
+    the frequent one — the same reasoning that keeps `counts_by_status` out
+    of `queue_depth`.
+
+    This is also the read Phase 4 consumes: "which workers fail most" is a
+    scheduling input, and it is **coordinator-observed** (§12) — every row
+    here was written by the reclaimer, never reported by a worker.
+
+    Declared before `/workers/{worker_id}/...` routes: FastAPI matches in
+    declaration order, and `failures` must not be read as a worker id.
+    """
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="worker_failures"
+    )
+    if rejection is not None:
+        return rejection
+
+    async with get_session() as session:
+        rows = await worker_failure_counts(session)
+
+    return {
+        "workers": [
+            {
+                "worker_id": str(row["worker_id"]),
+                "outcome": row["outcome"],
+                "failures": int(row["failures"]),
+                "last_failure_at": row["last_failure_at"].isoformat(),
+            }
+            for row in rows
+        ],
+        "count": len(rows),
+    }
 
 
 @app.post("/workers/token/refresh")
@@ -1391,6 +1445,15 @@ def _task_summary(row: dict[str, Any]) -> dict[str, object]:
         # on every laptop in the room, which is exactly the failure mode
         # `completions_per_minute` already avoids by bucketing in Postgres.
         "lease_seconds_remaining": _seconds_until(row["lease_expires_at"]),
+        # Phase 3.2. Why a QUEUED task is sitting there: `not_before` is its
+        # retry backoff, `excluded_worker_id` is the worker that lost the
+        # previous attempt and may not immediately have it back. Both NULL
+        # for a task that has never been reclaimed, which is the common case.
+        "not_before": row["not_before"].isoformat() if row["not_before"] else None,
+        "retry_in_seconds": _seconds_until(row["not_before"]),
+        "excluded_worker_id": (
+            str(row["excluded_worker_id"]) if row["excluded_worker_id"] else None
+        ),
     }
 
 
@@ -1854,6 +1917,10 @@ async def inspect_task(
 
     async with get_session() as session:
         task = await get_task(session, task_id)
+        # Phase 3.2. Read in the same session, and only for a single task —
+        # this is the inspection endpoint, not the listing (§3.0.7's reason
+        # for not putting attempt rows on the hot read path).
+        attempts = await task_attempts(session, task_id=task_id) if task else []
 
     if task is None:
         response.status_code = 404
@@ -1862,6 +1929,22 @@ async def inspect_task(
     return {
         **_task_summary(task),
         "timeline": _lifecycle(task),
+        # **What makes a FAILED task inspectable rather than merely
+        # visible** (Step 3.2 exit criterion, and gate §3.0.4 item 2): one
+        # row per attempt that ended abnormally, naming the worker that
+        # held it and which clock ran out. A task that has never been
+        # reclaimed has an empty list here, not a missing field.
+        "attempts": [
+            {
+                "attempt_number": attempt["attempt_number"],
+                "worker_id": str(attempt["worker_id"]) if attempt["worker_id"] else None,
+                "outcome": attempt["outcome"],
+                "reason": attempt["reason"],
+                "recorded_at": attempt["recorded_at"].isoformat(),
+                "correlation_id": attempt["correlation_id"],
+            }
+            for attempt in attempts
+        ],
         # None once the retention sweep has removed the body. The task row
         # survives as the audit trail — that is the documented behaviour of
         # `RESULT_RETENTION_DAYS`, not a lost result.
