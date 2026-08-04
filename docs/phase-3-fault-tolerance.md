@@ -839,15 +839,236 @@ are the two accelerator paths.
   dropped.
 
 **Exit criteria**
-- [ ] Killing a worker mid-task causes automatic reassignment; a
+- [x] Killing a worker mid-task causes automatic reassignment; a
       different worker completes it.
-- [ ] Attempt count increments visibly on the dashboard.
-- [ ] A poison task exhausts retries and lands in terminal `FAILED`,
+- [x] Attempt count increments visibly on the dashboard.
+- [x] A poison task exhausts retries and lands in terminal `FAILED`,
       visible in the GUI.
-- [ ] The failed worker is excluded from the immediate retry — verified.
-- [ ] Failure counters accumulate per worker and are queryable.
-- [ ] Reassignment works when the failed worker is a remote Internet
-      machine, not only a local container.
+- [x] The failed worker is excluded from the immediate retry — verified.
+- [x] Failure counters accumulate per worker and are queryable.
+- [ ] **NOT MET. Reassignment works when the failed worker is a remote
+      Internet machine, not only a local container.** No worker outside
+      this laptop took part in any of the runs below, so §8 is **not**
+      claimed for this step. Same gap Step 3.1 recorded, carried
+      deliberately rather than quietly.
+
+---
+
+## 3.2.1 What was built
+
+**No migration.** Migration 0006 already carries `tasks.not_before`,
+`tasks.excluded_worker_id` and the `task_policies.max_attempts` column,
+named there as Step 3.2's and written by nothing in 3.1 (gate §3.0.7's
+one-migration rule paying off exactly as intended).
+
+The retry policy lives **inside the reclaim statement**, not in a second
+pass over the rows it just wrote:
+
+| Branch | Condition | Write |
+|---|---|---|
+| retry | `attempt_count + 1 < max_attempts` | `QUEUED`, `attempt_count + 1`, `excluded_worker_id = the worker that lost it`, `not_before = now() + full_jitter(attempt)` |
+| exhausted | `attempt_count + 1 >= max_attempts` | terminal `FAILED`, `attempt_count + 1`, **both retry columns NULL** |
+
+Both branches write one `task_attempts` row. The dequeue predicate gains
+the two eligibility conditions the gate specified, inside the same ordered
+index walk it already performed.
+
+Also new: `max_attempts` as a real per-type policy (`PUT
+/tasks/policies/{type}`, no redeploy); `GET /workers/failures`; `attempts`
+on `GET /tasks/{id}`; `not_before`, `retry_in_seconds` and
+`excluded_worker_id` on every task listing row; a best-effort `task_cancel`
+to the worker that lost the task, over the shipped `worker:{id}:push`
+channel, and the worker-side handler and `capacity` reply that answers it;
+`coordinator_tasks_reassigned_total`, `coordinator_tasks_exhausted_total`
+and `coordinator_tasks_awaiting_retry`; three alerts; and an **attempt**
+column plus a retry countdown on the task console.
+
+## 3.2.2 Four decisions this step made
+
+**1. A worker-reported `task_failed` is still terminal and is NOT
+retried.** The retry engine reacts to lease expiry only. An executor that
+raised is a deterministic fault of the task — re-running it burns three
+times the CPU for the same exception — and the gate's taxonomy has no
+retry row for it. The honest cost: a *transient* executor failure (a
+momentary OOM, a full disk) is not retried either, and would need the
+worker to distinguish transient from permanent, which V1's dummy workloads
+give no basis for. Named here rather than discovered.
+
+**2. `outcome` says what happened to the task, `reason` says why the
+attempt ended.** An exhausted task's row is `FAILED` /
+`execution_deadline_exceeded`, not a single string carrying both. There is
+deliberately no `attempts_exhausted` reason code: "exhausted" is
+`attempt_count = max_attempts` on the task, which is derivable and does
+not go stale when the policy changes.
+
+**3. The reclaimer distinguishes the two clocks.** `deadline_exceeded` is
+evaluated in the reclaim statement against Postgres's own clock, so an
+attempt killed by its type's execution cap (taxonomy row 7 — a task too
+slow for its policy) is not recorded identically to one whose worker
+stopped answering (row 1 — a machine that died). One `CASE`, no extra
+query, and it is what makes the poison-task demo below self-explaining.
+
+**4. Failure counters are derived, not accumulated, and they are not on
+`GET /workers`.** A counter column on `workers` would be a second write on
+the recovery path and a number that can disagree with the rows it
+summarises. Keeping the aggregate off the fleet listing matters more than
+it looks: that endpoint is the dashboard's 2s poll, and this is a grouped
+scan over a table that grows with every abnormal ending.
+
+## 3.2.3 Measurements
+
+Measured on the reference laptop (Intel i5-4460S, 4 cores) against a real
+Docker Compose stack with three workers, on **shortened windows** so the
+demo runs in a minute: `TASK_LEASE_TTL 15`, `DISCONNECT_GRACE 5`,
+`RECLAIM_INTERVAL 2`, `BACKOFF_BASE 3`, `EXCLUSION 30`, `MAX_ATTEMPTS 3`.
+Every timestamp below is from the coordinator's own API, polled at 0.4s.
+
+**Kill the worker holding a task; a different worker finishes it.**
+
+| t | state |
+|---|---|
+| 0.0s | `RUNNING`, attempt 0, worker `d0b60c7d`, lease 4.8s left (the observed close had already cut it to the grace) |
+| 5.1s | `QUEUED`, **attempt 1**, `excluded_worker_id = d0b60c7d`, retry in 2.4s |
+| 7.6s | `RUNNING`, attempt 1, worker **`a6232283`** — a different machine |
+| 52.8s | `COMPLETED` on attempt 1 |
+
+Detection to requeue was **5.1s** against the ≤7s this stack's settings
+bound it to (grace 5 + reclaim interval 2), and the task was executing on
+another worker **2.5s after that**.
+
+**A poison task exhausts its attempts and stops.** The poison is a task
+that cannot finish inside its cap: `sleep(600)` against a `max_execution`
+lowered to 10s through the policy API, with nothing restarted.
+
+| t | state |
+|---|---|
+| 0.1s | `ASSIGNED`, attempt 0, `a6232283` |
+| 11.1s | `QUEUED`, attempt 1, excluded `a6232283`, retry in 2.0s |
+| 13.1s | `RUNNING`, attempt 1, `89a4152a` |
+| 24.9s | `QUEUED`, attempt 2, excluded `89a4152a`, retry in 1.2s |
+| 26.1s | `RUNNING`, attempt 2, `a6232283` |
+| **37.0s** | **`FAILED`**, attempt_count **3**, `not_before` NULL, `excluded_worker_id` NULL |
+
+Its three attempt rows, read back from `GET /tasks/{id}`:
+
+```
+attempt 0: REASSIGNED / execution_deadline_exceeded  worker=a6232283
+attempt 1: REASSIGNED / execution_deadline_exceeded  worker=89a4152a
+attempt 2: FAILED     / execution_deadline_exceeded  worker=a6232283
+```
+
+**A one-worker fleet is not starved by its own exclusion.** Both other
+workers stopped, the only worker frozen with `docker pause` (no close
+frame — the lease simply ran out), then unpaused:
+
+- reclaimed with `excluded_worker_id` = the only worker there is;
+- refused it for the whole exclusion window;
+- claimed it again at **30.7s**, against the 30s window;
+- `COMPLETED` at 55.8s.
+
+**Per-worker failure counters**, from `GET /workers/failures` after the
+runs above — the numbers match the attempt rows exactly:
+
+```
+a6232283  REASSIGNED 1
+a6232283  FAILED     1
+89a4152a  REASSIGNED 1
+d0b60c7d  REASSIGNED 1
+```
+
+**Metrics on the same stack:** `coordinator_tasks_reassigned_total 3`,
+`coordinator_tasks_exhausted_total 1`, `coordinator_leases_expired_total 4`
+— the two branches sum to the expiries, which is the arithmetic that says
+no reclaim went unaccounted for.
+
+**The cancel was delivered and honoured**, from the worker's own log:
+`task_cancel_received` naming the task with `reason: lease_expired`, then
+`task_execution_cancelled` **0.28s later** — the cooperative flag being
+noticed between chunks.
+
+## 3.2.4 What reviewing this step found, before it ran
+
+Three defects, each fixed with a regression test that fails against the
+first version:
+
+- **A retry became eligible and nothing woke the engine.** The doorbell
+  rung at reclaim time wakes an assignment pass that finds nothing —
+  every task it just requeued is held by `not_before`. Without a second
+  wake the retry waited for the safety-net poll: up to
+  `ASSIGNMENT_POLL_INTERVAL_SECONDS` (30s) on top of a backoff measured in
+  seconds. Not a correctness fault — the task was always claimed
+  eventually — but a recovery that is working would have looked stalled to
+  anyone watching. Fixed with one sleeping wake-up per reclaim pass, timed
+  to the earliest `not_before`, that rings the doorbell and nothing else.
+- **A completed task kept the backoff and the exclusion of the attempt
+  that failed.** Terminal rows are never claimed, so nothing would have
+  acted on them — but the console renders those fields, and a `COMPLETED`
+  task showing "retry after …" is a fact every later reader has to know to
+  ignore. Cleared in the statements that were already writing the row,
+  exactly as Step 3.1 cleared the lease pair.
+- **Two flaky assertions in this step's own tests.** The backoff is
+  `random() * base`, so asserting the delay was still in the future
+  would have failed roughly once in a thousand runs and been blamed on the
+  database. Only the ceiling is assertable, and the tests now say so.
+
+## 3.2.5 What Step 3.2 deliberately does NOT do
+
+- **No retry on a worker-reported failure.** Decision 1 above.
+- **No fencing.** A late result from a superseded attempt is still
+  accepted if the row happens to name that worker again — which the
+  exclusion window makes *less* likely but does not prevent. Step 3.4.
+- **No recovery timeline in the GUI beyond the task drawer.** The attempt
+  rows are rendered in the detail panel; a fleet-wide failure view is
+  Step 3.7.
+- **No worker quarantine.** A worker that fails everything keeps being
+  given work; the failure counters exist so Phase 4 can act on that, and
+  M3 does not.
+- **No remote Internet worker**, so §8 is not claimed — see the unmet
+  exit criterion above.
+- **Every demo above was agent-run**, not user-run (§15 items 3–4).
+
+## 3.2.6 Demo and failure demo
+
+Same stack as Step 3.1, with the retry windows shortened too:
+
+```bash
+TASK_LEASE_TTL_SECONDS=15 LEASE_DISCONNECT_GRACE_SECONDS=5 \
+LEASE_RECLAIM_INTERVAL_SECONDS=2 TASK_RETRY_BACKOFF_BASE_SECONDS=3 \
+TASK_RETRY_EXCLUSION_SECONDS=30 docker compose -p dcds up -d
+```
+
+**What is on screen.** `https://localhost:${DASHBOARD_PORT}/ui/tasks` now
+has an **attempt** column — highlighted from attempt 2 on — and the lease
+column shows **"retry in Ns"** for a task waiting out its backoff. The
+task drawer lists every attempt that ended abnormally, with the worker and
+the reason.
+
+**Failure demo 1 — reassignment.** Submit `sleep` for 45s, `docker kill`
+the worker the console shows holding it. The attempt column goes to 2, the
+lease column reads "retry in Ns", and a different worker picks it up.
+
+**Failure demo 2 — a poison task reaching terminal `FAILED`.**
+
+```bash
+curl -k -X PUT https://localhost:$PORT/tasks/policies/sleep \
+  -H "X-Admin-Secret: $ADMIN_SECRET" -H 'Content-Type: application/json' \
+  -d '{"max_execution_seconds": 10}'
+# then submit sleep(600) and watch three attempts end at the cap
+```
+
+**Failure demo 3 — no starvation on one worker.** Stop every worker but
+one, `docker pause` it until its lease expires, unpause. It is refused the
+task for `TASK_RETRY_EXCLUSION_SECONDS` and then gets it back.
+
+**Reads worth running:** `GET /workers/failures` for the per-worker
+counters, `GET /tasks/{id}` for the attempt rows, and
+`coordinator_tasks_reassigned_total` / `coordinator_tasks_exhausted_total`
+on `/metrics`.
+
+**Logs to watch.** `task_lease_expired` now carries `not_before`,
+`excluded_worker_id` and `reason`; `task_attempts_exhausted` is its own
+event, so "this task will be tried again" and "this task is over" are not
+one log line with a field to filter on.
 
 ---
 
