@@ -31,7 +31,11 @@ from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
 
 from app.config import database_url, redis_url  # noqa: E402
-from app.task_queue import complete_task, mark_status  # noqa: E402
+from app.task_queue import (  # noqa: E402
+    complete_task,
+    mark_status,
+    reclaim_expired_leases,
+)
 
 ADMIN = os.environ["ADMIN_SECRET"]
 AUTH = {"X-Admin-Secret": ADMIN}
@@ -593,8 +597,11 @@ def test_the_policy_listing_covers_every_type_and_names_its_source(client):
     assert set(by_type) == {"count_to_n", "hash_rounds", "sleep", "opaque_payload"}
     assert by_type["sleep"]["max_execution_seconds"] == 3900
     assert by_type["sleep"]["max_execution_seconds_source"] == "default"
-    # No attempt cap exists in 3.1 — reporting a number would invent one.
-    assert by_type["sleep"]["max_attempts"] is None
+    # Phase 3.2: the attempt cap is real now, so the listing reports it and
+    # says it came from the code rather than from an operator. In 3.1 this
+    # was `None`, because any number would have been invented (§10).
+    assert by_type["sleep"]["max_attempts"] == 3
+    assert by_type["sleep"]["max_attempts_source"] == "default"
 
 
 def test_a_policy_can_be_set_and_cleared_without_a_restart(client):
@@ -687,3 +694,80 @@ def test_a_task_reports_its_lease_and_deadline(client):
     # re-stamps it from the real start.
     assert detail["deadline_at"] is not None
     assert 0 < detail["lease_seconds_remaining"] <= 30
+
+
+def test_a_reassigned_task_reports_its_retry_state_and_its_attempt_rows(client):
+    """Phase 3.2, through the API an operator actually drives. A task that
+    lost its worker reports **why it is not being picked up** — the backoff
+    and the excluded worker — and its detail carries one attempt row per
+    abnormal ending, which is what "failed tasks are inspectable, never
+    silently dropped" means in practice."""
+    reset_tasks()
+    task_id = one_task_id(client)
+    worker_id = register_worker(client)
+    assert dequeue_for(client, worker_id)
+
+    def expire_and_reclaim(sessionmaker):
+        async def body(sessionmaker):
+            async with sessionmaker() as session:
+                await session.execute(
+                    text(
+                        "UPDATE tasks SET lease_expires_at = now() - interval '1 second' "
+                        "WHERE id = CAST(:id AS uuid)"
+                    ),
+                    {"id": task_id},
+                )
+                await session.commit()
+            async with sessionmaker() as session:
+                await reclaim_expired_leases(session, batch=100)
+                await session.commit()
+
+        return body(sessionmaker)
+
+    db(expire_and_reclaim)
+
+    listed = client.get("/tasks", headers=AUTH).json()["tasks"][0]
+    assert listed["status"] == "QUEUED"
+    assert listed["attempt_count"] == 1
+    assert listed["excluded_worker_id"] == worker_id
+    assert listed["not_before"] is not None
+    # Ceiling only. The backoff is `random() * 5` seconds, so asserting it
+    # is still in the future would be a flake waiting to happen.
+    assert listed["retry_in_seconds"] <= 5
+
+    detail = client.get(f"/tasks/{task_id}", headers=AUTH).json()
+    assert len(detail["attempts"]) == 1
+    assert detail["attempts"][0]["outcome"] == "REASSIGNED"
+    assert detail["attempts"][0]["reason"] == "lease_expired"
+    assert detail["attempts"][0]["worker_id"] == worker_id
+    # Zero-based on the wire, exactly as the worker was told.
+    assert detail["attempts"][0]["attempt_number"] == 0
+
+    failures = client.get("/workers/failures", headers=AUTH)
+    assert failures.status_code == 200, failures.text
+    rows = failures.json()["workers"]
+    assert [r["worker_id"] for r in rows] == [worker_id]
+    assert rows[0]["failures"] == 1
+    assert rows[0]["outcome"] == "REASSIGNED"
+
+
+def test_a_healthy_task_has_no_attempt_rows_and_no_retry_state(client):
+    """`task_attempts` records abnormal endings **only** (gate §3.0.7), so
+    an empty list here is a fact about the task rather than a gap in the
+    record. Asserted so a later change that starts writing a row per
+    attempt has to justify itself against the hot-path cost."""
+    reset_tasks()
+    task_id = one_task_id(client)
+
+    detail = client.get(f"/tasks/{task_id}", headers=AUTH).json()
+    assert detail["attempts"] == []
+    assert detail["not_before"] is None
+    assert detail["retry_in_seconds"] is None
+    assert detail["excluded_worker_id"] is None
+
+
+def test_the_failure_counters_need_the_operator_credential(client):
+    """Same guard as every other operator read. A per-worker failure
+    profile is exactly the kind of thing that must not be public."""
+    assert client.get("/workers/failures").status_code == 401
+    assert client.get("/workers/failures", headers={"X-Admin-Secret": "wrong"}).status_code == 401
