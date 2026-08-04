@@ -46,14 +46,29 @@ def test_cancelled_is_reachable_from_every_live_state(live):
         (QUEUED, RUNNING),  # cannot skip assignment
         (QUEUED, COMPLETED),  # cannot skip the whole pipeline
         (ASSIGNED, COMPLETED),  # cannot complete without running
-        (RUNNING, QUEUED),  # no going backwards
         (RUNNING, ASSIGNED),  # no going backwards
-        (ASSIGNED, QUEUED),  # no going backwards
     ],
 )
 def test_illegal_moves_are_rejected(current, new):
     with pytest.raises(InvalidTaskTransition):
         check_transition(current, new)
+
+
+@pytest.mark.parametrize("live", [ASSIGNED, RUNNING])
+def test_a_live_task_can_be_returned_to_the_queue(live):
+    """Phase 3.1's recovery move, and the reason it is `-> QUEUED`.
+
+    Until M3 both of these raised, under the heading "no going backwards".
+    The lease reclaimer is exactly a task going backwards: its worker
+    stopped answering, so the work has not happened and must be offered
+    again.
+
+    It returns to `QUEUED` rather than to the reserved `REASSIGNED` state
+    because the queue is `WHERE status = 'QUEUED'` — the test below still
+    holds `REASSIGNED` unreachable, so a recovered task that landed there
+    would be invisible to every dequeue forever.
+    """
+    assert check_transition(live, QUEUED) is True
 
 
 @pytest.mark.parametrize("terminal", sorted(TERMINAL_STATES))
