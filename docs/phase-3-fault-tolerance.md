@@ -574,14 +574,257 @@ the step wording would otherwise have required.
   replicas without double-reclaiming.
 
 **Exit criteria**
-- [ ] Leases are created, renewed, and expire correctly.
-- [ ] Killing a worker mid-task causes lease expiry within the documented
+- [x] Leases are created, renewed, and expire correctly.
+- [x] Killing a worker mid-task causes lease expiry within the documented
       timeout — timed and recorded.
-- [ ] A legitimate long task renews its lease and is never reclaimed.
-- [ ] A hung worker that stops renewing is reclaimed.
-- [ ] Three coordinator replicas running the reclaimer never
+- [x] A legitimate long task renews its lease and is never reclaimed.
+- [x] A hung worker that stops renewing is reclaimed.
+- [x] Three coordinator replicas running the reclaimer never
       double-reclaim — verified under load.
-- [ ] Timeouts configurable per task type without redeploy.
+- [x] Timeouts configurable per task type without redeploy.
+
+---
+
+## 3.1.1 What was built
+
+Migration **0006** carries the whole milestone's schema (gate §3.0.7), so
+Steps 3.2–3.4 ship no migration of their own: `tasks.deadline_at`,
+`tasks.not_before`, `tasks.excluded_worker_id`, the partial index
+`ix_tasks_lease_expiry`, and the `task_attempts` and `task_policies`
+tables. Only `deadline_at`, the index, `task_attempts` and `task_policies`
+are written in 3.1; the other two columns are Step 3.2's and are named as
+such in the migration.
+
+The lease lifecycle, implemented exactly where the gate put it — on the
+statements that were already moving the row, so no path gains a round
+trip:
+
+| Event | Write |
+|---|---|
+| `dequeue` | `lease_expires_at = now() + ack timeout`, `deadline_at = now() + execution cap` |
+| `task_started` | `deadline_at` re-stamped from the real start; `lease_expires_at = LEAST(now() + ttl, deadline_at)` |
+| any observed message about the task | `lease_expires_at = LEAST(now() + ttl, deadline_at)`, **lazily** |
+| socket close observed by the holding replica | `lease_expires_at = LEAST(it, now() + grace)` |
+| `hello` | every live lease that worker holds, renewed from the database |
+| terminal state | `lease_expires_at = NULL`, `deadline_at = NULL` |
+| reclaim | `ASSIGNED`/`RUNNING` → `QUEUED`, `attempt_count + 1`, one `task_attempts` row |
+
+`ASSIGNED -> QUEUED` and `RUNNING -> QUEUED` are added to `task_states`,
+and the two shipped docstrings that called this the `REASSIGNED`
+transition are corrected. The gate assigned that correction to Step 3.2;
+it is done here instead because this is the step that adds the transition,
+and leaving the code contradicting itself for a step would have been worse
+than moving one paragraph early.
+
+New: `GET /tasks/policies`, `PUT /tasks/policies/{type}`,
+`DELETE /tasks/policies/{type}` (operator-credentialled);
+`coordinator_leases_expired_total`, `coordinator_lease_renewals_total`,
+`coordinator_leases_overdue`, `coordinator_lease_reclaim_seconds`; two
+alerts; and `lease` on the task console with an overdue state.
+
+## 3.1.2 Three implementation decisions this step made
+
+**1. Renewal laziness lives in the process, not in the database.** Each
+session records, on its own monotonic clock, when each of its tasks is
+next worth a write. A message that arrives before then costs **no
+database round trip at all** — not a no-op UPDATE, no statement. At the
+defaults a 10s progress cadence becomes ~1 write per running task per 30s.
+The alternative, a guarded UPDATE that self-skips, would still have sent
+10 statements/s per 100 running tasks to a table that is also the queue's
+hot path (#79).
+
+**2. `deadline_at` is stamped at delivery as well as at `task_started`.**
+This is a deviation from the gate's lifecycle table and it was **found by
+a live run, not by review** — see 3.1.4.
+
+**3. Decision #168 is pulled forward from Step 3.4.** `handle_task_result`
+and `handle_task_failed` now release the credit when the outcome is
+`NOT_OWNER` *and* the id is one this session delivered. The gate scheduled
+this for 3.4, but 3.1 is what makes `NOT_OWNER` honestly reachable: a
+reclaimed task's row no longer names its original worker, so that worker's
+sincere late report would otherwise hold its credit for the life of the
+session. A worker losing three tasks to reassignment would quietly stop
+accepting work. A guessed id is still not in `credited`, so the §12
+protection is untouched.
+
+## 3.1.3 Measurements
+
+Every figure below is **measured on the reference laptop** (Intel i5-4460S,
+4 cores) against a real Docker Compose stack, Postgres 16. They are
+properties of that machine, not of the design.
+
+**The two detection bounds the gate published, tested against their own
+numbers** (`DISCONNECT_GRACE 30` + `RECLAIM_INTERVAL 5` = ≤35s;
+`LEASE_TTL 60` + `RECLAIM_INTERVAL 5` = ≤65s):
+
+| Failure | How it was caused | Bound | Measured |
+|---|---|---|---|
+| Worker process killed mid-task | `docker kill` on a worker running `sleep(600)` | ≤ 35s | **31.2s** |
+| Worker alive but frozen, no close observed | `docker pause` — the socket stays open, nothing is sent | ≤ 65s | **49.6s** |
+
+The killed case shows the close being observed: one second after the kill
+the task's remaining lease had dropped from 56.8s to **29.3s** — the
+disconnect grace — and it was reclaimed 1.2s after that expired. The
+frozen case never shortened, ran its full TTL down from its last renewal,
+and was caught on the next reclaim tick.
+
+**A legitimate long task is never reclaimed.** A `sleep(600)` task watched
+for 2.5 minutes — more than four lease windows — held `attempt_count = 1`
+and never returned to `QUEUED`, its lease sawtoothing between ~25s and
+~59s as progress messages renewed it lazily.
+
+**Three coordinator replicas, under load, zero double-reclaims.** Three
+real coordinator processes (`--scale coordinator=3`) against 3,000 tasks
+seeded `ASSIGNED` with already-expired leases:
+
+| | |
+|---|---|
+| drained in | **5.74s** (≈522 reclaims/second) |
+| reclaims per replica | **900 / 1100 / 1000** |
+| total reclaim log lines | **3,000 — exactly, not 3,001** |
+| tasks with more than one attempt row | **0** |
+| tasks whose `attempt_count` ≠ 1 | **0** |
+
+An earlier run of the same shape split **0 / 2900 / 100**, and that is
+worth recording rather than tidying away: the reclaimer is race-to-claim,
+not load-balanced, so whichever replica ticks first takes most of a
+backlog. The total was still exactly 3,000. **Even distribution is not a
+property this design has or needs; exactly-once reclaim is, and it held in
+both runs.**
+
+Reclaim pass duration on an idle-to-light queue: 6 passes totalling
+**30.2ms**, i.e. ~5ms each, from `coordinator_lease_reclaim_seconds`.
+
+**Per-type timeouts change with no redeploy.** `PUT
+/tasks/policies/hash_rounds {"max_execution_seconds": 1800}` against the
+running coordinator moved the effective cap from 300 (`source: default`)
+to 1800 (`source: policy`), and a task claimed seconds later carried a
+**1796s** cap. Nothing was restarted, reloaded or redeployed.
+
+**`count_to_n`'s ceiling, which the gate flagged as the one number with no
+measurement behind it (§3.0.8).** The 100,000,000 ceiling runs at a median
+of **4.801s** over three runs (4.771 / 4.801 / 5.124), single core, through
+the executor's own chunked loop. The 300s default is ~62x that. Measured
+rather than carried.
+
+## 3.1.4 What the live run found that review did not
+
+**The execution cap could be bypassed entirely on a reassigned task, and
+the tests written for this step all passed while it was true.**
+
+Watching a reclaimed task on the running stack, it sat `ASSIGNED` with a
+lease that kept renewing and a `deadline_at` of NULL. The cause is a
+shipped M2 worker behaviour: `task_assign_duplicate_ignored`. The worker
+refuses a re-delivery of a task id it is already executing — correctly —
+so after a reclaim handed the task back to the same worker there was no
+second `task_started`, and the deadline was only ever written there.
+
+The consequence is exactly the failure `deadline_at` exists to prevent:
+progress messages from a **hung** executor would renew that task's lease
+forever, because the cap that should have stopped them was never set.
+
+Fixed by stamping `deadline_at` in the dequeue statement as well, so a cap
+exists from the moment a task is claimed and `task_started` re-stamps it
+from the real start. The cap has to be **per type** at claim time — one
+dequeue claims across every type a worker supports — so the code default
+is a SQL `CASE` over the registry rather than a single bound parameter.
+Two regression tests cover it.
+
+**This is the sixth time a live run has found something review and the
+suite both missed**, after #144, #145, #146, #149 and the event-loop lock.
+The pattern holds: the defects that survive review are the ones that need
+two subsystems in the same room.
+
+Two further defects were found reviewing this step's own implementation
+before it ran, and each has a regression test that fails against the first
+version:
+
+- **A worker that reconnected mid-execution could not renew.** The new
+  session holds no credit key for work delivered to the socket that died
+  (Decision #101 has the worker declare a *count*, which cannot be keyed),
+  so every progress message about it was skipped and the task would have
+  been reclaimed **from a worker that was doing exactly what it should**.
+  Fixed with `LocalSession.recovered_tasks`, seeded from what the database
+  says the worker holds — never from the worker.
+- **The renewal sat behind the telemetry lookup** in `handle_task_progress`,
+  which returns early for precisely that case. Moved above it.
+
+## 3.1.5 What Step 3.1 deliberately does NOT do
+
+Stated so it is not discovered in a demo:
+
+- **No retry policy.** The reclaimer requeues with no attempt cap, no
+  backoff and no exclusion of the worker that just lost the task, so a
+  task whose worker is permanently gone **cycles rather than reaching
+  `FAILED`**. `max_attempts`, `not_before` and `excluded_worker_id` all
+  exist in the schema and are written by nothing. Step 3.2.
+- **No `task_cancel`.** A reclaimed task's original worker keeps burning
+  CPU on it. Step 3.2.
+- **No fencing.** A late result from a superseded attempt is accepted if
+  the row still names that worker. Step 3.4.
+- **No recovery timeline in the GUI.** `task_attempts` rows are written
+  and are not yet rendered; the console shows the lease, the countdown and
+  the attempt count. Step 3.7.
+- **No remote Internet worker** took part in any of the above. Everything
+  here is local Docker on one laptop, so §8 is **not** claimed for this
+  step.
+- **Every demo above was agent-run**, not user-run (§15 items 3–4).
+
+## 3.1.6 Demo and failure demo
+
+Runnable from a fresh clone with the documented compose command. Shorten
+the windows first if you do not want to wait — the four lease settings are
+exposed in `docker-compose.yml` for exactly this:
+
+```bash
+TASK_LEASE_TTL_SECONDS=15 LEASE_DISCONNECT_GRACE_SECONDS=5 \
+LEASE_RECLAIM_INTERVAL_SECONDS=2 docker compose -p dcds up -d
+```
+
+**What is on screen.** Open `https://localhost:${DASHBOARD_PORT}/ui/tasks`.
+The `lease` column counts down on every in-flight task and resets as it is
+renewed; an expired lease not yet reclaimed shows **red, as "Ns overdue"**.
+
+**Success path.** Submit a `sleep` task of 600 seconds. Watch it go
+`QUEUED → ASSIGNED → RUNNING`, and watch its lease sawtooth rather than
+run out — that is renewal working, and the task is never reclaimed.
+
+**Failure demo 1 — kill a worker mid-task.**
+
+```bash
+docker kill dcds-worker-1
+```
+
+The lease drops to the disconnect grace within a second, expires, and the
+task reappears **`QUEUED` with `attempt` incremented**. Restart the worker
+and it is executed again.
+
+**Failure demo 2 — a worker that is alive but frozen.**
+
+```bash
+docker pause dcds-worker-1
+```
+
+No close frame is sent, so nothing shortens the lease. It runs down its
+full TTL and the task is reclaimed anyway — which is the point of putting
+the trigger in Postgres rather than in the connection.
+
+**Failure demo 3 — change a timeout with no redeploy.**
+
+```bash
+curl -k -X PUT https://localhost:$PORT/tasks/policies/sleep \
+  -H "X-Admin-Secret: $ADMIN_SECRET" -H 'Content-Type: application/json' \
+  -d '{"max_execution_seconds": 120}'
+```
+
+`GET /tasks/policies` shows the value with `source: policy`; the next
+`sleep` task claimed carries the new cap. Nothing was restarted.
+
+**Logs to watch.** `task_lease_expired` carries the task id, the worker
+that lost it, the previous status, the attempt number and
+`overdue_seconds` — the coordinator-observed detection lag.
+`task_leases_shortened_on_disconnect` and `task_leases_renewed_on_hello`
+are the two accelerator paths.
 
 ---
 
