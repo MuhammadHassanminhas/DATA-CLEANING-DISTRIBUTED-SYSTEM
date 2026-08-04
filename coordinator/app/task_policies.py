@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import (
     task_ack_timeout_seconds,
     task_lease_ttl_seconds,
+    task_max_attempts,
     task_max_execution_seconds_default,
 )
 from app.task_types import DEFAULT_MAX_EXECUTION_SECONDS, TASK_TYPES, UnknownTaskType
@@ -63,8 +64,10 @@ POLICY_FIELDS = (
 # any V1 dummy workload can legally run (`sleep` caps at 3600s).
 MIN_POLICY_SECONDS = 1
 MAX_POLICY_SECONDS = 86_400
-# `max_attempts` is Step 3.2's, but the column is validated here so 3.2
-# inherits a surface that was never able to store a nonsensical value.
+# `max_attempts` is Step 3.2's retry cap. The bounds were written in 3.1,
+# before anything read the column, so the surface was never able to store a
+# nonsensical value: 0 attempts is a task that can never run, and a cap in
+# the thousands is a poison task burning a worker forever.
 MIN_MAX_ATTEMPTS = 1
 MAX_MAX_ATTEMPTS = 100
 
@@ -131,12 +134,24 @@ def max_execution_seconds(*, table_alias: str = "t") -> str:
     )
 
 
+def max_attempts(*, table_alias: str = "t") -> str:
+    """SQL for "this task's attempt cap": policy row, else the code default.
+
+    A named wrapper over `policy_seconds` rather than a second
+    implementation — the resolution rule is identical, and only the
+    function's name would suggest otherwise (the cap is a count, not a
+    duration). The default is bound as `:max_attempts`.
+    """
+    return policy_seconds("max_attempts", "max_attempts", table_alias=table_alias)
+
+
 def default_policy(task_type: str) -> dict[str, int | None]:
     """The code defaults for one type — what applies when no row exists.
 
-    `max_attempts` is `None` because Step 3.1 has no attempt cap: the
-    reclaimer requeues without limit and Step 3.2 is what adds the policy
-    that stops it. Reporting a number here would be inventing one (§10).
+    **`max_attempts` reports a real number from Step 3.2 on.** In 3.1 it
+    was `None`, because the reclaimer requeued without a cap and any figure
+    here would have been invented (§10). The cap now exists, so reporting
+    `None` would be the dishonest answer instead.
     """
     if task_type not in TASK_TYPES:
         raise UnknownTaskType(f"unknown task type: {task_type!r}")
@@ -146,7 +161,7 @@ def default_policy(task_type: str) -> dict[str, int | None]:
         "max_execution_seconds": DEFAULT_MAX_EXECUTION_SECONDS.get(
             task_type, task_max_execution_seconds_default()
         ),
-        "max_attempts": None,
+        "max_attempts": task_max_attempts(),
     }
 
 

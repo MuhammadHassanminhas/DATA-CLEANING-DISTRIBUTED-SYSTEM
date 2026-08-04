@@ -434,6 +434,74 @@ def lease_disconnect_grace_seconds() -> int:
     return int(os.environ.get("LEASE_DISCONNECT_GRACE_SECONDS", "30"))
 
 
+def task_max_attempts() -> int:
+    """How many executions a task gets before it is terminally `FAILED`
+    (Phase 3.2, gate default 3). Recommendation, not a measured value —
+    one retry for a transient fault, one for an unlucky second, then stop.
+
+    **Zero-based, and this is exactly where an off-by-one hides.**
+    `attempt_count` is 0 for a first delivery and is already on the wire as
+    `attempt: 0` (`assignment._deliver`), so 3 means the executions
+    numbered 0, 1 and 2. A task whose incremented count reaches this number
+    has no attempt left and goes to `FAILED`.
+
+    Per-type overrides live in `task_policies.max_attempts` and win over
+    this default without a redeploy, so a type that is expensive to re-run
+    can be given one attempt while a cheap one gets five.
+    """
+    return int(os.environ.get("TASK_MAX_ATTEMPTS", "3"))
+
+
+def task_retry_backoff_base_seconds() -> float:
+    """First retry delay before jitter (Phase 3.2, gate default 5).
+
+    Recommendation, not a measured value. It mirrors the worker's shipped
+    reconnect backoff (`worker.py`'s `_full_jitter`), which is the other
+    place in this system where something failed and is about to be tried
+    again — one backoff shape to reason about rather than two.
+    """
+    return float(os.environ.get("TASK_RETRY_BACKOFF_BASE_SECONDS", "5"))
+
+
+def task_retry_backoff_factor() -> float:
+    """Multiplier per attempt (Phase 3.2, gate default 2). Recommendation.
+
+    The delay is **full jitter**: `random() * min(max, base * factor^attempt)`.
+    Full rather than fixed because the failure that produces retries is
+    usually a worker or a network dying under many tasks at once — an
+    unjittered backoff would return every one of them to the queue in the
+    same instant, which is the thundering herd the recovery system would
+    then be causing itself.
+    """
+    return float(os.environ.get("TASK_RETRY_BACKOFF_FACTOR", "2"))
+
+
+def task_retry_backoff_max_seconds() -> float:
+    """Ceiling on the pre-jitter retry delay (Phase 3.2, gate default 60).
+
+    Recommendation, not a measured value. It bounds the exponential so a
+    task with a high per-type `max_attempts` cannot end up waiting hours
+    between attempts.
+    """
+    return float(os.environ.get("TASK_RETRY_BACKOFF_MAX_SECONDS", "60"))
+
+
+def task_retry_exclusion_seconds() -> int:
+    """How long the worker that lost a task stays ineligible for it
+    (Phase 3.2, gate default 60). Recommendation, not a measured value.
+
+    **The window is bounded deliberately, and the gate is explicit about
+    why** (§3.0.6): a permanent exclusion starves the task to death on a
+    single-worker fleet, which is precisely the shape of a laptop demo and
+    of one Internet worker on a hotspot. Eventually retrying on the same
+    worker is better than never retrying at all.
+
+    Measured from `not_before`, which is the retry-backoff instant — one
+    column, one meaning: this row is not eligible yet.
+    """
+    return int(os.environ.get("TASK_RETRY_EXCLUSION_SECONDS", "60"))
+
+
 def worker_claim_ttl_seconds() -> int:
     """Recommendation, not a measured value.
 
