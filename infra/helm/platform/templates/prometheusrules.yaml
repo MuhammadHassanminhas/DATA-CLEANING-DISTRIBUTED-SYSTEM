@@ -67,6 +67,39 @@ spec:
           labels: { severity: warning, team: dcds }
           annotations:
             summary: "Connected worker count dropped by more than half in 10 minutes."
+        # ---- Phase 3.1 lease engine ----
+        #
+        # **The one that matters most is the backlog, not the rate.** A
+        # reclaimer that has died emits no reclaim events at all, which in
+        # any counter looks exactly like a healthy system with nothing to
+        # reclaim. `coordinator_leases_overdue` is recomputed from Postgres
+        # on every scrape by every replica, so a backlog that climbs and
+        # never drains is visible even when the loop that should be
+        # draining it is gone. `max` because the series is identical across
+        # replicas (see `metrics._refresh_fleet_gauges`).
+        #
+        # 5 minutes, not 1: the reclaim interval is 5s and the batch is
+        # 100, so a genuine burst — a whole node's worth of workers dying
+        # at once — legitimately shows a backlog for a few passes while it
+        # drains. Alerting on the drain would page for recovery working.
+        - alert: LeaseReclaimBacklog
+          expr: max(coordinator_leases_overdue) > 0
+          for: 5m
+          labels: { severity: critical, team: dcds }
+          annotations:
+            summary: "Task leases have been expired without being reclaimed for 5 minutes — the reclaimer may have stopped."
+        # Sustained expiry: tasks are being taken back from workers at a
+        # rate that means something is wrong with the fleet rather than
+        # with one machine. Threshold is a RECOMMENDATION, not measured —
+        # it is well above the zero a healthy fleet produces and well below
+        # the pipeline's measured ~110-124 tasks/s (#141). `sum` not `max`:
+        # this is a per-instance counter (see `app/metrics.py`).
+        - alert: TaskLeaseExpirySustained
+          expr: sum(rate(coordinator_leases_expired_total[5m])) > 1
+          for: 10m
+          labels: { severity: warning, team: dcds }
+          annotations:
+            summary: "Task leases are expiring at over 1/s for 10 minutes — workers are losing work faster than they finish it."
         # cert-manager exports this; alerts before Let's Encrypt renewal.
         - alert: CertificateNearExpiry
           expr: (certmanager_certificate_expiration_timestamp_seconds - time()) < 7 * 24 * 3600
