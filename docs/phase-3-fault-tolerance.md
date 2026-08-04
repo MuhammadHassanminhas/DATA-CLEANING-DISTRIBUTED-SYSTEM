@@ -38,6 +38,529 @@ with idempotent completion. Not exactly-once. Do not overclaim.
 
 ---
 
+# Step 3.0 — the decided design (2026-08-03)
+
+**Status: BUILT AS A DESIGN, AWAITING APPROVAL. No code has been written.**
+Decisions **#152–#168** in `PHASE_STATE.md`.
+
+Everything below was checked against the code that is actually deployed,
+not against what the phase plan assumed. Where the two disagree, the code
+wins and the disagreement is named.
+
+## 3.0.1 What M3 actually has to add
+
+M2 already ends with a task that is **durably recorded and permanently
+stuck** when its worker vanishes. `assignment.log_unacknowledged` names
+the stranded tasks and deliberately recovers none of them
+(`coordinator/app/assignment.py:342`), `task_queue` has no requeue
+primitive on purpose (`coordinator/app/task_queue.py:30`), and
+`lease_expires_at` / `attempt_count` exist and are written by nothing
+(`coordinator/app/models.py:140`). Staging is carrying ~20,636 rows in
+exactly that condition.
+
+So M3 adds **one missing loop**: something that notices a task is not
+progressing and puts it back in play, safely, across replicas, without
+ever completing it twice.
+
+Everything else M3 needs is already shipped and was verified in place
+before this gate was written:
+
+| Already there | Where | M3 uses it for |
+|---|---|---|
+| `lease_expires_at`, `attempt_count` columns | `models.py:141-144` | lease and retry, **no migration for the core** |
+| `attempt_number`, `session_epoch`, `idempotency_token` on the wire | `results.py:127-131` | fencing, **no protocol change** |
+| Row-locked, atomic completion returning `DUPLICATE` | `task_queue.complete_task:378` | duplicate suppression, already structural |
+| `FOR UPDATE SKIP LOCKED` claim proven across 3 replicas | `task_queue._dequeue_sql:189` | the reclaimer reuses the same primitive |
+| Cooperative cancel flag in every executor | `worker/executors.py:92` | stop work that has been reassigned |
+| Worker ignores unknown message types | `worker/worker.py:1236-1264` | a new `task_cancel` is backward compatible |
+| Idempotent per-replica sweep with no leader election | `task_queue.purge_expired_results:652` | the reclaimer follows the same pattern |
+| Coordinator-observed liveness, never worker-supplied clocks | `main._sweep_heartbeats:397` | the crash/slow distinction |
+
+## 3.0.2 The spine of the design
+
+**One recovery trigger: lease expiry in Postgres.** Nothing else in the
+system is allowed to reclaim a task — not a closed socket, not `OFFLINE`,
+not a missed heartbeat, not a progress percentage.
+
+That is the whole design in one sentence, and it is chosen over the
+obvious alternative ("reclaim when the worker goes OFFLINE") for a
+concrete, code-level reason:
+
+> `_sweep_heartbeats` marks a worker `OFFLINE` when its Redis metrics key
+> is missing — `elapsed is None` and the key holding it is a TTL'd Redis
+> key (`main.py:416-427`). **If Redis is flushed, restarted, or
+> unreachable, every worker in the fleet is declared OFFLINE within one
+> sweep.** In M2 that is cosmetic. If OFFLINE reclaimed tasks, a Redis
+> blip would reassign the entire in-flight fleet at once — a self-inflicted
+> outage caused by the recovery system.
+
+Lease expiry has none of that coupling: it is a timestamp column in
+Postgres, compared against Postgres's own clock, by a query that touches
+no Redis at all. **Coordinator-side expiry detection that does not depend
+on the worker being reachable** — which is what Step 3.1 asks for — falls
+out for free, and so does "does not depend on Redis being healthy", which
+the plan did not ask for and needs anyway.
+
+Fast detection is not sacrificed. A socket close **is** coordinator-
+observed, so the replica that held it *shortens* the lease to a short
+grace instead of reclaiming. That accelerates the one mechanism rather
+than adding a second one, and it cannot storm: it only affects tasks
+owned by workers whose sockets that replica personally held.
+
+## 3.0.3 The failure taxonomy
+
+Detection is **coordinator-observed in every row**. "Observable outcome"
+is what a person sees in the browser, not what a log says.
+
+| # | Failure | Detection | Recovery action | Observable outcome |
+|---|---|---|---|---|
+| 1 | Worker process crash (`docker kill`, OOM) | Socket close observed → lease shortened to `LEASE_DISCONNECT_GRACE`; if the close was never seen, lease simply expires | Reclaimer requeues: `attempt_count + 1`, previous worker excluded, `not_before` set to the retry backoff | Worker leaves the fleet panel; its task returns to `QUEUED` with attempt 2 and a reassignment event on the task's recovery timeline |
+| 2 | Worker machine power loss | No close frame at all — lease expiry only | Same as #1, up to `LEASE_TTL + RECLAIM_INTERVAL` later | Same, with a visibly longer detection gap; the timeline records both timestamps |
+| 3 | Network disconnection mid-task | Socket close or lease expiry, whichever the coordinator sees first | Requeue as #1. If the worker reconnects inside the grace, `hello` renews the lease **from the database** and nothing is reassigned | Either a clean reconnect with the task still `RUNNING`, or a reassignment — both visible live |
+| 4 | Coordinator pod eviction | Nothing to detect: the tasks are rows, the sockets die with the pod | Workers reconnect to another replica; that replica renews their leases on `hello`; anything not reclaimed by a reconnect expires normally | Fleet re-attaches within the reconnect backoff; queue depth unchanged; no task changes state |
+| 5 | Coordinator crash mid-assignment | Commit-before-send (`assignment.py:34`) means the row is already `ASSIGNED`; the send may never have happened | Lease expires (nothing ever renewed it) → requeue | Task sits `ASSIGNED` for at most one lease, then reappears `QUEUED` with attempt 2 |
+| 6 | Duplicate task completion | `complete_task` locks the row and finds it `COMPLETED` | Returns `DUPLICATE`, writes **nothing**, acks the worker with `accepted: true` | Exactly one result row; the duplicate is counted in `coordinator_task_results{outcome="duplicate"}`, not shown as an error |
+| 7 | Worker timeout (slower than its type's cap) | `MAX_EXECUTION_SECONDS` for the task type is passed — a hard cap that renewal cannot extend | `task_cancel` sent, attempt recorded as `EXPIRED`, task requeued or `FAILED` if attempts are exhausted | Attempt row with reason `execution_deadline_exceeded`, visible on the task's timeline |
+| 8 | Stale result after reassignment | `attempt_number` in the envelope ≠ `tasks.attempt_count`, or the sender is not `assigned_worker_id` | Result **rejected**, task state untouched, attempt row written with outcome `FENCED`, worker acked definitively so it stops retrying | The task's timeline shows a fenced submission naming the worker and the superseded attempt; `coordinator_results_fenced_total` increments |
+| 9 | Partial task completion | Not detected, by design — see §3.0.6 | Full re-execution | Attempt count increments; no partial state exists to display |
+| 10 | Worker reconnect after failure | New `hello` on an existing identity | Coordinator queries its own non-terminal tasks for that worker and renews their leases — **worker-declared ids are never trusted** | Worker returns `ONLINE`; its still-running tasks stay `RUNNING` rather than being reassigned |
+| 11 | Alive but not progressing (hung executor) | Heartbeats continue, but nothing renews the task's lease | Lease expires → requeue exactly as for a crash. The worker is **not** quarantined; that is Phase 4 policy | Worker stays `ONLINE` while its task is visibly reassigned — the case that proves recovery is task-scoped, not worker-scoped |
+| 12 | Malformed result | `results.validate` refuses it before any write (shipped in 2.5) | Nothing written; definitive rejection ack; attempt row `FENCED` with the reason code | Rejection reason visible on the task; task remains `RUNNING` until its lease expires, then retries |
+| 13 | Database unavailable | `/ready` fails; every dequeue, reclaim and completion raises | **Stop**, do not improvise: no assignment, no reclaim, no completion. Sockets stay open, workers keep executing, results buffer in the worker's `pending_results` and retry | Dashboard shows `coordinator_unreachable` / not-ready; **no reassignment storm**, because the reclaimer needs the same database it has lost |
+| 14 | Redis unavailable | `/ready` reports it; the doorbell stops ringing | Assignment falls back to the 30s safety-net poll; liveness display degrades; **task recovery is unaffected** | Fleet panel goes stale, queue keeps draining. This is the failure mode that made the design put leases in Postgres |
+
+Two of these — 13 and 14 — are the reason the taxonomy is worth writing.
+Both are cases where the *recovery system itself* is the thing most
+likely to cause the outage, and in both the answer is to do less.
+
+## 3.0.4 Explicitly NOT recovered
+
+Stated so nobody has to discover it during a demo.
+
+1. **A worker that returns a wrong answer.** Every worker is untrusted
+   (§12), but V1 does no cross-verification, no quorum, no redundant
+   execution. A confidently wrong result is stored as the truth. Detecting
+   it needs duplicate execution and comparison, which is a scheduling
+   decision and is not in M1–M4.
+2. **A poison task beyond `max_attempts`.** Terminal `FAILED`, kept
+   visible and inspectable, never retried again and never silently
+   dropped. This is a designed stop, not a gap.
+3. **Loss of the Postgres volume.** The in-cluster Postgres is a single
+   pod with no replica, no PITR and no backup job. **If it is lost, every
+   task, result and worker identity is lost with it, and no part of M3
+   changes that.** M3 makes the system survive workers and coordinators,
+   not its own database. Naming it here because "fault tolerance" is
+   otherwise easy to read as covering it. Fixing it is a real piece of
+   infrastructure work and is not smuggled into this phase.
+   **⇒ ACCEPTED AS A KNOWN RISK by the user on 2026-08-03 (Decision
+   #171). M3 builds nothing for this, tests nothing for it, and no M3
+   exit criterion depends on it.** Recorded here so it is an owned
+   acceptance rather than an assumption. **The cheap upgrade path,
+   written down now so taking it later needs no rediscovery:** a
+   `CronJob` in the chart running `pg_dump` from the image Postgres
+   already uses. That protects against logical loss — a bad migration, an
+   accidental `DELETE`, a corrupt table — and **it does NOT protect
+   against loss of the volume itself unless the dump is written somewhere
+   other than that volume**, which needs external storage and therefore
+   credit. Stated in full so the limitation is not discovered after
+   trusting it.
+4. **A task whose worker completes it while the coordinator is
+   permanently gone.** The result buffer is memory-only and bounded at 64
+   (`worker.py:241`), abandoned on shutdown by deliberate choice (§3.6,
+   workers are stateless between tasks). The task is re-executed by
+   someone else instead.
+5. **Duplicate execution.** Not a fault to be recovered — see the
+   guarantee below.
+
+## 3.0.5 Delivery guarantee, stated exactly
+
+> **At-least-once execution. Exactly-once completion. At most one stored
+> result per task.**
+
+- A task **may execute more than once**. A worker that is merely slow, or
+  partitioned, keeps running work that has already been reassigned. That
+  is accepted, not prevented.
+- A task reaches `COMPLETED` **exactly once**, and stores **exactly one**
+  result. This is structural, not a check that could be forgotten: the row
+  is locked `FOR UPDATE` before its status is read, and an already-
+  completed task returns `DUPLICATE` having written nothing
+  (`task_queue.py:378`). Two replicas racing the same submission serialise
+  on that lock.
+- **Not exactly-once execution, and it is not achievable here.** It would
+  require the execution and the completion record to commit atomically,
+  and they are on different machines with a network between them.
+- **No ordering guarantee across tasks.** `SKIP LOCKED` gives strict
+  `(priority, created_at)` order to a single dequeuer only — already
+  documented and unchanged (`task_queue.py:12`).
+
+## 3.0.6 Mechanism detail
+
+### Lease lifecycle
+
+```
+delivered      → lease_expires_at = now() + ACK_TIMEOUT
+task_started   → lease_expires_at = now() + LEASE_TTL,     deadline_at = now() + MAX_EXECUTION
+any observed message naming the task (ack, started, progress, result attempt)
+               → lease_expires_at = min(now() + LEASE_TTL, deadline_at)
+socket close observed by the replica holding it
+               → lease_expires_at = min(lease_expires_at, now() + DISCONNECT_GRACE)
+hello from that worker
+               → leases renewed for its own non-terminal rows, read from the DB
+```
+
+**Renewal is worker-driven and therefore untrusted, so it is capped.**
+`deadline_at` is coordinator-set at start and no renewal can push past it
+— a worker that renews forever still loses the task at its type's
+execution cap. The distinction that matters for §12: *when* a lease is
+renewed depends on the worker sending something; *how long* it can ever
+live does not.
+
+**Renewal writes are lazy.** A renewal only touches the database when the
+remaining lease has fallen below half of `LEASE_TTL`. At the defaults
+below that is roughly one UPDATE per running task per 30s — ~3.3 writes/s
+at 100 concurrent tasks, against a pipeline measured at 110–124 tasks/s
+(#141). Renewing on every 10s progress message instead would have tripled
+that for nothing.
+
+### The crash / slow-worker distinction, made objective
+
+The decision input is **whether a coordinator-observed message about that
+task arrived inside the window**. Nothing else. In particular:
+
+- **`progress` values are never an input.** They are worker-reported
+  telemetry, Redis-only, and a lying worker can report 0.99 forever. Their
+  *arrival* renews the lease; their *content* decides nothing.
+- **Worker status (`ONLINE`/`SUSPECT`/`OFFLINE`) is never an input.** It
+  is a fleet-view concern and it depends on Redis (see §3.0.2).
+- A worker that is alive and hung is therefore treated exactly like a
+  crashed one, at the task level, and left alone at the fleet level. That
+  asymmetry is the correct one: the task is what is stuck.
+
+### The reclaimer
+
+One loop per replica, no leader election — the same shape as the shipped
+retention sweep and for the same reason (§3.9, no replica holds
+authoritative state):
+
+```sql
+WITH expired AS (
+    SELECT id FROM tasks
+    WHERE status IN ('ASSIGNED','RUNNING')
+      AND lease_expires_at IS NOT NULL
+      AND lease_expires_at < now()
+    ORDER BY lease_expires_at
+    LIMIT :batch
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE tasks t SET ... FROM expired WHERE t.id = expired.id
+```
+
+Double-reclaim is impossible for the same reason double-assignment is:
+the second replica's `SKIP LOCKED` steps over the locked row, and by the
+time the lock lifts the row no longer matches. This is the identical
+primitive already measured at 10,000 claims / 0 duplicates across three
+AKS pods in Step 2.2 — the reclaimer inherits that proof rather than
+inventing a new mechanism to be proven from scratch.
+
+**The reclaimer never touches in-memory credit.** It usually runs on a
+replica that does not hold the worker's socket, so it cannot. Credit is
+released by the socket-holding replica when the worker responds, or dies
+with the session (`assignment.py:449`). A worker that loses a task it is
+still running gets over-committed at worst, refuses `at_capacity`, and
+the shipped saturation rule (#101) absorbs it.
+
+### Requeue, retry and exclusion
+
+On reclaim, inside one transaction:
+
+- `attempt_count + 1`; if that reaches the type's `max_attempts` →
+  `FAILED`, terminal, with the reason on its attempt row.
+  **`attempt_count` is zero-based** — it is already on the wire as
+  `attempt: 0` for a first delivery (`assignment.py:920`), so
+  `max_attempts = 3` means executions numbered 0, 1, 2. Written out
+  because this is exactly where an off-by-one hides.
+- otherwise `status = QUEUED`, `assigned_worker_id = NULL`,
+  `excluded_worker_id = <the worker that lost it>`,
+  `not_before = now() + full_jitter_backoff(attempt)`.
+- an attempt row is written recording what happened.
+
+The dequeue predicate gains two conditions:
+
+```sql
+AND (not_before IS NULL OR not_before <= now())
+AND (excluded_worker_id IS NULL
+     OR excluded_worker_id <> :worker_id
+     OR not_before + make_interval(secs => :exclusion_window) <= now())
+```
+
+**Exclusion expires, deliberately.** A permanent exclusion starves the
+task to death on a single-worker fleet — which is exactly the shape of a
+laptop demo and of a hotspot Internet worker. Starving a task forever to
+avoid one worker is worse than eventually retrying on it, so exclusion is
+a bounded window and the window is configuration.
+
+`not_before` doubles as the retry-backoff clock and the exclusion clock.
+One column, one meaning: *this row is not eligible yet*.
+
+### Fencing (Step 3.4)
+
+**Accept a result if and only if the sender is the current
+`assigned_worker_id` and `attempt_number` equals `tasks.attempt_count`.**
+Anything else is fenced: nothing written, definitive rejection ack, one
+attempt row with outcome `FENCED`.
+
+The classic race resolves itself with no extra machinery. Worker A's
+result is in flight; the lease expires; the task goes to B; both results
+arrive. Whoever's submission wins the row lock while it still matches the
+current attempt completes the task; the other is fenced. If A's result
+lands *before* the reclaimer runs, A wins and the reclaimer's UPDATE
+simply matches nothing — its `WHERE status IN ('ASSIGNED','RUNNING')` no
+longer holds.
+
+**`session_epoch` is NOT a fencing input, and the phase plan's wording is
+wrong on this point.** Step 2.5 *measured* a legitimate result executed
+under session epoch 4 and submitted on epoch 5, after a reconnect — that
+is the coordinator-outage criterion working as designed. Rejecting on a
+stale epoch would break the exact behaviour a previous step proved. The
+epoch is recorded and logged; **session** conflicts are already arbitrated
+by the shipped Step 1.7 epoch check (`main.py:867-898`), which is a
+different question from result validity.
+
+### Cancelling work that has been reassigned
+
+A reclaimed task's original worker may still be burning CPU on it. The
+coordinator sends a `task_cancel` naming the task; the worker sets the
+cooperative flag the executors already check between chunks
+(`executors.py:92`).
+
+It is best-effort by design — the worker may be unreachable, which is why
+the task was reclaimed in the first place. No behaviour depends on it
+arriving; it saves CPU and nothing more. It needs **no protocol version
+bump**: the worker's dispatch already falls through unknown message types
+to a log line (`worker.py:1236-1264`), verified before this was chosen.
+
+**Routing:** the reclaimer usually runs on a replica that does not hold
+the worker's socket, so the cancel goes over the shipped
+`worker:{id}:push` Redis channel that `POST /workers/{id}/push` and
+`_push_listener` already implement (`main.py:847`). No new fan-out
+mechanism.
+
+**The worker must answer a coordinator-initiated cancel with a
+`capacity` naming the task.** Its shipped cancel path deliberately reports
+nothing (`worker.py:889`) because until now cancellation only ever
+happened during shutdown, when the socket was going away anyway. Under M3
+that would leak a credit for the life of the session.
+
+## 3.0.6a One shipped rule that becomes wrong under M3
+
+Found by re-reading the credit accounting against the new reassignment
+path, not by running anything.
+
+`handle_task_result` and `handle_task_failed` release **no credit** when
+the database answers `NOT_OWNER` or `NOT_FOUND` (`assignment.py:805`,
+`assignment.py:666`). In M2 that is correct and is a §12 protection: the
+only way to reach `NOT_OWNER` is a worker naming a task that is not its
+own, and honouring that would let one worker free its own slots by
+guessing another's task ids.
+
+**M3 makes `NOT_OWNER` reachable honestly.** A reassigned task's row no
+longer names its original worker, so that worker's perfectly sincere
+late result now returns `NOT_OWNER` — and the shipped rule then holds its
+credit consumed for the rest of the session. A worker that loses three
+tasks to reassignment quietly stops being able to accept work.
+
+**Fix, and it needs no new concept:** release the credit when *this
+session actually delivered that task id* — `task_id in session.credited`
+— which is the exact discipline the malformed-result path already applies
+(`assignment.py:763`). A guessed id is not in `credited`, so the §12
+protection is untouched; a genuine one is, so the slot is freed. Decision
+**#168**. This is a Step 3.4 implementation constraint, and it is the sort
+of thing that would otherwise have surfaced as "the fleet mysteriously
+slows down during chaos runs".
+
+## 3.0.7 State machine and schema
+
+**New transitions:** `ASSIGNED → QUEUED` and `RUNNING → QUEUED`.
+
+**`REASSIGNED` becomes an *attempt* outcome, never a task status.** The
+queue is `WHERE status = 'QUEUED'` (`task_queue.py:194`), so a recovered
+task must actually be `QUEUED` to be claimable; a `REASSIGNED` status
+would either be a state nothing can observe or a second queue predicate to
+maintain forever. The reserved constant is used where it is meaningful:
+the attempt that was superseded.
+
+**This contradicts two shipped docstrings** — `task_states.py:11` and
+`task_queue.py:30` both say returning a task to the queue *is* the Phase 3
+`REASSIGNED` transition. They were written before the queue predicate
+existed in the form it now has. The contradiction is named here rather
+than quietly resolved, and the docstrings get corrected in Step 3.2.
+
+**Migration `0006`** (one migration for the whole milestone's schema):
+
+| Change | Why |
+|---|---|
+| `tasks.excluded_worker_id uuid NULL` | retry exclusion |
+| `tasks.not_before timestamptz NULL` | retry backoff + exclusion window |
+| `tasks.deadline_at timestamptz NULL` | the renewal cap |
+| partial index on `lease_expires_at WHERE status IN ('ASSIGNED','RUNNING')` | the reclaimer's scan; keeps it off `ix_tasks_queue` |
+| `task_attempts` table | recovery timeline, per-worker failure counters |
+| `task_policies` table | per-type timeouts changeable without a redeploy |
+| backfill: pre-M3 stranded rows → `FAILED` | see below |
+
+**`task_attempts` records only attempts that did *not* complete normally.**
+A row per attempt always would add a second write to the hot assignment
+path on a pipeline already sitting at 92–112% of one core (#141), to
+record that nothing went wrong — and a healthy task's timeline is already
+fully derivable from `created_at / assigned_at / started_at /
+completed_at`. Abnormal endings are exactly what a recovery timeline is
+for. Happy path keeps its single write.
+
+**The 20,636 stranded staging rows are closed as `FAILED`, not
+resurrected.** Treating a NULL lease as "expired" would have been elegant
+and would have dumped ~20k months-old tasks into the queue on the first
+production rollout, at a coordinator whose measured ceiling is ~110–124
+tasks/s. The backfill marks them terminal with reason
+`stranded_pre_m3` and an attempt row each, which is honest, visible, and
+finally closes Decision #91's carried item.
+
+## 3.0.8 Configuration
+
+**Every number below is a recommendation, not a measurement** (§10). The
+measured ones are named as such. Defaults live in code; per-type overrides
+live in `task_policies` and take effect without a redeploy.
+
+| Setting | Default | Basis |
+|---|---|---|
+| `TASK_ACK_TIMEOUT_SECONDS` | 30 | ~3x the **measured** worst heartbeat gap under saturation (10.52s, Step 2.9) |
+| `TASK_LEASE_TTL_SECONDS` | 60 | 6 worker progress intervals (**measured** cadence: 10s, `worker.py:191`) |
+| `TASK_LEASE_RENEW_FRACTION` | 0.5 | renew when under half remains — one write per ~30s per running task |
+| `TASK_MAX_EXECUTION_SECONDS` (`sleep`) | 3900 | the type's own parameter cap is 3600s (`task_types.py:62`) plus slack |
+| `TASK_MAX_EXECUTION_SECONDS` (`hash_rounds`) | 300 | ceiling parameters **measured** at 15.4s on one core; ~20x headroom for slow hardware |
+| `TASK_MAX_EXECUTION_SECONDS` (`count_to_n`) | 300 | **no measurement exists** for the 100M ceiling — flagged, to be measured in 3.1 |
+| `TASK_MAX_EXECUTION_SECONDS` (`opaque_payload`) | 60 | bounded by a 64 KB echo |
+| `TASK_MAX_ATTEMPTS` | 3 | one retry for a transient fault, one for an unlucky second, then stop |
+| `TASK_RETRY_BACKOFF_BASE/FACTOR/MAX` | 5s / 2 / 60s | mirrors the worker's shipped full-jitter retry (`worker.py:208`) |
+| `TASK_RETRY_EXCLUSION_SECONDS` | 60 | bounded anti-starvation window |
+| `LEASE_RECLAIM_INTERVAL_SECONDS` | 5 | matches the shipped heartbeat sweep cadence |
+| `LEASE_RECLAIM_BATCH` | 100 | matches `TASK_DEQUEUE_MAX_BATCH`; bounds lock hold time |
+| `LEASE_DISCONNECT_GRACE_SECONDS` | 30 | longer than the worker's reconnect backoff so a clean reconnect wins |
+
+**The bound this gives Step 3.1 to verify, stated so it can fail:**
+
+- socket close observed → reassignment starts within
+  `DISCONNECT_GRACE + RECLAIM_INTERVAL` = **≤ 35s**
+- no close observed (power loss) → within
+  `LEASE_TTL + RECLAIM_INTERVAL` = **≤ 65s**
+
+## 3.0.9 Observability
+
+New metrics: `coordinator_leases_expired_total`,
+`coordinator_tasks_reassigned_total`,
+`coordinator_tasks_exhausted_total`, `coordinator_results_fenced_total{reason}`,
+`coordinator_tasks_awaiting_retry` (gauge),
+`coordinator_lease_reclaim_seconds` (histogram).
+
+New alerts in `prometheusrules.yaml`: sustained reassignment rate,
+any sustained fencing, and a reclaim backlog that stops draining — the
+third being the one that catches the reclaimer itself having died.
+
+Dashboard v3 (Step 3.7) extends the existing pages and keeps the shipped
+2s poll. **No SSE, no WebSocket, no framework**: the poll is already
+proven to show a live lifecycle (Step 2.7), and "watch a reassignment
+happen" is the same read at the same cadence.
+
+## 3.0.10 Technology choices, and what was rejected
+
+| Choice | Rejected alternative | Why |
+|---|---|---|
+| Leases in Postgres | Redis TTL + keyspace notifications | Redis is ephemeral by contract (§4); a flush would silently reset recovery state, and the reclaim needs a DB write anyway |
+| Per-replica reclaimer, no leader | Leader election (Redis lock / K8s lease) | `SKIP LOCKED` already makes concurrent reclaim safe; a leader adds a failure mode and a split-brain question for zero gain |
+| Per-type policy in a Postgres table | env vars; Redis hash; ConfigMap reload | env vars need a restart, so "configurable without redeploy" would be false; Redis would silently revert operator intent on a flush |
+| Structural idempotency in Postgres | a Redis dedup set with a retention window | the row lock plus terminal state already answers it, **measured in 2.5**; a second store would be a second truth that can disagree |
+| Python chaos script (`scripts/chaos.py`) | Chaos Mesh / LitmusChaos | a new cluster-wide operator, more student credit, another Terraform surface, to do what `docker kill` and `kubectl delete pod` already do in a harness pattern that is already proven (`scripts/loadtest.py`) |
+| Keep the coordinator | Temporal / Celery / Kafka | each replaces the coordinator wholesale, which is precisely the "permanent foundation" §1 says is not being rewritten |
+
+## 3.0.11 Shipped decisions this gate changes
+
+| Decision | Effect |
+|---|---|
+| **#103** — "no execution timeout is added" | **Superseded.** M3 adds a per-type execution deadline; #103's rationale (duration is bounded by parameter validation) is true for *legal* durations and says nothing about a hung executor |
+| **#91** — stranded `ASSIGNED` rows are the designed outcome | Closed. The reclaimer is what #91 was waiting for; the pre-M3 backlog is closed as `FAILED` by backfill |
+| **#79** — the queue is the `tasks` table | Unchanged, but the dequeue predicate gains two filters inside the same ordered index walk. Same honest cost caveat as the 2.3 type filter; **to be measured in 3.1, not assumed** |
+| **#101** — capacity refusal saturates the session | Unchanged and relied upon: it is what absorbs a worker that had a task taken from it |
+| **#105 / #98** | Unchanged |
+
+## 3.0.12 §16 escalations — ALL THREE APPROVED 2026-08-03
+
+Raised as three things needing an explicit call. **All three were
+approved by the user on 2026-08-03, in the form each recommendation
+proposed, with the user's instruction being to take the variant that
+costs the least design and implementation time and adds no load to the
+running system.** Decisions **#169**, **#170** and **#171**. The wording
+in Steps 3.3 and 3.4 that each deviation contradicted is corrected in
+this same commit, so no step now asks for something the gate has decided
+against.
+
+1. **`session_epoch` is not used for result fencing** (§3.0.6), which
+   contradicted the wording of Step 3.4. Using it would break Step 2.5's
+   measured reconnect path. **APPROVED — Decision #169.** Fencing is
+   `worker == assigned_worker_id AND attempt_number == attempt_count`,
+   evaluated inside the row lock the shipped result path already takes.
+   **No new column, no new index, no new query and no extra round trip** —
+   it is the same `UPDATE … WHERE` M2 ships, with two more predicates.
+   `session_epoch` stays on the wire and stays in the logs as a tracing
+   field; it simply is not an input to the accept/reject decision.
+   Step 3.4's third bullet and its epoch exit criterion are re-worded
+   below to match.
+2. **No Redis dedup store** (§3.0.10), which contradicted the wording of
+   Step 3.3. **APPROVED — Decision #170.** Postgres answers duplicate
+   submission structurally: the row lock plus the terminal-state check
+   already measured in Step 2.5. **This is the cheapest possible outcome
+   because it is a deletion, not a build** — there is no dedup store to
+   write, no retention window to tune, no expiry job to run, no extra
+   Redis round trip on the hot result path, and no second store that can
+   disagree with the first after a Redis flush. Step 3.3's Redis bullet
+   and its retention criterion are re-worded below to describe the
+   mechanism that actually exists.
+3. **Postgres has no replica, no PITR and no backup** (§3.0.4 item 3).
+   **APPROVED AS AN EXPLICIT ACCEPTED RISK — Decision #171**, accepted by
+   the user on 2026-08-03. **M3 builds nothing for this and claims
+   nothing about it.** The risk is stated plainly in §3.0.4 item 3 and is
+   not covered by any M3 exit criterion. It is not an open question and
+   not a hidden assumption; it is a recorded, owned acceptance. The cheap
+   upgrade path, if it is ever wanted, is written down in §3.0.4 item 3
+   so that taking it later needs no rediscovery.
+
+**Nothing in these three approvals adds a query, a store, a background
+job, a migration or a protocol message.** Two of them remove work that
+the step wording would otherwise have required.
+
+## 3.0.13 What each later step inherits
+
+| Step | Inherits from this gate |
+|---|---|
+| 3.1 | lease lifecycle, the three timeouts, the reclaimer query, `task_policies`, the ≤35s / ≤65s bounds to verify |
+| 3.2 | requeue transitions, `max_attempts`, backoff via `not_before`, exclusion window, `task_attempts` counters |
+| 3.3 | nothing to build but the tests — idempotency is already structural; the race's winner rule is fixed here |
+| 3.4 | the fencing rule, and the epoch deviation |
+| 3.5 | no startup scan is needed; recovery is the continuous reclaimer plus lease renewal on `hello` |
+| 3.6 | full re-execution, no checkpointing (executors are pure and were fingerprint-verified in 2.4/2.5) |
+| 3.7 | attempt timeline, failed-task reason, fencing events, per-worker counters — all from `task_attempts` |
+| 3.8 | invariants to assert: zero loss, zero double completion, convergence to no `ASSIGNED`/`RUNNING` rows after chaos stops |
+| 3.9 | the demo script already written below is unchanged by any of this |
+
+## 3.0.14 Exit-criteria self-check for 3.0
+
+| Criterion | Where |
+|---|---|
+| Every failure has detection, recovery and a dashboard outcome | §3.0.3, all 14 rows |
+| Crash vs slow-worker distinction objective, not guesswork | §3.0.6 — coordinator-observed message arrival only; progress values and worker status explicitly excluded |
+| Failures explicitly not recovered, with reasoning | §3.0.4, five of them |
+| Delivery guarantee stated accurately | §3.0.5 |
+| Approved before code | **MET — Step 3.0 approved by the user 2026-08-03, all three §16 escalations approved with it (#169–#171). No code had been written at the time of approval.** |
+
+---
+
 ## Step 3.1 — Lease and timeout engine
 
 - Leases over assignments, with duration relative to expected task
@@ -51,14 +574,257 @@ with idempotent completion. Not exactly-once. Do not overclaim.
   replicas without double-reclaiming.
 
 **Exit criteria**
-- [ ] Leases are created, renewed, and expire correctly.
-- [ ] Killing a worker mid-task causes lease expiry within the documented
+- [x] Leases are created, renewed, and expire correctly.
+- [x] Killing a worker mid-task causes lease expiry within the documented
       timeout — timed and recorded.
-- [ ] A legitimate long task renews its lease and is never reclaimed.
-- [ ] A hung worker that stops renewing is reclaimed.
-- [ ] Three coordinator replicas running the reclaimer never
+- [x] A legitimate long task renews its lease and is never reclaimed.
+- [x] A hung worker that stops renewing is reclaimed.
+- [x] Three coordinator replicas running the reclaimer never
       double-reclaim — verified under load.
-- [ ] Timeouts configurable per task type without redeploy.
+- [x] Timeouts configurable per task type without redeploy.
+
+---
+
+## 3.1.1 What was built
+
+Migration **0006** carries the whole milestone's schema (gate §3.0.7), so
+Steps 3.2–3.4 ship no migration of their own: `tasks.deadline_at`,
+`tasks.not_before`, `tasks.excluded_worker_id`, the partial index
+`ix_tasks_lease_expiry`, and the `task_attempts` and `task_policies`
+tables. Only `deadline_at`, the index, `task_attempts` and `task_policies`
+are written in 3.1; the other two columns are Step 3.2's and are named as
+such in the migration.
+
+The lease lifecycle, implemented exactly where the gate put it — on the
+statements that were already moving the row, so no path gains a round
+trip:
+
+| Event | Write |
+|---|---|
+| `dequeue` | `lease_expires_at = now() + ack timeout`, `deadline_at = now() + execution cap` |
+| `task_started` | `deadline_at` re-stamped from the real start; `lease_expires_at = LEAST(now() + ttl, deadline_at)` |
+| any observed message about the task | `lease_expires_at = LEAST(now() + ttl, deadline_at)`, **lazily** |
+| socket close observed by the holding replica | `lease_expires_at = LEAST(it, now() + grace)` |
+| `hello` | every live lease that worker holds, renewed from the database |
+| terminal state | `lease_expires_at = NULL`, `deadline_at = NULL` |
+| reclaim | `ASSIGNED`/`RUNNING` → `QUEUED`, `attempt_count + 1`, one `task_attempts` row |
+
+`ASSIGNED -> QUEUED` and `RUNNING -> QUEUED` are added to `task_states`,
+and the two shipped docstrings that called this the `REASSIGNED`
+transition are corrected. The gate assigned that correction to Step 3.2;
+it is done here instead because this is the step that adds the transition,
+and leaving the code contradicting itself for a step would have been worse
+than moving one paragraph early.
+
+New: `GET /tasks/policies`, `PUT /tasks/policies/{type}`,
+`DELETE /tasks/policies/{type}` (operator-credentialled);
+`coordinator_leases_expired_total`, `coordinator_lease_renewals_total`,
+`coordinator_leases_overdue`, `coordinator_lease_reclaim_seconds`; two
+alerts; and `lease` on the task console with an overdue state.
+
+## 3.1.2 Three implementation decisions this step made
+
+**1. Renewal laziness lives in the process, not in the database.** Each
+session records, on its own monotonic clock, when each of its tasks is
+next worth a write. A message that arrives before then costs **no
+database round trip at all** — not a no-op UPDATE, no statement. At the
+defaults a 10s progress cadence becomes ~1 write per running task per 30s.
+The alternative, a guarded UPDATE that self-skips, would still have sent
+10 statements/s per 100 running tasks to a table that is also the queue's
+hot path (#79).
+
+**2. `deadline_at` is stamped at delivery as well as at `task_started`.**
+This is a deviation from the gate's lifecycle table and it was **found by
+a live run, not by review** — see 3.1.4.
+
+**3. Decision #168 is pulled forward from Step 3.4.** `handle_task_result`
+and `handle_task_failed` now release the credit when the outcome is
+`NOT_OWNER` *and* the id is one this session delivered. The gate scheduled
+this for 3.4, but 3.1 is what makes `NOT_OWNER` honestly reachable: a
+reclaimed task's row no longer names its original worker, so that worker's
+sincere late report would otherwise hold its credit for the life of the
+session. A worker losing three tasks to reassignment would quietly stop
+accepting work. A guessed id is still not in `credited`, so the §12
+protection is untouched.
+
+## 3.1.3 Measurements
+
+Every figure below is **measured on the reference laptop** (Intel i5-4460S,
+4 cores) against a real Docker Compose stack, Postgres 16. They are
+properties of that machine, not of the design.
+
+**The two detection bounds the gate published, tested against their own
+numbers** (`DISCONNECT_GRACE 30` + `RECLAIM_INTERVAL 5` = ≤35s;
+`LEASE_TTL 60` + `RECLAIM_INTERVAL 5` = ≤65s):
+
+| Failure | How it was caused | Bound | Measured |
+|---|---|---|---|
+| Worker process killed mid-task | `docker kill` on a worker running `sleep(600)` | ≤ 35s | **31.2s** |
+| Worker alive but frozen, no close observed | `docker pause` — the socket stays open, nothing is sent | ≤ 65s | **49.6s** |
+
+The killed case shows the close being observed: one second after the kill
+the task's remaining lease had dropped from 56.8s to **29.3s** — the
+disconnect grace — and it was reclaimed 1.2s after that expired. The
+frozen case never shortened, ran its full TTL down from its last renewal,
+and was caught on the next reclaim tick.
+
+**A legitimate long task is never reclaimed.** A `sleep(600)` task watched
+for 2.5 minutes — more than four lease windows — held `attempt_count = 1`
+and never returned to `QUEUED`, its lease sawtoothing between ~25s and
+~59s as progress messages renewed it lazily.
+
+**Three coordinator replicas, under load, zero double-reclaims.** Three
+real coordinator processes (`--scale coordinator=3`) against 3,000 tasks
+seeded `ASSIGNED` with already-expired leases:
+
+| | |
+|---|---|
+| drained in | **5.74s** (≈522 reclaims/second) |
+| reclaims per replica | **900 / 1100 / 1000** |
+| total reclaim log lines | **3,000 — exactly, not 3,001** |
+| tasks with more than one attempt row | **0** |
+| tasks whose `attempt_count` ≠ 1 | **0** |
+
+An earlier run of the same shape split **0 / 2900 / 100**, and that is
+worth recording rather than tidying away: the reclaimer is race-to-claim,
+not load-balanced, so whichever replica ticks first takes most of a
+backlog. The total was still exactly 3,000. **Even distribution is not a
+property this design has or needs; exactly-once reclaim is, and it held in
+both runs.**
+
+Reclaim pass duration on an idle-to-light queue: 6 passes totalling
+**30.2ms**, i.e. ~5ms each, from `coordinator_lease_reclaim_seconds`.
+
+**Per-type timeouts change with no redeploy.** `PUT
+/tasks/policies/hash_rounds {"max_execution_seconds": 1800}` against the
+running coordinator moved the effective cap from 300 (`source: default`)
+to 1800 (`source: policy`), and a task claimed seconds later carried a
+**1796s** cap. Nothing was restarted, reloaded or redeployed.
+
+**`count_to_n`'s ceiling, which the gate flagged as the one number with no
+measurement behind it (§3.0.8).** The 100,000,000 ceiling runs at a median
+of **4.801s** over three runs (4.771 / 4.801 / 5.124), single core, through
+the executor's own chunked loop. The 300s default is ~62x that. Measured
+rather than carried.
+
+## 3.1.4 What the live run found that review did not
+
+**The execution cap could be bypassed entirely on a reassigned task, and
+the tests written for this step all passed while it was true.**
+
+Watching a reclaimed task on the running stack, it sat `ASSIGNED` with a
+lease that kept renewing and a `deadline_at` of NULL. The cause is a
+shipped M2 worker behaviour: `task_assign_duplicate_ignored`. The worker
+refuses a re-delivery of a task id it is already executing — correctly —
+so after a reclaim handed the task back to the same worker there was no
+second `task_started`, and the deadline was only ever written there.
+
+The consequence is exactly the failure `deadline_at` exists to prevent:
+progress messages from a **hung** executor would renew that task's lease
+forever, because the cap that should have stopped them was never set.
+
+Fixed by stamping `deadline_at` in the dequeue statement as well, so a cap
+exists from the moment a task is claimed and `task_started` re-stamps it
+from the real start. The cap has to be **per type** at claim time — one
+dequeue claims across every type a worker supports — so the code default
+is a SQL `CASE` over the registry rather than a single bound parameter.
+Two regression tests cover it.
+
+**This is the sixth time a live run has found something review and the
+suite both missed**, after #144, #145, #146, #149 and the event-loop lock.
+The pattern holds: the defects that survive review are the ones that need
+two subsystems in the same room.
+
+Two further defects were found reviewing this step's own implementation
+before it ran, and each has a regression test that fails against the first
+version:
+
+- **A worker that reconnected mid-execution could not renew.** The new
+  session holds no credit key for work delivered to the socket that died
+  (Decision #101 has the worker declare a *count*, which cannot be keyed),
+  so every progress message about it was skipped and the task would have
+  been reclaimed **from a worker that was doing exactly what it should**.
+  Fixed with `LocalSession.recovered_tasks`, seeded from what the database
+  says the worker holds — never from the worker.
+- **The renewal sat behind the telemetry lookup** in `handle_task_progress`,
+  which returns early for precisely that case. Moved above it.
+
+## 3.1.5 What Step 3.1 deliberately does NOT do
+
+Stated so it is not discovered in a demo:
+
+- **No retry policy.** The reclaimer requeues with no attempt cap, no
+  backoff and no exclusion of the worker that just lost the task, so a
+  task whose worker is permanently gone **cycles rather than reaching
+  `FAILED`**. `max_attempts`, `not_before` and `excluded_worker_id` all
+  exist in the schema and are written by nothing. Step 3.2.
+- **No `task_cancel`.** A reclaimed task's original worker keeps burning
+  CPU on it. Step 3.2.
+- **No fencing.** A late result from a superseded attempt is accepted if
+  the row still names that worker. Step 3.4.
+- **No recovery timeline in the GUI.** `task_attempts` rows are written
+  and are not yet rendered; the console shows the lease, the countdown and
+  the attempt count. Step 3.7.
+- **No remote Internet worker** took part in any of the above. Everything
+  here is local Docker on one laptop, so §8 is **not** claimed for this
+  step.
+- **Every demo above was agent-run**, not user-run (§15 items 3–4).
+
+## 3.1.6 Demo and failure demo
+
+Runnable from a fresh clone with the documented compose command. Shorten
+the windows first if you do not want to wait — the four lease settings are
+exposed in `docker-compose.yml` for exactly this:
+
+```bash
+TASK_LEASE_TTL_SECONDS=15 LEASE_DISCONNECT_GRACE_SECONDS=5 \
+LEASE_RECLAIM_INTERVAL_SECONDS=2 docker compose -p dcds up -d
+```
+
+**What is on screen.** Open `https://localhost:${DASHBOARD_PORT}/ui/tasks`.
+The `lease` column counts down on every in-flight task and resets as it is
+renewed; an expired lease not yet reclaimed shows **red, as "Ns overdue"**.
+
+**Success path.** Submit a `sleep` task of 600 seconds. Watch it go
+`QUEUED → ASSIGNED → RUNNING`, and watch its lease sawtooth rather than
+run out — that is renewal working, and the task is never reclaimed.
+
+**Failure demo 1 — kill a worker mid-task.**
+
+```bash
+docker kill dcds-worker-1
+```
+
+The lease drops to the disconnect grace within a second, expires, and the
+task reappears **`QUEUED` with `attempt` incremented**. Restart the worker
+and it is executed again.
+
+**Failure demo 2 — a worker that is alive but frozen.**
+
+```bash
+docker pause dcds-worker-1
+```
+
+No close frame is sent, so nothing shortens the lease. It runs down its
+full TTL and the task is reclaimed anyway — which is the point of putting
+the trigger in Postgres rather than in the connection.
+
+**Failure demo 3 — change a timeout with no redeploy.**
+
+```bash
+curl -k -X PUT https://localhost:$PORT/tasks/policies/sleep \
+  -H "X-Admin-Secret: $ADMIN_SECRET" -H 'Content-Type: application/json' \
+  -d '{"max_execution_seconds": 120}'
+```
+
+`GET /tasks/policies` shows the value with `source: policy`; the next
+`sleep` task claimed carries the new cap. Nothing was restarted.
+
+**Logs to watch.** `task_lease_expired` carries the task id, the worker
+that lost it, the previous status, the attempt number and
+`overdue_seconds` — the coordinator-observed detection lag.
+`task_leases_shortened_on_disconnect` and `task_leases_renewed_on_hello`
+are the two accelerator paths.
 
 ---
 
@@ -88,7 +854,11 @@ with idempotent completion. Not exactly-once. Do not overclaim.
 ## Step 3.3 — Idempotency and duplicate suppression
 
 - Enforce the idempotency token that has been carried since Phase 2.
-- Deduplication state in Redis with a documented window and retention.
+- **Deduplication is structural in Postgres — the row lock plus the
+  terminal-state check — and there is NO separate dedup store.** Amended
+  by Decision #170 (§3.0.12); this bullet previously called for
+  deduplication state in Redis with a window and retention. There is no
+  window and no retention because there is nothing to retain.
 - Duplicate submission is a **no-op returning success**, not an error.
 - Resolve the classic race: worker A's result is in flight, the lease
   expires, the task reassigns to worker B, and both results arrive.
@@ -99,7 +869,10 @@ with idempotent completion. Not exactly-once. Do not overclaim.
 - [ ] The in-flight-versus-reassignment race has a stated winner rule,
       implemented and tested by deliberately reproducing it.
 - [ ] Duplicate submission returns success, not an error.
-- [ ] Dedup state has a bounded retention and does not grow unbounded.
+- [ ] **No dedup store exists to grow unbounded** — the terminal-state
+      check on the task row is the whole mechanism, and that is asserted
+      rather than assumed (amended by #170; previously "dedup state has a
+      bounded retention").
 - [ ] Dedup works across coordinator replicas.
 - [ ] Result ledger count matches task completion count exactly under
       load.
@@ -108,8 +881,14 @@ with idempotent completion. Not exactly-once. Do not overclaim.
 
 ## Step 3.4 — Stale result fencing
 
-- Reject results from superseded attempts using attempt number and
-  session epoch, both present since Phase 2.
+- Reject results from superseded attempts using **task ownership and
+  attempt number** — `worker == assigned_worker_id AND attempt_number ==
+  attempt_count` — both present since Phase 2. Amended by Decision #169
+  (§3.0.12); this bullet previously also named `session_epoch`.
+  **`session_epoch` is deliberately NOT a fencing input**, because Step
+  2.5 measured a legitimate result executed under epoch 4 and submitted
+  on 5 after a reconnect. It stays on the wire and in the logs for
+  tracing.
 - Rejected results never mutate task state.
 - The worker receives an unambiguous rejection response.
 - Rejections are logged and surfaced on the dashboard.
@@ -117,7 +896,11 @@ with idempotent completion. Not exactly-once. Do not overclaim.
 **Exit criteria**
 - [ ] A result from a superseded attempt is rejected — verified by
       deliberately reproducing it.
-- [ ] A result from an old session epoch is rejected.
+- [ ] **A result submitted under a NEWER session epoch than the one it
+      was executed under is ACCEPTED** — Step 2.5's measured reconnect
+      path, asserted rather than assumed (amended by #169; previously "a
+      result from an old session epoch is rejected", which would have
+      broken that path).
 - [ ] Rejected results leave task state untouched.
 - [ ] The worker handles rejection gracefully without crashing.
 - [ ] Rejections visible on the dashboard, not buried in logs.

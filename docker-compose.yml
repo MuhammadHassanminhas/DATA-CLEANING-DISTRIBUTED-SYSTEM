@@ -56,6 +56,21 @@ services:
       # requests, and so a listing page size can be shrunk to show paging.
       TASK_API_RATE_LIMIT_PER_MINUTE: ${TASK_API_RATE_LIMIT_PER_MINUTE:-300}
       TASK_LIST_MAX_LIMIT: ${TASK_LIST_MAX_LIMIT:-200}
+      # Phase 3.1 lease engine. Defaults match app/config.py exactly; they
+      # are exposed here so a failure demo can be run in a minute instead
+      # of a lease window — shortening TASK_LEASE_TTL_SECONDS and
+      # LEASE_DISCONNECT_GRACE_SECONDS is what makes "kill a worker and
+      # watch its task come back" a demo rather than a wait.
+      #
+      # **Per-task-type timeouts are NOT set here and must not be.** They
+      # live in the `task_policies` table, because the exit criterion is
+      # that they change *without a redeploy*, and an environment variable
+      # cannot. These four are the fleet-wide defaults that a policy row
+      # overrides.
+      TASK_ACK_TIMEOUT_SECONDS: ${TASK_ACK_TIMEOUT_SECONDS:-30}
+      TASK_LEASE_TTL_SECONDS: ${TASK_LEASE_TTL_SECONDS:-60}
+      LEASE_RECLAIM_INTERVAL_SECONDS: ${LEASE_RECLAIM_INTERVAL_SECONDS:-5}
+      LEASE_DISCONNECT_GRACE_SECONDS: ${LEASE_DISCONNECT_GRACE_SECONDS:-30}
     ports:
       - "${COORDINATOR_PORT}:8443"
     volumes:

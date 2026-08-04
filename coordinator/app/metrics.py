@@ -38,7 +38,7 @@ from app.config import admin_secret_is_separate
 from app.db import get_session
 from app.models import Worker
 from app.redis_client import redis_client
-from app.task_queue import queue_depth
+from app.task_queue import expired_lease_count, queue_depth
 
 logger = logging.getLogger("coordinator")
 
@@ -166,6 +166,43 @@ TASK_API_RATE_LIMITED = Counter(
     "Operator task API requests rejected by the per-source-IP rate limit.",
 )
 
+# Phase 3.1 lease engine.
+#
+# `coordinator_leases_expired_total` and `coordinator_lease_renewals_total`
+# are **per-instance** like the assignment series above: a lease is renewed
+# by the replica holding the socket and reclaimed by whichever replica's
+# tick got there first. Sum across instances, do not `max`.
+#
+# `coordinator_leases_overdue` is the opposite — it is recomputed from
+# Postgres per scrape, so every replica reports the same number and queries
+# collapse it with `max by`. It is deliberately a **gauge of the backlog
+# rather than a rate of reclaims**, because the failure it exists to catch
+# is the reclaimer having stopped: a dead reclaimer produces no reclaim
+# events at all, which looks identical to a healthy idle system in any
+# counter. A backlog that climbs and never drains does not.
+LEASES_EXPIRED = Counter(
+    "coordinator_leases_expired_total",
+    "Task leases that expired and were returned to the queue by this instance.",
+)
+LEASE_RENEWALS = Counter(
+    "coordinator_lease_renewals_total",
+    "Lease renewal attempts by this instance, by outcome.",
+    ["outcome"],
+)
+LEASES_OVERDUE = Gauge(
+    "coordinator_leases_overdue",
+    "Tasks whose lease has already expired and that no reclaim pass has taken yet.",
+)
+# Buckets chosen for a statement that reads a partial index and updates at
+# most `LEASE_RECLAIM_BATCH` rows: the common case is an empty pass in
+# single-digit milliseconds, and anything past a second means the reclaimer
+# is contending with the assignment path for the same rows.
+LEASE_RECLAIM_SECONDS = Histogram(
+    "coordinator_lease_reclaim_seconds",
+    "Duration of one lease reclaim pass.",
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),
+)
+
 # Per-instance request latency. Route template keeps label cardinality bounded.
 REQUEST_LATENCY = Histogram(
     "coordinator_request_duration_seconds",
@@ -202,6 +239,11 @@ async def _refresh_fleet_gauges() -> None:
             for status, count in result.all():
                 counts[status] = count
             TASKS_QUEUED.set(await queue_depth(session))
+            # Phase 3.1. Same session, one more indexed count — the reclaim
+            # backlog has to be visible on the same scrape as the queue
+            # depth, or "the queue is draining" and "recovery has stopped"
+            # cannot be told apart on one dashboard.
+            LEASES_OVERDUE.set(await expired_lease_count(session))
         DEPENDENCY_UP.labels("database").set(1)
     except Exception as exc:  # noqa: BLE001 — a scrape must not raise
         logger.warning("metrics_db_unavailable", extra={"detail": str(exc)})

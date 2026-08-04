@@ -110,6 +110,12 @@
   .tid { font-family: var(--mono); font-size: 12px; color: var(--text-dim); cursor: pointer; }
   .tid:hover { color: var(--accent); }
 
+  /* Phase 3.1. A lease past its expiry that nothing has reclaimed. It
+     borrows the offline colour rather than getting its own, because it
+     means the same thing everywhere on this dashboard: something that
+     should have answered by now has not. */
+  .lease-overdue { color: var(--offline); }
+
   .task-state {
     display: inline-flex;
     align-items: center;
@@ -299,11 +305,12 @@
               <th>type</th>
               <th>worker</th>
               <th class="num">duration</th>
+              <th class="num">lease</th>
               <th>created</th>
             </tr>
           </thead>
           <tbody id="tbody">
-            <tr><td colspan="6" class="loading-state">loading tasks…</td></tr>
+            <tr><td colspan="7" class="loading-state">loading tasks…</td></tr>
           </tbody>
         </table>
       </div>
@@ -449,6 +456,37 @@
     return (seconds / 3600).toFixed(1) + "h ago";
   }
 
+  // Phase 3.1. The lease countdown, and it deliberately renders the
+  // number the **coordinator** computed (`lease_seconds_remaining`) rather
+  // than subtracting from this browser's clock. Two operators watching the
+  // same reclaim on two laptops must see the same countdown, and a viewer
+  // whose clock is minutes out must not see a healthy task as overdue.
+  //
+  // A negative value is shown as "overdue", not clamped to zero: a lease
+  // that has expired and has not been reclaimed is the visible signature
+  // of a stopped reclaimer, and that is worth seeing.
+  function leaseCell(task) {
+    const left = task.lease_seconds_remaining;
+    if (left == null) return "—";
+    if (left < 0) return `<span class="lease-overdue">${(-left).toFixed(0)}s overdue</span>`;
+    return `${left.toFixed(0)}s`;
+  }
+
+  function leaseDetail(task) {
+    if (!task.lease_expires_at) {
+      return task.status === "QUEUED"
+        ? "— (queued: no worker holds it)"
+        : "— (finished: the lease was cleared)";
+    }
+    const left = task.lease_seconds_remaining;
+    const suffix = left == null
+      ? ""
+      : left < 0
+        ? ` — ${(-left).toFixed(1)}s overdue, awaiting reclaim`
+        : ` — ${left.toFixed(1)}s left`;
+    return esc(task.lease_expires_at) + esc(suffix);
+  }
+
   async function api(path, options) {
     const resp = await fetch(path, Object.assign({ cache: "no-store" }, options || {}));
     const data = await resp.json().catch(() => ({}));
@@ -481,7 +519,7 @@
 
   function renderRows(tasks) {
     if (tasks.length === 0) {
-      el.tbody.innerHTML = `<tr><td colspan="6" class="empty-state"><div class="big">no tasks match</div>submit one on the right, or clear the filter</td></tr>`;
+      el.tbody.innerHTML = `<tr><td colspan="7" class="empty-state"><div class="big">no tasks match</div>submit one on the right, or clear the filter</td></tr>`;
       return;
     }
     el.tbody.innerHTML = tasks.map((t) => `
@@ -491,6 +529,7 @@
         <td>${esc(t.task_type)}</td>
         <td class="wid" title="${esc(t.assigned_worker_id || "")}">${esc(shortId(t.assigned_worker_id))}</td>
         <td class="num">${t.observed_duration_seconds == null ? "—" : t.observed_duration_seconds.toFixed(3) + "s"}</td>
+        <td class="num">${leaseCell(t)}</td>
         <td>${esc(timeAgo(t.created_at))}</td>
       </tr>`).join("");
   }
@@ -607,6 +646,8 @@
         <dt>observed duration</dt><dd>${task.observed_duration_seconds == null ? "—" : task.observed_duration_seconds + "s (coordinator)"}</dd>
         <dt>reported duration</dt><dd>${task.result && task.result.duration_seconds != null ? esc(task.result.duration_seconds) + "s (worker, untrusted)" : "—"}</dd>
         <dt>attempts</dt><dd>${esc(task.attempt_count)}</dd>
+        <dt>lease</dt><dd>${leaseDetail(task)}</dd>
+        <dt>execution deadline</dt><dd>${task.deadline_at ? esc(task.deadline_at) + " (cap; renewal cannot pass it)" : "—"}</dd>
       </dl>
 
       <div class="section">

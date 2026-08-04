@@ -168,7 +168,7 @@ def run(body):
 async def _reset(sessionmaker, workers: int = 1) -> list[uuid.UUID]:
     ids = [uuid.uuid4() for _ in range(workers)]
     async with sessionmaker() as session:
-        await session.execute(text("TRUNCATE tasks"))
+        await session.execute(text("TRUNCATE tasks CASCADE"))
         for worker_id in ids:
             await session.execute(
                 text(

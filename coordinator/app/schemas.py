@@ -67,3 +67,25 @@ class DequeueTaskRequest(BaseModel):
     admin_secret: str
     worker_id: str
     limit: int = Field(default=1, ge=1)
+
+
+class TaskPolicyRequest(BaseModel):
+    """Phase 3.1. Per-task-type timeout overrides.
+
+    **Every field is optional and `None` means "leave this one alone"**,
+    not "clear it". Partial updates are the common operator action — "give
+    `sleep` a longer execution cap and change nothing else" — and a model
+    that required all four would make that a read-modify-write the operator
+    has to get right. Clearing is `DELETE`, which says so plainly.
+
+    Bounds are checked in `app.task_policies`, not by `Field(ge=...)` here,
+    for the reason `EnqueueTaskRequest` records: a pydantic rejection is a
+    422, and the range that a lease TTL has to satisfy is a domain rule
+    that belongs next to the code that applies it, with a 400 and a
+    message naming the field.
+    """
+
+    ack_timeout_seconds: int | None = None
+    lease_ttl_seconds: int | None = None
+    max_execution_seconds: int | None = None
+    max_attempts: int | None = None
