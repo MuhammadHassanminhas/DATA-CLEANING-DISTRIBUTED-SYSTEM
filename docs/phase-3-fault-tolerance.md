@@ -1085,18 +1085,379 @@ one log line with a field to filter on.
   expires, the task reassigns to worker B, and both results arrive.
 
 **Exit criteria**
-- [ ] Submitting the same result twice completes the task exactly once —
-      verified in the database.
-- [ ] The in-flight-versus-reassignment race has a stated winner rule,
-      implemented and tested by deliberately reproducing it.
-- [ ] Duplicate submission returns success, not an error.
-- [ ] **No dedup store exists to grow unbounded** — the terminal-state
+- [x] Submitting the same result twice completes the task exactly once —
+      verified in the database. — **Twenty consecutive submissions of one
+      envelope over a real socket: one `COMPLETED`, one result row, one
+      `completed_at`** (§3.3.3).
+- [x] The in-flight-versus-reassignment race has a stated winner rule,
+      implemented and tested by deliberately reproducing it. — **Rule in
+      §3.3.2, reproduced live by freezing the worker holding a `sleep(40)`
+      task**: reassigned at 12.2s, completed by another worker by 55.8s,
+      and the original's honest result answered `superseded` **40.9s after
+      that completion**, having written nothing (§3.3.3).
+- [x] Duplicate submission returns success, not an error. — **`accepted:
+      true`, `outcome: duplicate`**, and the worker drops its pending
+      result rather than retrying (§3.3.3).
+- [x] **No dedup store exists to grow unbounded** — the terminal-state
       check on the task row is the whole mechanism, and that is asserted
       rather than assumed (amended by #170; previously "dedup state has a
-      bounded retention").
-- [ ] Dedup works across coordinator replicas.
-- [ ] Result ledger count matches task completion count exactly under
-      load.
+      bounded retention"). — **Asserted in the schema and in Redis**
+      (§3.3.3), and by a test that fails if a table is added.
+- [x] Dedup works across coordinator replicas. — **The same envelope
+      re-sent to a different replica of a three-replica stack answered
+      `duplicate` and wrote nothing** (§3.3.3).
+- [x] Result ledger count matches task completion count exactly under
+      load. — **1,303 completions, 1,303 result rows, 1,303 distinct
+      tokens, 0 rows shared by two tasks**, held through a run in which
+      **every attempt of 60 tasks lost its lease and 180 late results
+      arrived** (§3.3.3).
+
+**Not claimed for this step, and named rather than left to be found:**
+**no remote Internet worker took part** (§8 not claimed — the same gap
+Steps 3.1 and 3.2 recorded), and **every demo below was run by the agent,
+not by the user** (§15 items 3–4).
+
+---
+
+## 3.3.1 What was built
+
+**No migration, no new table, no new key, no new message.** That is the
+step, stated as a diff: `complete_task` reorders two guards and reads one
+more column, and one small helper decides what to call a submission the
+coordinator is not going to store. Everything else here is tests,
+measurement and this document.
+
+Before 3.3 the suppression existed — the row lock plus `status ==
+COMPLETED` shipped in Step 2.5 — but it answered **two different
+situations with one word**:
+
+| Situation | Before 3.3 | After 3.3 |
+|---|---|---|
+| The same worker retries the submission it already made | `duplicate` | `duplicate` |
+| A second, different result arrives for a completed task | `duplicate` | **`superseded`** |
+| A late result arrives for a task another attempt completed | **`not_owner`** | **`superseded`** |
+| A late result arrives for a task that ended `FAILED` | **`illegal`** | **`superseded`** |
+| A late result arrives for a task another worker is still running | `not_owner` | `not_owner` (3.4 fences it) |
+
+Two of those rows were actively misleading after Step 3.2 made
+reassignment real. `not_owner` is the answer to *an impostor*, and it is
+the same answer §12 gives a worker naming a task id it guessed — but a
+worker whose task was reassigned while it was still computing is not an
+impostor, it is the honest loser of a race the design says it may lose.
+`illegal` was worse: it accused a worker of an invalid transition when
+what actually happened was that the coordinator gave up on the task first.
+
+**The mechanism, in full:**
+
+```
+lock the task row FOR UPDATE          (already there — Step 2.5)
+  terminal?  -> compare the submitted idempotency_token with the token in
+                the stored result:  equal -> duplicate,  else -> superseded
+  live?      -> must be the assigned worker, then complete it
+```
+
+**The idempotency token stops being decoration here.** It has been on the
+wire and in the stored envelope since Step 2.5, required and enforced by
+nothing — which was that step's stated intent, so that Phase 3 could add
+arbitration without a protocol change. It is minted **once per task
+execution** on the worker (`worker.py`'s `Task.idempotency_token`) and
+re-sent unchanged by every retry, so token equality means *the same
+submission*, not merely *the same worker*.
+
+## 3.3.2 Three decisions this step made
+
+**1. The winner rule, stated once so it can be tested:**
+
+> The first submission to find its task non-terminal **while holding it**
+> completes the task and stores exactly one result. Every later submission
+> for that task writes nothing, and is answered definitively: `duplicate`
+> if the stored result is its own, `superseded` if it is not.
+
+The lock is what makes "first" well defined across replicas; nothing about
+this rule needs a clock, an ordering service or a second store. And the
+race resolves in **both** directions with no extra machinery: if the late
+result arrives before the reclaimer ticks, the task is already terminal
+and the reclaimer's `WHERE status IN ('ASSIGNED','RUNNING')` matches
+nothing — the slow worker simply wins.
+
+**2. The terminal check runs BEFORE the ownership check, and the order is
+load-bearing.** Reversed — as it shipped in 2.5 — a reassigned task
+answers its original worker `not_owner`, which is both the wrong word and
+the wrong behaviour: under Decision #168 that path only releases the
+worker's credit as a special case. Putting the terminal check first means
+an honest late result is answered on the task's terms, whoever asks.
+
+The §12 question this raises, answered rather than skipped: a worker that
+*guesses* a completed task's id now learns it is terminal, where before it
+learned it was someone else's. Both answers already reveal that the id
+exists (`not_found` is the answer when it does not), so no new class of
+information is disclosed — and the credit it can free is bounded by what
+it declared as its own reconnect residue, exactly as the shipped
+`capacity` message already allows.
+
+**3. `superseded` is a new outcome word rather than a reuse of
+`duplicate`.** Collapsing them would make an ack say *your result is
+stored* when another attempt's is — the kind of blurring §10 exists to
+prevent — and it would hide the one number that distinguishes a fleet
+retrying itself from a fleet being reassigned out from under itself.
+`accepted` is therefore `false` for `superseded` and `true` for
+`duplicate`: nothing of the superseded submission was kept, and the worker
+should stop retrying either way.
+
+**It needs no new metric.** `coordinator_task_results_total{outcome=...}`
+has counted decisions about submissions since Step 2.5, and a new label
+value is what a new decision looks like there.
+
+## 3.3.3 Measurements
+
+Measured on the reference laptop (Intel i5-4460S, 4 cores) against a real
+Docker Compose stack: **three coordinator replicas** (`--scale
+coordinator=3`) over one Postgres and one Redis, plus real worker
+containers, on the shortened windows Step 3.2 introduced — `LEASE_TTL 15`,
+`DISCONNECT_GRACE 5`, `RECLAIM_INTERVAL 2`, `BACKOFF_BASE 3`, `EXCLUSION
+30`.
+
+Duplicate and superseded submissions are made by a **throwaway protocol
+client** driving the shipped `SimWorker` from `scripts/loadtest.py` — the
+same wire protocol a real worker speaks, with **no production code
+changed**. A real worker cannot be asked to repeat itself on demand; that
+is the whole point of the pending buffer it drops on the first ack.
+
+**Twenty identical submissions of one envelope, over one socket** — the
+same task id, the same token, the same body, 0.4s apart:
+
+| | |
+|---|---|
+| acks received | `transitioned`, then **19 × `duplicate`**, every one `accepted: true` |
+| the task | `COMPLETED`, one `completed_at`, one `result_id` |
+| result rows in the whole database afterwards | **3, for 3 completed tasks, with 3 distinct tokens** |
+
+**A different envelope for the same completed task** (a fresh token and
+the body `"a-different-answer"`) was answered **`superseded`, `accepted:
+false`**. Checked in the database on the earlier `count_to_n(2000)` task
+that got the same treatment: the stored row still held token
+`0dbc465c982b…` and the answer **`2000`** — the loser's body was not
+stored, and `completed_at` did not move.
+
+**Across replicas.** The same worker reconnected to a **different
+coordinator replica** — a different process, sharing nothing but Postgres
+— and re-sent the winning envelope. Answer: **`duplicate`**, and the
+metric appeared on that replica's own `/metrics` while the first replica's
+count did not move:
+
+```
+replica A   transitioned 1   duplicate 4   superseded 1
+replica B   duplicate 1
+```
+
+**The race, deliberately reproduced.** A `sleep(40)` task delivered to one
+worker, which was then **frozen with `docker pause`** — alive, socket
+open, nothing sent, so no close is observed and only the lease can catch
+it:
+
+| t | what the coordinator's API showed |
+|---|---|
+| 0.0s | `RUNNING`, attempt 0, worker `50716244` |
+| 12.2s | `QUEUED`, attempt **1**, no worker — reclaimed and requeued |
+| 16.3s | `RUNNING`, attempt 1, worker **`75ead7af`** — a different machine |
+| 55.8s | `COMPLETED` by `75ead7af` (the poll before, at 51.8s, still read `RUNNING`) |
+| +40.9s | the **unpaused** original worker finished its own 40s of work and submitted — `11:02:39.817` against a completion at `11:01:58.870`, both from the coordinator's own log |
+
+The last line is the one this step exists for. The coordinator answered
+`task_result_not_applied outcome=superseded`, and the worker's own log
+reads:
+
+```
+{"event": "task_result_refused", "outcome": "superseded",
+ "was_pending": true, "pending": 0}
+```
+
+— it dropped the result and stopped, rather than retrying a verdict that
+will never change. In the database: **one result row**, holding
+`75ead7af`'s answer with a worker-reported duration of **40.006s**, and
+the loser's identical 40.001s of honest work stored **nowhere**. That is
+the delivery guarantee (gate §3.0.5) demonstrated end to end: **the task
+executed twice and completed once.**
+
+**No dedup store — asserted, not assumed.** After a storm of 20 duplicates
+and 2 superseded submissions:
+
+```
+                    List of relations
+ Schema |      Name       | Type  |    Owner
+--------+-----------------+-------+-------------
+ public | alembic_version | table | coordinator
+ public | task_attempts   | table | coordinator
+ public | task_policies   | table | coordinator
+ public | task_results    | table | coordinator
+ public | tasks           | table | coordinator
+ public | workers         | table | coordinator
+```
+
+Six tables — the migrations' own, with nothing added. Redis went from 12
+keys to 18 across the storm, and **every one of the six is accounted for
+by the probe registering as a new worker** (`access_token`,
+`session_epoch`, `token_gen`, `metrics`) plus two rate-limit counters. **No
+new key *shape* appeared, and 20 duplicate submissions in a row created
+not one key.** `tests/test_idempotency.py` asserts the table set exactly,
+so adding a store fails CI rather than being noticed later.
+
+**The ledger under load.** Two burst runs plus a deliberate race storm,
+counted from the coordinator's own rows:
+
+| run | tasks | outcome |
+|---|---|---|
+| `burst --workers 10 --tasks 1000` (`count_to_n`) | 1,000 | 1,000 `COMPLETED` in 16.6s, every check green |
+| `burst --workers 10 --tasks 300` (`sleep(4)`, lease 5s) | 300 | 300 `COMPLETED` in 37.1s |
+| **race storm** — `sleep(4)` with the type's lease policy at **2s**, so **every attempt loses its task** | 60 | 60 exhausted to `FAILED` |
+
+Cumulative, at the end of all three:
+
+| | |
+|---|---|
+| tasks `COMPLETED` | **1,303** |
+| `task_results` rows | **1,303** |
+| distinct idempotency tokens stored | **1,303** |
+| result rows pointed at by more than one task | **0** |
+| tasks `FAILED` with a result row | **0** |
+
+The race storm is the part worth reading. 181 lease expiries produced
+**121 reassignments + 60 exhaustions — exactly, with none unaccounted
+for** — and the 180 late results those lost attempts eventually submitted
+were answered:
+
+```
+coordinator_task_results_total{outcome="not_owner"}   120   (task still live, held by a later attempt)
+coordinator_task_results_total{outcome="superseded"}   60   (task already terminal FAILED)
+```
+
+120 + 60 = 180 = 60 tasks × 3 attempts. **Every single one of those
+executions was real work, and not one of them added a row to the ledger.**
+
+## 3.3.4 What running this step found
+
+**The exclusion window expiring makes the loser a legal destination for
+its own task, and the first version of the race test got it back.** Step
+3.2's `not_before` carries two clocks in one column — the retry backoff
+and the bounded exclusion — so a test that ages it to elapse the backoff
+elapses the exclusion with it. The reassignment then landed back on the
+still-connected worker that had just lost the task, which is *correct
+behaviour* (§3.2's anti-starvation decision) and a *wrong test*. Fixed by
+dropping the loser's socket first, which is also what the scenario means:
+the lease expired because that worker was not answering.
+
+**A cold start of three replicas against an empty database races the first
+migration.** `docker compose up --scale coordinator=3` on a fresh volume
+gave `duplicate key value violates unique constraint
+"pg_type_typname_nsp_index"` — three processes running `alembic upgrade
+head` at once. The demo starts one replica, lets it migrate, then scales.
+**Recorded, not claimed as a defect of this step**: it is a property of
+`RUN_MIGRATIONS_ON_STARTUP` that predates M3, it cannot happen on a
+database that has been migrated once, and Kubernetes rollouts do not cold
+start every replica simultaneously. It is the local demo's problem and it
+now has a documented order.
+
+**`.venv-loadtest` had drifted off `worker/requirements.txt`** — it held
+`websockets 17.0.1` against a pinned `>=12,<13`, so the harness died with
+`create_connection() got an unexpected keyword argument 'extra_headers'`
+before sending a frame. Pinned back. Worth knowing before reading any
+"the harness is broken" conclusion into a future run.
+
+## 3.3.5 What Step 3.3 deliberately does NOT do
+
+- **No fencing.** A stale result from an *earlier attempt* of a task the
+  same worker is holding *again* is still accepted, because
+  `attempt_number` is not compared against `attempt_count`. That is Step
+  3.4's exit criterion, and the gate assigned it there (§3.0.6). What 3.3
+  does resolve is the far more common shape of the same race — the late
+  result arriving after somebody else finished.
+- **A late result for a task that is still live gets `not_owner`, not a
+  fenced answer with an attempt row.** 120 of them in the storm above. 3.4
+  owns turning that into `FENCED` with a row in `task_attempts`.
+- **`task_failed` was not touched.** A *failure* report for a task that has
+  moved on is still answered by `mark_status` with `not_owner` or
+  `illegal`, so the vocabulary is now consistent on the result path and not
+  yet on the failure path. Deliberate: this step's criteria are about the
+  **result ledger**, a refused failure report writes nothing either way,
+  and Decision #168 already gives such a worker its credit back. Naming it
+  because a reader of the ack outcomes will notice the asymmetry.
+- **No alert, and Steps 3.1 and 3.2 both shipped some, so this is a
+  decision.** A sustained `superseded` rate means a fleet is losing races,
+  and the *cause* of that is sustained reassignment — which Step 3.2
+  already alerts on. A second alert on the same phenomenon one hop
+  downstream pages twice for one incident, which is how alert fatigue
+  starts. The label is on `/metrics` for anyone diagnosing that page.
+- **No dashboard change, and that is a judgement rather than an
+  omission.** The task drawer already renders the stored result envelope
+  whole, so the **winning submission's `idempotency_token` is on screen**
+  next to the attempt row that records who lost — verified live on the
+  race task (`idempotency_token: bb0027e1a74a…`, attempts:
+  `REASSIGNED / lease_expired / attempt 0`). A per-task duplicate counter
+  would need somewhere to count duplicates, which is precisely the store
+  this step's fourth criterion forbids. Fleet-wide, the two outcomes are
+  on `/metrics` today and belong on the dashboard in **Step 3.7**, whose
+  subject is exactly that.
+- **A duplicate arriving after retention has purged the body cannot be
+  recognised as one** and is answered `superseded` — the token lives in
+  the result body and goes with it. Both answers mean "stop retrying,
+  nothing is owed", and no submission survives seven days in a buffer that
+  lives in a worker's memory. Named in `complete_task` and covered by a
+  test rather than left to be discovered.
+- **No remote Internet worker** (§8 not claimed), and **no user-run demo**
+  (§15 items 3–4). Both carried from 3.1 and 3.2.
+
+## 3.3.6 Demo and failure demo
+
+Same stack as Step 3.2, plus replicas. **Start one coordinator, let it
+migrate, then scale** — see §3.3.4:
+
+```bash
+docker compose -p dcds --env-file <env> up -d --scale coordinator=1
+# wait for healthy, then:
+docker compose -p dcds --env-file <env> up -d --scale coordinator=3
+```
+
+**Demo 1 — a duplicate is a success.** Submit a task, let a worker
+complete it, then re-send the same result envelope. The ack comes back
+`{"outcome": "duplicate", "accepted": true}` and `GET /tasks/{id}` shows
+one result and an unchanged `completed_at`. A throwaway client is needed
+because a real worker drops its pending result on the first ack; the one
+used here subclasses `SimWorker` from `scripts/loadtest.py`.
+
+**Demo 2 — across replicas.** Re-send the same envelope to a *different*
+replica's port. Same answer, and the count appears on that replica's own
+`/metrics`.
+
+**Failure demo 1 — the race.** Submit `sleep(40)`, find the worker holding
+it in the task console, and `docker pause` it. Watch the task go `QUEUED`
+→ another worker → `COMPLETED`. Then `docker unpause`: the original worker
+finishes and submits, and its log line is `task_result_refused` with
+`outcome: superseded`. The database still has one result row.
+
+**Failure demo 2 — every attempt loses its lease.** Set the type's lease
+below its execution time and run a burst:
+
+```bash
+curl -k -X PUT https://localhost:$PORT/tasks/policies/sleep \
+  -H "X-Admin-Secret: $ADMIN_SECRET" -H 'Content-Type: application/json' \
+  -d '{"lease_ttl_seconds": 2, "max_attempts": 3}'
+python scripts/loadtest.py burst --url https://localhost:$PORT \
+  --workers 5 --tasks 60 --task-type sleep --parameters '{"seconds":4}' ...
+```
+
+Every task exhausts to `FAILED`, every attempt submits a late result, and
+the ledger does not move. **Then check it:**
+
+```sql
+SELECT (SELECT count(*) FROM tasks WHERE status='COMPLETED') AS completed,
+       (SELECT count(*) FROM task_results)                   AS result_rows,
+       (SELECT count(DISTINCT payload->>'idempotency_token')
+          FROM task_results)                                 AS distinct_tokens;
+```
+
+**Reads worth running:** `coordinator_task_results_total` by outcome on
+each replica, `\dt` in Postgres (six tables, no store), and
+`redis-cli --scan` before and after a duplicate storm.
 
 ---
 
