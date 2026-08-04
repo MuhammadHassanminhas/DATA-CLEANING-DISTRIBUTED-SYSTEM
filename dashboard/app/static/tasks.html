@@ -116,6 +116,13 @@
      should have answered by now has not. */
   .lease-overdue { color: var(--offline); }
 
+  /* Phase 3.2. A task that has been reassigned at least once, and a task
+     that is queued but not yet claimable. Both are "this is recovery in
+     progress, not a stall", so they share the warning colour the fleet
+     panel already uses for a worker that has stopped answering. */
+  .attempt-retried { color: var(--suspect); font-weight: 600; }
+  .lease-retry { color: var(--suspect); }
+
   .task-state {
     display: inline-flex;
     align-items: center;
@@ -305,6 +312,7 @@
               <th>type</th>
               <th>worker</th>
               <th class="num">duration</th>
+              <th class="num">attempt</th>
               <th class="num">lease</th>
               <th>created</th>
             </tr>
@@ -465,7 +473,26 @@
   // A negative value is shown as "overdue", not clamped to zero: a lease
   // that has expired and has not been reclaimed is the visible signature
   // of a stopped reclaimer, and that is worth seeing.
+  // Phase 3.2. **The attempt counter, and this column is the exit
+  // criterion "attempt count increments visibly on the dashboard".** It is
+  // rendered as the human-facing attempt number (`attempt_count + 1`)
+  // because `attempt_count` is zero-based on the wire, and a first attempt
+  // displayed as "0" reads as "not attempted". A task on attempt 2 or
+  // later is highlighted — that is the whole visible signal of a
+  // reassignment having happened.
+  function attemptCell(task) {
+    const attempt = (task.attempt_count || 0) + 1;
+    return attempt > 1 ? `<span class="attempt-retried">${attempt}</span>` : `${attempt}`;
+  }
+
+  // Phase 3.2. A queued task waiting out its retry backoff has no lease —
+  // nobody holds it — so the same column shows when it becomes claimable
+  // again. Without this a reassigned task reads as an idle queue entry for
+  // the length of its backoff, which is the exact moment an operator is
+  // watching to see whether recovery is working.
   function leaseCell(task) {
+    const retry = task.retry_in_seconds;
+    if (retry != null && retry > 0) return `<span class="lease-retry">retry in ${retry.toFixed(0)}s</span>`;
     const left = task.lease_seconds_remaining;
     if (left == null) return "—";
     if (left < 0) return `<span class="lease-overdue">${(-left).toFixed(0)}s overdue</span>`;
@@ -519,7 +546,7 @@
 
   function renderRows(tasks) {
     if (tasks.length === 0) {
-      el.tbody.innerHTML = `<tr><td colspan="7" class="empty-state"><div class="big">no tasks match</div>submit one on the right, or clear the filter</td></tr>`;
+      el.tbody.innerHTML = `<tr><td colspan="8" class="empty-state"><div class="big">no tasks match</div>submit one on the right, or clear the filter</td></tr>`;
       return;
     }
     el.tbody.innerHTML = tasks.map((t) => `
@@ -529,6 +556,7 @@
         <td>${esc(t.task_type)}</td>
         <td class="wid" title="${esc(t.assigned_worker_id || "")}">${esc(shortId(t.assigned_worker_id))}</td>
         <td class="num">${t.observed_duration_seconds == null ? "—" : t.observed_duration_seconds.toFixed(3) + "s"}</td>
+        <td class="num">${attemptCell(t)}</td>
         <td class="num">${leaseCell(t)}</td>
         <td>${esc(timeAgo(t.created_at))}</td>
       </tr>`).join("");
@@ -621,6 +649,31 @@
       </li>`).join("")}</ul>`;
   }
 
+  // Phase 3.2. The recovery record for one task: every attempt that did
+  // **not** end normally, oldest first. A healthy task has none, and says
+  // so rather than showing an empty box — `task_attempts` records abnormal
+  // endings only, so "no rows" is a fact about the task, not a gap.
+  function renderAttempts(attempts) {
+    if (!attempts || attempts.length === 0) {
+      return "<p class=\"idle\">none — no attempt of this task has ended abnormally</p>";
+    }
+    return `<ul class="timeline">${attempts.map((a) => `
+      <li style="--dot-color: ${a.outcome === "FAILED" ? STATE_COLOR.FAILED : "var(--suspect)"}">
+        attempt ${esc(a.attempt_number + 1)} — ${esc(a.outcome.toLowerCase())}
+        <span class="at">${esc(a.recorded_at)}</span>
+        <span class="src">${esc(a.reason || "no reason recorded")}${a.worker_id ? " · worker " + esc(shortId(a.worker_id)) : ""}</span>
+      </li>`).join("")}</ul>`;
+  }
+
+  function retryDetail(task) {
+    if (!task.not_before) {
+      return task.status === "QUEUED" ? "— (claimable now)" : "—";
+    }
+    const left = task.retry_in_seconds;
+    const suffix = left == null ? "" : left > 0 ? ` — ${left.toFixed(1)}s to go` : " — elapsed, claimable now";
+    return esc(task.not_before) + esc(suffix);
+  }
+
   let lastDetailJson = "";
 
   function renderDetail(task, force) {
@@ -645,14 +698,21 @@
         <dt>correlation id</dt><dd>${esc(task.correlation_id || "—")}</dd>
         <dt>observed duration</dt><dd>${task.observed_duration_seconds == null ? "—" : task.observed_duration_seconds + "s (coordinator)"}</dd>
         <dt>reported duration</dt><dd>${task.result && task.result.duration_seconds != null ? esc(task.result.duration_seconds) + "s (worker, untrusted)" : "—"}</dd>
-        <dt>attempts</dt><dd>${esc(task.attempt_count)}</dd>
+        <dt>attempt</dt><dd>${esc((task.attempt_count || 0) + 1)} (${esc(task.attempt_count)} recorded ending${task.attempt_count === 1 ? "" : "s"})</dd>
         <dt>lease</dt><dd>${leaseDetail(task)}</dd>
         <dt>execution deadline</dt><dd>${task.deadline_at ? esc(task.deadline_at) + " (cap; renewal cannot pass it)" : "—"}</dd>
+        <dt>retry after</dt><dd>${retryDetail(task)}</dd>
+        <dt>excluded worker</dt><dd>${task.excluded_worker_id ? esc(task.excluded_worker_id) + " (not eligible for the immediate retry)" : "—"}</dd>
       </dl>
 
       <div class="section">
         <div class="section-title">lifecycle</div>
         ${renderTimeline(task.timeline)}
+      </div>
+
+      <div class="section">
+        <div class="section-title">attempts that ended abnormally</div>
+        ${renderAttempts(task.attempts)}
       </div>
 
       <div class="section">
