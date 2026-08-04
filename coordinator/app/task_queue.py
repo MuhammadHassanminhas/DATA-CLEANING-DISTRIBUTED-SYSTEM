@@ -412,6 +412,23 @@ ILLEGAL = "illegal"
 # worker's point of view — the task is completed, so the worker should stop
 # retrying — whereas NOOP is a state report that changed nothing.
 DUPLICATE = "duplicate"
+# Phase 3.3. A result for a task that is **already terminal and whose stored
+# result is somebody else's** — the losing side of the in-flight-versus-
+# reassignment race, and the honest answer to a late result for a task that
+# was failed or cancelled while it was still being computed.
+#
+# Distinct from `DUPLICATE` because the two say opposite things about the
+# submitter's own work: a duplicate means "your result is the one that is
+# stored, stop retrying", a superseded means "your result was not stored and
+# never will be, stop retrying". Collapsing them would make the ack claim a
+# result landed when another attempt's did, which is exactly the kind of
+# blurring §10 forbids — and the metric label is what makes a fleet losing
+# races visible without reading logs.
+#
+# Distinct from `NOT_OWNER` because nothing about it is suspicious: the
+# sender held this task, executed it honestly, and lost a race that the
+# design says it may lose (gate §3.0.5 — at-least-once execution).
+SUPERSEDED = "superseded"
 # Phase 2.6. The task exists but is past the point where a coordinator-side
 # write alone can cancel it — see `cancel_queued_task`. Distinct from
 # ILLEGAL because nothing was attempted: this is a refusal, not a rejected
@@ -534,6 +551,32 @@ async def mark_status(
     return TRANSITIONED
 
 
+async def _terminal_result_outcome(
+    session: AsyncSession, *, result_id: uuid.UUID | None, token: str | None
+) -> str:
+    """Answer a result submitted for a task that is already terminal (3.3).
+
+    The whole dedup mechanism is these few lines plus the `FOR UPDATE` the
+    caller already holds: **no store, nothing to expire, nothing to size.**
+    The stored result is the record of who won, and its token is read from
+    the row that record already lives in.
+
+    A terminal task with no stored result — `FAILED`, `CANCELLED`, or a
+    `COMPLETED` task whose body retention has purged — cannot match any
+    token, so it answers `SUPERSEDED`. That is the correct answer in every
+    one of those cases: nothing of this submission was kept.
+    """
+    if result_id is None or token is None:
+        return SUPERSEDED
+    stored = (
+        await session.execute(
+            text("SELECT payload ->> 'idempotency_token' AS token FROM task_results WHERE id = :id"),
+            {"id": str(result_id)},
+        )
+    ).scalar_one_or_none()
+    return DUPLICATE if stored is not None and stored == token else SUPERSEDED
+
+
 async def complete_task(
     session: AsyncSession,
     *,
@@ -556,10 +599,50 @@ async def complete_task(
     `DUPLICATE` having written nothing at all — not a second result row, not
     a re-stamped `completed_at`. Two coordinator replicas processing the
     same retried submission serialise on that lock, so the second one sees
-    `COMPLETED` and stops. The `idempotency_token` in the envelope is
-    therefore **recorded, not enforced** in M2: the task's own terminal
-    state is what makes a duplicate a no-op, and the token is what lets
-    Phase 3 tell a retry apart from a genuinely second attempt.
+    `COMPLETED` and stops. **There is no dedup store** — no Redis set, no
+    seen-token table, nothing with a retention window to tune or a size to
+    watch (gate §3.0.12, Decision #170). The suppression is a state read on
+    a row that had to be locked anyway.
+
+    **Phase 3.3 is where the `idempotency_token` stops being merely
+    recorded.** The terminal-state check answers *whether* to write; the
+    token answers *whose* result is stored, which is the question the
+    reassignment race asks:
+
+    * task terminal, stored token equals the submitted one → `DUPLICATE`.
+      This submission's own result is the stored one, so from the worker's
+      side it is a success.
+    * task terminal, stored token differs — or there is no stored result at
+      all, because the task was failed or cancelled → `SUPERSEDED`. Nothing
+      was written and nothing ever will be for this attempt.
+
+    The token is minted once per task execution on the worker
+    (`worker.py`'s `Task.idempotency_token`) and reused by every retry of
+    that submission, which is what makes equality mean "the same
+    submission" rather than "the same worker".
+
+    **The winner rule, stated once and implemented here** (gate §3.0.6):
+    the first submission to find the task non-terminal *while holding it*
+    completes it; every later submission for that task writes nothing. The
+    lock is what makes "first" well defined across replicas, and the order
+    the guards run in is what makes the rule honest — the terminal check
+    comes **before** the ownership check, because a task reassigned to
+    another worker and completed there is no longer owned by the submitter,
+    and answering `NOT_OWNER` to a worker whose only mistake was being slow
+    would report an honest loser as an impostor.
+
+    **One consequence, named rather than left to be discovered:** a result
+    body purged by retention takes its token with it (`result_id` is
+    `ON DELETE SET NULL`), so a duplicate arriving after the retention
+    window cannot be told from a superseded one and is answered
+    `SUPERSEDED`. Both mean "stop retrying, nothing is owed", and a
+    submission pending for seven days does not exist — the worker's pending
+    buffer is in memory and dies with the process.
+
+    **What this does NOT do is fencing (Step 3.4).** A stale result from an
+    *earlier attempt* of a task the same worker holds again is still
+    accepted here, because `attempt_number` is not yet compared against
+    `attempt_count`. That is 3.4's exit criterion, not this one's.
 
     **A missing `RUNNING` is walked through, not widened.** A result can
     arrive for a task still `ASSIGNED` — the `task_started` report is a
@@ -579,7 +662,12 @@ async def complete_task(
     row = (
         await session.execute(
             text(
-                "SELECT status, assigned_worker_id FROM tasks "
+                # `result_id` joins the read (Phase 3.3) so the duplicate
+                # branch can compare tokens without a second lookup of the
+                # task row. The hot path pays one more column on a row it
+                # was already locking; the token itself is only fetched when
+                # the task is terminal, which is the rare branch.
+                "SELECT status, assigned_worker_id, result_id FROM tasks "
                 "WHERE id = CAST(:id AS uuid) FOR UPDATE"
             ),
             {"id": str(parsed)},
@@ -587,16 +675,26 @@ async def complete_task(
     ).mappings().one_or_none()
     if row is None:
         return NOT_FOUND
+
+    current = row["status"]
+    # Phase 3.3, and the order matters — see the docstring. A terminal task
+    # is answered on its own terms whoever is asking, because after Step 3.2
+    # the submitter of a late result is usually *not* the current assignee
+    # and calling that `NOT_OWNER` would accuse an honest worker.
+    if is_terminal(current):
+        return await _terminal_result_outcome(
+            session, result_id=row["result_id"], token=envelope.get("idempotency_token")
+        )
+
     if str(row["assigned_worker_id"]) != str(worker_id):
         return NOT_OWNER
 
-    current = row["status"]
-    if current == COMPLETED:
-        return DUPLICATE
-
     # ASSIGNED needs the RUNNING hop; RUNNING goes straight through. Every
-    # step is checked, so an already-terminal task (FAILED, CANCELLED) is
-    # refused here rather than silently overwritten.
+    # step is checked. A terminal task never reaches here — Phase 3.3
+    # answers it above — so `ILLEGAL` now means only "a live state this
+    # module does not know how to complete from", which is unreachable
+    # today and kept because the state machine, not this function, is the
+    # authority on that.
     path = [RUNNING, COMPLETED] if current == ASSIGNED else [COMPLETED]
     state = current
     try:

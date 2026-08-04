@@ -125,6 +125,13 @@ TASK_PROGRESS_REPORTS = Counter(
 # because the task is not this worker's — so a rejection spike is visible
 # without reading logs, which is what makes the malformed-input criterion
 # alertable rather than only auditable.
+#
+# Phase 3.3 adds `superseded`: work that was computed honestly and lost the
+# race to another attempt. It needs no new metric because it is a *decision
+# about a submission*, which is what this counter already counts — and
+# keeping it here means `duplicate` and `superseded` can be read side by
+# side, which is the comparison that says whether a fleet is retrying
+# itself or being reassigned out from under itself.
 TASK_RESULTS = Counter(
     "coordinator_task_results_total",
     "Result submissions received, by outcome.",
