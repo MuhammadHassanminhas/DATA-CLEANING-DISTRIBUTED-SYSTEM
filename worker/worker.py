@@ -861,6 +861,50 @@ async def _result_submission_loop(
             pass
 
 
+def _handle_cancel(identity: dict, runner: TaskRunner, message: dict) -> None:
+    """Stop executing one task, because the coordinator took it back
+    (Phase 3.2).
+
+    The coordinator sends this after a lease expired and the task was
+    reassigned. **Nothing here decides anything** — the reassignment has
+    already happened in the coordinator's database, and this worker's
+    result would be refused if it finished. All that is saved is the CPU of
+    an execution whose answer nobody can accept.
+
+    Cooperative, like every other cancel in this worker: a Python thread
+    cannot be killed, so the flag is set and the executor notices between
+    chunks (Decision #94). A task id that is not running is ignored — a
+    cancel can arrive after the task finished, and that is ordinary rather
+    than exceptional.
+
+    Synchronous on purpose. Setting a `threading.Event` cannot block, and
+    the `capacity` that releases the coordinator's credit is sent by
+    `_execute_task`'s cancelled path once the executor actually stops —
+    sending it from here would free the slot while the thread is still
+    holding one.
+    """
+    payload = message.get("payload") or {}
+    task_id = str(payload.get("task_id") or "")
+    task = runner.running.get(task_id)
+    if task is None:
+        _log(
+            "task_cancel_unknown",
+            worker_id=identity["worker_id"],
+            task_id=task_id,
+            reason=payload.get("reason"),
+        )
+        return
+    task.cancel.set()
+    _log(
+        "task_cancel_received",
+        worker_id=identity["worker_id"],
+        task_id=task_id,
+        correlation_id=task.correlation_id,
+        reason=payload.get("reason"),
+        elapsed_seconds=round(time.monotonic() - task.started_at, 3),
+    )
+
+
 async def _execute_task(
     identity: dict,
     runner: TaskRunner,
@@ -886,8 +930,13 @@ async def _execute_task(
       would put the credit accounting on two messages instead of one.
     * raised   → `task_failed` carrying the **exception type only**, never
       a message and never a traceback (Decision #102, §12).
-    * cancelled → nothing. The worker is shutting down and the socket is
-      going with it; the row stays where Phase 3 can see it.
+    * cancelled → `capacity`, naming the task. Two things reach this path
+      now: shutdown, where the socket is going away and the message is
+      dropped harmlessly, and a coordinator `task_cancel` after the task
+      was reassigned, where the credit must go back or this worker's
+      capacity leaks for the life of the session (Phase 3.2). No result is
+      sent either way — a cancelled execution has no answer, and the task
+      belongs to someone else now.
     """
     loop = asyncio.get_running_loop()
     try:
@@ -904,6 +953,26 @@ async def _execute_task(
             task_id=task.task_id,
             correlation_id=task.correlation_id,
             elapsed_seconds=round(time.monotonic() - task.started_at, 3),
+        )
+        # **Phase 3.2: answer the cancel with a `capacity` naming the task.**
+        # Until now cancellation only happened at shutdown, when the socket
+        # was going away anyway, so reporting nothing cost nothing. A
+        # coordinator-initiated cancel is the opposite case: the session
+        # lives on, and the credit for this task would stay consumed for the
+        # rest of it — a worker cancelled three times would quietly stop
+        # accepting work.
+        #
+        # Sent unconditionally rather than only for coordinator-initiated
+        # cancels. At shutdown the socket is already detaching, so `report`
+        # drops it with a log line and no harm; distinguishing the two would
+        # mean tracking who cancelled, to save a message that costs nothing.
+        await runner.report(
+            Envelope(
+                message_type="capacity",
+                worker_id=identity["worker_id"],
+                correlation_id=task.correlation_id,
+                payload={"task_id": task.task_id, "freed": 1},
+            )
         )
     except Exception as exc:  # noqa: BLE001 — every failure is reported, none crashes the loop
         error_type = type(exc).__name__
@@ -1028,9 +1097,10 @@ async def _handle_assignment(
         correlation_id=correlation_id,
         started_at=time.monotonic(),
         # Coordinator-sourced, not invented: `attempt` comes off the
-        # assignment (always 0 in M2 — nothing writes `attempt_count`) and
-        # the epoch is the session that admitted this task. Both are echoed
-        # back in the result envelope so Phase 3 needs no protocol change.
+        # assignment — 0 for a first delivery, and non-zero since Phase 3.1
+        # started incrementing `attempt_count` on a reclaim — and the epoch
+        # is the session that admitted this task. Both are echoed back in
+        # the result envelope, so Phase 3 needed no protocol change.
         attempt=_coerce_int(payload.get("attempt")),
         session_epoch=runner.session_epoch,
     )
@@ -1253,6 +1323,9 @@ async def _hold_connection(
                     continue
                 if message_type == "task_result_ack":
                     await _handle_result_ack(identity, runner, message)
+                    continue
+                if message_type == "task_cancel":
+                    _handle_cancel(identity, runner, message)
                     continue
                 if message_type == "session_evicted":
                     _log(

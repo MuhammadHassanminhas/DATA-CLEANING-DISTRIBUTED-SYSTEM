@@ -181,6 +181,25 @@ async def _row(sessionmaker, task_id) -> dict:
         )
 
 
+async def _backoff_elapsed(sessionmaker, task_id, *, seconds_ago: int = 1) -> None:
+    """Put a reclaimed task's retry backoff in the past (Phase 3.2).
+
+    Same discipline as `_expire`: the clock would have got here anyway, and
+    a test that sleeps out a backoff is a test nobody runs. Pass a value
+    larger than `TASK_RETRY_EXCLUSION_SECONDS` to also age out the
+    exclusion of the worker that lost the task.
+    """
+    async with sessionmaker() as session:
+        await session.execute(
+            text(
+                "UPDATE tasks SET not_before = now() - make_interval(secs => :ago) "
+                "WHERE id = CAST(:id AS uuid)"
+            ),
+            {"id": str(task_id), "ago": seconds_ago},
+        )
+        await session.commit()
+
+
 async def _expire(sessionmaker, task_id, *, seconds_ago: int = 1) -> None:
     """Put a task's lease in the past — what the clock would have done."""
     async with sessionmaker() as session:
@@ -414,7 +433,11 @@ def test_a_reclaim_writes_one_attempt_row_naming_the_worker_that_lost_it():
 
         assert attempt["attempt_number"] == 0
         assert str(attempt["worker_id"]) == str(worker_id)
-        assert attempt["outcome"] == "EXPIRED"
+        # Phase 3.2: the outcome is the branch the retry policy took. This
+        # task had attempts left, so the ended attempt was superseded —
+        # `REASSIGNED`. In 3.1, which had no policy, every row was
+        # `EXPIRED`; the reason code is unchanged because the cause is.
+        assert attempt["outcome"] == "REASSIGNED"
         assert attempt["reason"] == "lease_expired"
 
     run(body)
@@ -469,10 +492,16 @@ def test_a_queued_task_has_no_lease_and_is_never_reclaimed():
     run(body)
 
 
-def test_a_reclaimed_task_is_immediately_claimable_again():
+def test_a_reclaimed_task_is_claimable_again_once_its_backoff_has_passed():
     """`-> QUEUED` rather than `-> REASSIGNED`, proven where it matters: the
     dequeue predicate is `WHERE status = 'QUEUED'`, so recovery is only
-    real if the row lands somewhere a claim can find it."""
+    real if the row lands somewhere a claim can find it.
+
+    **Phase 3.2 adds the backoff**, so "immediately" is no longer true and
+    the test says so: the task is `QUEUED` at once and *claimable* once
+    `not_before` has passed. Retitled rather than deleted, because the
+    property it guards — a recovered task is reachable by a real dequeue —
+    is the one that matters."""
 
     async def body(sessionmaker):
         first, second = await _reset(sessionmaker, workers=2)
@@ -486,6 +515,13 @@ def test_a_reclaimed_task_is_immediately_claimable_again():
             await reclaim_expired_leases(session, batch=RECLAIM_BATCH)
             await session.commit()
 
+        # Queued immediately, but held by its backoff — a second worker
+        # asking right now is told there is nothing for it.
+        async with sessionmaker() as session:
+            assert (await dequeue(session, worker_id=second, max_batch=MAX_DEQUEUE)) == []
+        assert (await _row(sessionmaker, task_id))["status"] == "QUEUED"
+
+        await _backoff_elapsed(sessionmaker, task_id)
         async with sessionmaker() as session:
             claimed = await dequeue(session, worker_id=second, max_batch=MAX_DEQUEUE)
             await session.commit()
@@ -836,6 +872,9 @@ def test_reclaim_once_requeues_and_the_engine_hands_the_task_out_again():
 
         await _expire(sessionmaker, task_id)
         assert await reclaim_once() == 1
+        # Phase 3.2: the retry backoff holds the task until it elapses.
+        # Written into the past rather than waited out (see `_expire`).
+        await _backoff_elapsed(sessionmaker, task_id)
 
         alive = make_session(second)
         register_session(alive)
@@ -1298,6 +1337,12 @@ def test_a_task_reclaimed_back_to_the_same_worker_still_has_a_cap():
             await session.commit()
         # The reclaim cleared the cap along with the lease.
         assert (await _row(sessionmaker, task_id))["deadline_at"] is None
+
+        # Phase 3.2 excludes the worker that lost the task for a bounded
+        # window, so getting it back means that window has elapsed — which
+        # is the case this defect lives in on a single-worker fleet, and
+        # therefore still the case worth testing.
+        await _backoff_elapsed(sessionmaker, task_id, seconds_ago=120)
 
         # The same worker is handed it back and never sends task_started.
         async with sessionmaker() as session:

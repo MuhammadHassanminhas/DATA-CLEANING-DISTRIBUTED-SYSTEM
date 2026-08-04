@@ -512,9 +512,16 @@ def test_a_raising_executor_reports_task_failed_with_the_type_and_no_traceback(m
     asyncio.run(body())
 
 
-def test_a_cancelled_task_reports_nothing_and_still_clears_its_state():
-    """Shutdown. The socket is going away with the process, so a report would
-    be noise; the local state must go regardless."""
+def test_a_cancelled_task_releases_its_credit_and_still_clears_its_state():
+    """A cancelled execution reports **no result and no failure** — it has
+    no answer, and it is not a fault — but it does release the slot.
+
+    **Phase 3.2 changed the second half of this.** Until now cancellation
+    only happened at shutdown, when the socket was going away, so reporting
+    nothing cost nothing. A coordinator `task_cancel` after a reassignment
+    happens on a live session, and a worker that stayed silent would hold
+    that credit for the rest of it — three cancels and it quietly stops
+    accepting work."""
 
     async def body():
         runner = worker.TaskRunner(2)
@@ -530,8 +537,9 @@ def test_a_cancelled_task_reports_nothing_and_still_clears_its_state():
 
         assert cancelled == "slow"
         assert runner.running == {}
+        assert "task_result" not in ws.types()
         assert "task_failed" not in ws.types()
-        assert "capacity" not in ws.types()
+        assert "capacity" in ws.types()
 
     asyncio.run(body())
 
@@ -580,5 +588,77 @@ def test_progress_reports_are_suppressed_when_the_value_has_not_moved():
         assert len(ws.of_type("task_progress")) == 1
 
         runner.running.clear()
+
+    asyncio.run(body())
+
+
+# --------------------------------------------------------------------------
+# Coordinator-initiated cancel (Phase 3.2)
+# --------------------------------------------------------------------------
+
+
+def test_a_coordinator_cancel_stops_the_task_and_gives_the_credit_back():
+    """The message the reclaimer sends after a task was reassigned. The
+    worker stops executing and releases the slot; it sends **no result and
+    no failure**, because a cancelled execution has no answer and is not a
+    fault.
+
+    Cancelling is cooperative — a Python thread cannot be killed — so what
+    is asserted here is that the flag is set and the executor honours it,
+    which is the same contract shutdown has relied on since Decision #94."""
+
+    async def body():
+        runner = worker.TaskRunner(2)
+        ws, lock = FakeWS(), asyncio.Lock()
+        runner.attach(ws, lock)
+
+        await worker._handle_assignment(
+            ws, IDENTITY, lock, runner, assignment("t-reassigned", "sleep", seconds=30), "s"
+        )
+        assert runner.tasks_in_flight == 1
+
+        worker._handle_cancel(
+            IDENTITY,
+            runner,
+            {"payload": {"task_id": "t-reassigned", "reason": "lease_expired"}},
+        )
+        await drain()
+
+        assert runner.running == {}
+        assert "task_result" not in ws.types()
+        assert "task_failed" not in ws.types()
+        released = ws.of_type("capacity")
+        assert len(released) == 1
+        # Named, so the coordinator's keyed credit release is exactly-once
+        # rather than drawing down an arbitrary slot.
+        assert released[0]["payload"]["task_id"] == "t-reassigned"
+
+    asyncio.run(body())
+
+
+def test_a_cancel_for_an_unknown_task_is_ignored():
+    """A cancel can arrive after the task finished — the reclaimer publishes
+    it best-effort, and nothing waits for it. That is ordinary rather than
+    exceptional, so it must not raise and must not release a credit
+    belonging to work that is still running."""
+
+    async def body():
+        runner = worker.TaskRunner(2)
+        ws, lock = FakeWS(), asyncio.Lock()
+        runner.attach(ws, lock)
+
+        await worker._handle_assignment(
+            ws, IDENTITY, lock, runner, assignment("t-live", "sleep", seconds=30), "s"
+        )
+
+        worker._handle_cancel(IDENTITY, runner, {"payload": {"task_id": "t-gone"}})
+        worker._handle_cancel(IDENTITY, runner, {"payload": {}})
+
+        assert "capacity" not in ws.types()
+        assert set(runner.running) == {"t-live"}
+
+        # Clean up the task this test started.
+        runner.cancel_all()
+        await drain()
 
     asyncio.run(body())

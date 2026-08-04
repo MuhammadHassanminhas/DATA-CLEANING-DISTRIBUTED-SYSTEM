@@ -100,6 +100,46 @@ spec:
           labels: { severity: warning, team: dcds }
           annotations:
             summary: "Task leases are expiring at over 1/s for 10 minutes — workers are losing work faster than they finish it."
+        # ---- Phase 3.2 retry engine ----
+        #
+        # **Exhaustion is the one worth waking up for.** A reassignment is
+        # the recovery system doing its job and a fleet under rolling
+        # restarts produces a trickle of them; a task reaching terminal
+        # FAILED is the system giving up on work forever, and by design
+        # nothing retries it again (gate §3.0.4 item 2). Any sustained rate
+        # of that is a real loss of work, not a transient.
+        #
+        # Threshold and window are RECOMMENDATIONS, not measured. `sum` not
+        # `max`: both are per-instance counters.
+        - alert: TaskAttemptsExhausted
+          expr: sum(rate(coordinator_tasks_exhausted_total[10m])) > 0
+          for: 10m
+          labels: { severity: critical, team: dcds }
+          annotations:
+            summary: "Tasks are exhausting their attempts and landing in terminal FAILED — work is being given up on."
+        # Sustained reassignment: distinct from the expiry alert above,
+        # which counts leases; this counts the tasks that actually went back
+        # to the queue for another try. A high rate here with a *low*
+        # exhaustion rate means retries are succeeding, which is recovery
+        # working under a fleet problem worth looking at rather than an
+        # emergency.
+        - alert: TaskReassignmentSustained
+          expr: sum(rate(coordinator_tasks_reassigned_total[5m])) > 1
+          for: 10m
+          labels: { severity: warning, team: dcds }
+          annotations:
+            summary: "Tasks are being reassigned at over 1/s for 10 minutes — the fleet is losing work faster than one bad machine explains."
+        # A queue that is entirely retry backlog. Not a failure on its own —
+        # every one of these tasks is waiting out a backoff that will end —
+        # but a queue whose depth is all backed-off retries for half an hour
+        # is a fleet that cannot execute what it is being given, and the
+        # depth graph alone cannot show it.
+        - alert: TasksStuckAwaitingRetry
+          expr: max(coordinator_tasks_awaiting_retry) > 0 and max(coordinator_tasks_awaiting_retry) >= max(coordinator_tasks_queued)
+          for: 30m
+          labels: { severity: warning, team: dcds }
+          annotations:
+            summary: "Every queued task has been waiting on a retry backoff for 30 minutes — nothing is executing successfully."
         # cert-manager exports this; alerts before Let's Encrypt renewal.
         - alert: CertificateNearExpiry
           expr: (certmanager_certificate_expiration_timestamp_seconds - time()) < 7 * 24 * 3600

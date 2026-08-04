@@ -71,6 +71,15 @@ services:
       TASK_LEASE_TTL_SECONDS: ${TASK_LEASE_TTL_SECONDS:-60}
       LEASE_RECLAIM_INTERVAL_SECONDS: ${LEASE_RECLAIM_INTERVAL_SECONDS:-5}
       LEASE_DISCONNECT_GRACE_SECONDS: ${LEASE_DISCONNECT_GRACE_SECONDS:-30}
+      # Phase 3.2 retry engine, exposed for the same reason: a poison task
+      # exhausting three attempts at the default backoff takes minutes, and
+      # a demo should not. `TASK_MAX_ATTEMPTS` is the fleet-wide default —
+      # the per-type override lives in `task_policies.max_attempts`.
+      TASK_MAX_ATTEMPTS: ${TASK_MAX_ATTEMPTS:-3}
+      TASK_RETRY_BACKOFF_BASE_SECONDS: ${TASK_RETRY_BACKOFF_BASE_SECONDS:-5}
+      TASK_RETRY_BACKOFF_FACTOR: ${TASK_RETRY_BACKOFF_FACTOR:-2}
+      TASK_RETRY_BACKOFF_MAX_SECONDS: ${TASK_RETRY_BACKOFF_MAX_SECONDS:-60}
+      TASK_RETRY_EXCLUSION_SECONDS: ${TASK_RETRY_EXCLUSION_SECONDS:-60}
     ports:
       - "${COORDINATOR_PORT}:8443"
     volumes:
