@@ -38,7 +38,7 @@ from app.config import admin_secret_is_separate
 from app.db import get_session
 from app.models import Worker
 from app.redis_client import redis_client
-from app.task_queue import expired_lease_count, queue_depth
+from app.task_queue import awaiting_retry_count, expired_lease_count, queue_depth
 
 logger = logging.getLogger("coordinator")
 
@@ -203,6 +203,33 @@ LEASE_RECLAIM_SECONDS = Histogram(
     buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),
 )
 
+# Phase 3.2 retry engine. The two counters are per-instance (whichever
+# replica's reclaim tick got there first); sum them, do not `max`.
+#
+# **They are deliberately two series and not one with a label.** A
+# reassignment is the recovery system working, and a healthy fleet under
+# rolling restarts produces a steady trickle of them. An exhaustion is the
+# system giving up on a task forever. Alerting on the first at the
+# threshold that matters for the second — or the reverse — is what a
+# shared counter with an `outcome` label invites.
+TASKS_REASSIGNED = Counter(
+    "coordinator_tasks_reassigned_total",
+    "Tasks returned to the queue for another attempt after a lease expired.",
+)
+TASKS_EXHAUSTED = Counter(
+    "coordinator_tasks_exhausted_total",
+    "Tasks moved to terminal FAILED because their attempts ran out.",
+)
+# Recomputed from Postgres per scrape like `coordinator_leases_overdue`, so
+# every replica reports the same number — collapse with `max by`. It exists
+# because these tasks are inside `coordinator_tasks_queued` but none of them
+# is claimable yet: without this series, a queue holding nothing but backed-
+# off retries is indistinguishable from a scheduler that has stopped.
+TASKS_AWAITING_RETRY = Gauge(
+    "coordinator_tasks_awaiting_retry",
+    "Queued tasks not yet eligible to be claimed because a retry backoff is running.",
+)
+
 # Per-instance request latency. Route template keeps label cardinality bounded.
 REQUEST_LATENCY = Histogram(
     "coordinator_request_duration_seconds",
@@ -244,6 +271,10 @@ async def _refresh_fleet_gauges() -> None:
             # depth, or "the queue is draining" and "recovery has stopped"
             # cannot be told apart on one dashboard.
             LEASES_OVERDUE.set(await expired_lease_count(session))
+            # Phase 3.2, same session and same reasoning: "the queue is
+            # deep" and "the queue is deep but nothing in it may be claimed
+            # yet" have to be answerable off one scrape.
+            TASKS_AWAITING_RETRY.set(await awaiting_retry_count(session))
         DEPENDENCY_UP.labels("database").set(1)
     except Exception as exc:  # noqa: BLE001 — a scrape must not raise
         logger.warning("metrics_db_unavailable", extra={"detail": str(exc)})

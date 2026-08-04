@@ -87,14 +87,21 @@ statement. At the shipped defaults that turns a 10s progress cadence into
 roughly one write per running task per 30s, which is what keeps the lease
 engine off the throughput ceiling measured in #141.
 
-**What still does not happen here.** No retry policy: the reclaimer
-requeues without an attempt cap, without a backoff and without excluding
-the worker that just lost the task, so in 3.1 a task whose worker is
-permanently gone cycles rather than reaching `FAILED`. That is Step 3.2.
-Nothing enforces the `idempotency_token` or the `session_epoch` a result
-carries — the gate settled that `session_epoch` will never be a fencing
-input (#169), because Step 2.5 *measured* a legitimate result executed
-under epoch 4 and submitted on 5. Fencing itself is Step 3.4.
+**What Step 3.2 added here.** The retry policy the reclaimer had none of.
+An expired task is now either requeued with a backoff and an exclusion, or
+— once its type's `max_attempts` is used up — moved to terminal `FAILED`,
+and the two branches are counted and logged as the different events they
+are. The worker that lost the task is also sent a best-effort
+`task_cancel` over the shipped push channel, because the replica that
+reclaimed it usually does not hold that worker's socket.
+
+**What still does not happen here.** Nothing enforces the
+`idempotency_token` or the `session_epoch` a result carries — the gate
+settled that `session_epoch` will never be a fencing input (#169), because
+Step 2.5 *measured* a legitimate result executed under epoch 4 and
+submitted on 5. Fencing itself is Step 3.4, so a late result from a
+superseded attempt is still accepted if the row happens to name that
+worker again.
 """
 
 from __future__ import annotations
@@ -137,7 +144,9 @@ from app.metrics import (
     TASK_RESULTS,
     TASKS_ASSIGNED,
     TASKS_COMPLETED,
+    TASKS_EXHAUSTED,
     TASKS_FAILED,
+    TASKS_REASSIGNED,
     TASKS_STARTED,
 )
 from app.redis_client import redis_client
@@ -1239,6 +1248,46 @@ async def shorten_local_leases(worker_id: str, reason: str) -> int:
     return shortened
 
 
+async def cancel_on_worker(worker_id: str, task_id: str, correlation_id: str) -> None:
+    """Ask the worker that lost a task to stop burning CPU on it (Phase 3.2).
+
+    **Best-effort by design, and nothing depends on it arriving** (gate
+    §3.0.6). The task was reclaimed precisely because that worker stopped
+    answering, so the most likely outcome is that this message reaches
+    nobody. When it does land it saves the CPU of an execution whose result
+    can no longer be accepted, and it does not save anything else — the
+    reassignment already happened, in the database, before this was sent.
+
+    It goes over the shipped `worker:{id}:push` Redis channel rather than
+    over a socket, because **the reclaimer usually runs on a replica that
+    does not hold that worker's socket** — a lease is a row, not a
+    connection, so any replica's tick may reclaim any worker's task. The
+    channel `POST /workers/{id}/push` and `_push_listener` already
+    implement is exactly the "reach a socket someone else is holding"
+    mechanism, so this adds no fan-out of its own.
+
+    No protocol version bump: the worker's dispatch falls through unknown
+    message types to a log line, so a worker built before this step ignores
+    it and keeps computing, which is the same outcome as the message being
+    lost.
+    """
+    envelope = Envelope(
+        message_type="task_cancel",
+        worker_id=worker_id,
+        correlation_id=correlation_id,
+        payload={"task_id": task_id, "reason": "lease_expired"},
+    )
+    try:
+        await redis_client.publish(
+            f"worker:{worker_id}:push", json.dumps(envelope.to_dict())
+        )
+    except Exception as exc:  # noqa: BLE001 — a cancel that is not delivered costs CPU, nothing else
+        logger.warning(
+            "task_cancel_publish_failed",
+            extra={"task_id": task_id, "worker_id": worker_id, "detail": str(exc)},
+        )
+
+
 async def reclaim_once() -> int:
     """One reclaim pass. Returns how many tasks were returned to the queue.
 
@@ -1264,8 +1313,17 @@ async def reclaim_once() -> int:
 
     for row in reclaimed:
         LEASES_EXPIRED.inc()
+        exhausted = row["status"] == FAILED
+        if exhausted:
+            TASKS_EXHAUSTED.inc()
+        else:
+            TASKS_REASSIGNED.inc()
         logger.warning(
-            "task_lease_expired",
+            # Phase 3.2 splits the event name by branch rather than adding a
+            # field to one line: "this task will be tried again" and "this
+            # task is over" are different operational facts, and a log query
+            # for the second must not have to filter the first out.
+            "task_attempts_exhausted" if exhausted else "task_lease_expired",
             extra={
                 "task_id": str(row["id"]),
                 "task_type": row["task_type"],
@@ -1287,16 +1345,91 @@ async def reclaim_once() -> int:
                     3,
                 ),
                 "attempt": row["attempt_count"],
+                # Phase 3.2: when this task becomes claimable again, and by
+                # whom it will not be claimed. NULL on the exhausted branch,
+                # which is how a reader tells the two apart without parsing
+                # the event name.
+                "not_before": (
+                    row["not_before"].isoformat() if row["not_before"] else None
+                ),
+                "excluded_worker_id": (
+                    None
+                    if exhausted or not row["previous_worker_id"]
+                    else str(row["previous_worker_id"])
+                ),
+                "reason": (
+                    "execution_deadline_exceeded"
+                    if row["deadline_exceeded"]
+                    else "lease_expired"
+                ),
                 "correlation_id": row["correlation_id"],
             },
         )
+
+        # Best-effort, after the requeue is committed: the worker that lost
+        # the task may still be executing it, and a cancel it never receives
+        # changes nothing that has already been decided.
+        if row["previous_worker_id"]:
+            await cancel_on_worker(
+                str(row["previous_worker_id"]), str(row["id"]), row["correlation_id"]
+            )
 
     if reclaimed:
         # Local first so this replica reacts without a Redis round trip,
         # then the fan-out so replicas holding other sockets do too.
         notify_local()
         await notify_work_available()
+        # **Phase 3.2: ring it again when the backoff actually elapses.**
+        # Found reviewing this step rather than by a test: the doorbell above
+        # now wakes an engine that will find nothing, because every task it
+        # just requeued is held by `not_before`. Without a second wake the
+        # retry waits for the safety-net poll — up to
+        # `ASSIGNMENT_POLL_INTERVAL_SECONDS` (30s by default) *on top of* a
+        # backoff measured in seconds, which is a recovery that looks stalled
+        # to anyone watching the console.
+        _schedule_retry_wake(reclaimed)
     return len(reclaimed)
+
+
+# Sleeping wake-ups this replica has scheduled, kept only so they are not
+# garbage-collected mid-sleep (asyncio holds no strong reference to a task).
+_retry_wakes: set[asyncio.Task] = set()
+
+
+def _schedule_retry_wake(reclaimed: list[dict[str, Any]]) -> None:
+    """Ring the doorbell once, when the earliest requeued task is eligible.
+
+    **One wake-up per reclaim pass, not per task**, and only for the
+    earliest `not_before` in it: a later task's own pass, or the safety-net
+    poll, covers the rest. It costs no query and no timer thread — an
+    `asyncio.sleep` and one Redis publish.
+
+    Deliberately not a scheduler. The database remains the authority on
+    when a task may be claimed (`not_before` is in the dequeue predicate),
+    so a wake that never happens — this replica dying mid-sleep, the
+    publish failing — costs latency and nothing else. That is why it is
+    fire-and-forget and why nothing waits on it.
+    """
+    moments = [row["not_before"] for row in reclaimed if row["not_before"] is not None]
+    if not moments:
+        return
+    delay = (min(moments) - datetime.now(timezone.utc)).total_seconds()
+    if delay <= 0:
+        return  # already eligible; the doorbell just rung is enough
+
+    async def _wake() -> None:
+        try:
+            await asyncio.sleep(delay)
+            notify_local()
+            await notify_work_available()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a missed wake costs latency, nothing more
+            logger.warning("retry_wake_failed", extra={"detail": str(exc)})
+
+    task = asyncio.create_task(_wake())
+    _retry_wakes.add(task)
+    task.add_done_callback(_retry_wakes.discard)
 
 
 async def lease_reclaim_loop() -> None:
