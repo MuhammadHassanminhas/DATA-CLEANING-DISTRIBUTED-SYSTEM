@@ -8,6 +8,124 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## ⇒ 2026-08-04 — STEP 3.3 BUILT AND VERIFIED, AWAITING APPROVAL
+
+**⚠ This file has a gap and `PHASE_STATE.md` does not.** The entry below
+this one is session 23; **the sessions that built Steps 3.1 and 3.2 wrote
+no handoff entry**, so read `PHASE_STATE.md`'s M3 register rows and
+Decisions #152–#183 for that history. Nothing here restates it.
+
+**Step 3.3 (idempotency and duplicate suppression) is built, all six exit
+criteria are measured, and it awaits your approval.** Decisions
+**#184–#186**, full record in `docs/phase-3-fault-tolerance.md`
+§3.3.1–§3.3.6. Suite **400 passed** (was 387 at 3.2), `ruff` clean.
+**No migration, no new table, no new Redis key, no new metric, no protocol
+change.**
+
+### ⇒ START HERE NEXT SESSION
+
+1. **Approve or reject Step 3.3.** It is on branch
+   `phase-3.3-idempotency`, not merged. **Steps 3.4–3.9 are NOT STARTED
+   and must not begin without an explicit go-ahead (§9).**
+2. **⚠ Local Docker stacks are RUNNING and were left up deliberately.**
+   `dcds33` is this step's demo stack (3 coordinator replicas on
+   **9455–9457**, dashboard **9458**, Postgres, Redis, workers), plus
+   `dcds33-pg` / `dcds33-redis` (the unit-test database on 55433/6390).
+   **`dcds31` and `dcds32` were already running when this session started
+   — from the 3.1 and 3.2 sessions — and were not touched.** Teardown:
+   ```bash
+   docker compose -p dcds33 down -v
+   docker rm -f dcds33-worker-b dcds33-worker-c dcds33-pg dcds33-redis
+   docker volume rm dcds33-identity-b dcds33-identity-c
+   docker compose -p dcds31 down -v && docker compose -p dcds32 down -v
+   ```
+3. **The AKS cluster was NOT checked this session.** Its state is unknown
+   and it may be billing:
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+4. Still open and unchanged: **no remote Internet worker has taken part in
+   any M3 step (§8 not claimed for 3.1, 3.2 or 3.3)**, **every M3 demo has
+   been agent-run rather than user-run** (§15 items 3–4), and
+   `GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` are still to rotate.
+
+### What Step 3.3 actually changes
+
+The suppression itself already existed — the `FOR UPDATE` lock plus the
+terminal-state check shipped in Step 2.5. What did not exist was the
+coordinator telling the truth about **which** submission it kept:
+
+| Situation | Before | After |
+|---|---|---|
+| A worker retries the submission it already made | `duplicate` | `duplicate` |
+| A second, different result for a completed task | `duplicate` | **`superseded`** |
+| A late result for a task another attempt completed | **`not_owner`** | **`superseded`** |
+| A late result for a task that ended `FAILED` | **`illegal`** | **`superseded`** |
+
+The two middle rows only became reachable when Step 3.2 made reassignment
+real, and `not_owner` is the answer §12 gives an **impostor** — not what an
+honest worker deserves for losing a race the design says it may lose. The
+mechanism is the idempotency token that has been on the wire since 2.5,
+compared against the token in the **stored result**. No store, because the
+record of who won is the result row itself.
+
+### The measurements that matter
+
+- **20 identical submissions of one envelope**: one `transitioned`, 19
+  `duplicate` (`accepted: true`), **one result row**, `completed_at`
+  unmoved.
+- **The race, reproduced rather than described.** `sleep(40)`, its worker
+  frozen with `docker pause`: requeued at **12.2s**, completed by a
+  different worker by **55.8s**, and the original — unpaused, having
+  genuinely finished its own 40.001s of work — refused **`superseded`**
+  40.9s after that completion, logging `pending: 0`. **Executed twice,
+  completed once.**
+- **Across replicas**: the same envelope re-sent to a *different* replica
+  of a three-replica stack answered `duplicate`; the count landed on that
+  replica's `/metrics` and not the first's.
+- **The ledger, through a deliberate race storm** (lease set below
+  execution time, so **every attempt of 60 tasks lost its task**):
+  **1,303 `COMPLETED` = 1,303 result rows = 1,303 distinct tokens**, 0
+  shared results. 181 expiries = 121 reassignments + 60 exhaustions, and
+  the 180 late results were answered **120 `not_owner` + 60 `superseded`**
+  — exactly 60 × 3 attempts, **not one of them a new row**.
+- **No dedup store, asserted**: six tables and no more; a 20-duplicate
+  storm created **not one Redis key**. A test enumerates the schema, so
+  adding a store fails CI.
+
+### Three gotchas worth keeping
+
+1. **`docker compose up --scale coordinator=3` on an empty database races
+   the first migration** — `duplicate key value violates unique constraint
+   "pg_type_typname_nsp_index"`, three replicas running `alembic upgrade
+   head` at once. Start one, let it migrate, then scale. Predates M3, and
+   cannot happen on a database that has been migrated once.
+2. **`--scale worker=2` does not work**: both replicas share the
+   `worker-identity-data` volume and the second one exits with
+   `duplicate_local_instance_detected`. Extra workers need their own
+   volume, i.e. their own `docker run`.
+3. **`.venv-loadtest` had drifted off `worker/requirements.txt`** — it
+   held `websockets 17.0.1` against a pinned `>=12,<13`, and the harness
+   died with `create_connection() got an unexpected keyword argument
+   'extra_headers'` before sending a frame. Pinned back this session.
+
+### What is NOT done
+
+- **No CI run on this branch, and no deployment.** Nothing was pushed to
+  staging or production, and the cluster was not touched.
+- **No remote Internet worker**, so §8 is **not** claimed for 3.3.
+- **No user-run demo or failure demo** — every run above was agent-run.
+- **No fencing** (Step 3.4 owns it): a stale result from an *earlier
+  attempt* of a task the same worker holds again is still accepted, and a
+  late result for a task that is still live is still `not_owner` with no
+  attempt row.
+
+**`.env` was not read and not modified this session, and no secret was
+printed.** The demo stack runs on throwaway credentials from a file in the
+session scratchpad, not from `.env`.
+
+---
+
 ## ⇒ 2026-08-03 (session 23) — PR #48 MERGED, PRODUCTION-VERIFICATION ITEM CLOSED (#151), NO FEATURE WORK
 
 **Three things were asked for and three were done: merge the session-22

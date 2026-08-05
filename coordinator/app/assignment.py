@@ -924,6 +924,16 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
 
     A task left `RUNNING` by a rejection stays visible for Phase 3, exactly
     like a task stranded `ASSIGNED` by a refusal.
+
+    **Phase 3.3 adds one outcome to answer for, `SUPERSEDED`** — this
+    worker's result lost to another attempt, or arrived for a task that had
+    already been failed or cancelled. It is acknowledged definitively like
+    every other outcome, `accepted: false` because nothing was stored, and
+    **it releases the credit**: unlike `NOT_OWNER` it is not a worker
+    naming something that was never its own, it is a worker whose slot
+    genuinely is free. Holding the credit here would make losing a race
+    cost the worker capacity for the life of the session, which is the
+    defect Decision #168 fixed on the neighbouring path.
     """
     payload = message.get("payload") or {}
     correlation_id = str(message.get("correlation_id") or "")
