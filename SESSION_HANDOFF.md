@@ -8,6 +8,132 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## ⇒ 2026-08-05 (session 26) — STEP 3.5 APPROVED, STEP 3.6 BUILT AND VERIFIED, ALL FIVE CRITERIA MET, NO PRODUCTION CODE CHANGED
+
+**You approved Step 3.5 and directed that Step 3.6 be built end to end,
+taking the decisions myself.** Both are done. 3.5's approval is Decision
+**#199**; 3.6 is Decisions **#200–#203**, full record in
+`docs/phase-3-fault-tolerance.md` §3.6.1–§3.6.8. Suite **438 passed** (was
+426), `ruff` clean. **`git diff --stat` against `phase-3.5-restart-recovery`
+touches nothing under `coordinator/`, `worker/`, `dashboard/`, `protocol/`,
+`infra/` or `alembic/`** — twelve new tests and documentation are the whole
+step, which is the answer the step's own brief invited.
+
+### ⇒ START HERE NEXT SESSION
+
+1. **Approve or reject Step 3.6.** It is on branch
+   `phase-3.6-partial-completion`, stacked on `phase-3.5-restart-recovery`.
+   **Steps 3.7–3.9 are NOT STARTED and must not begin without an explicit
+   go-ahead (§9).**
+2. **⚠ The merge queue is now THREE deep and unchanged from last session:
+   PR #54 (`phase-3.4-fencing` → `main`), PR #55 (`phase-3.5-restart-recovery`
+   → `phase-3.4-fencing`), and 3.6 on top of #55.** `main` is still at
+   **`770d937`**, so **neither environment runs 3.4, 3.5 or 3.6**. Merge
+   order is #54, then #55, then 3.6. **I did not merge anything and did not
+   touch the cluster:** merging #54 triggers CD, which deploys both
+   environments and spends cluster time, and that is your call to make, not
+   a side effect of a build step. PR #50 (`docs/session-24-close`) is still
+   open from session 24.
+3. **⚠ Step 3.5's sixth exit criterion is still UNMET** — the rolling
+   Kubernetes upgrade. Approving 3.5 did not close it (said so in Decision
+   #199). It cannot be closed until #55 merges and deploys; command
+   sequence in §3.5.5.
+4. **⚠ Local Docker stacks are RUNNING.** `dcds36` is this step's demo
+   stack (coordinator **9485**, dashboard **9486**) plus a second worker
+   container `dcds36-worker-b` on its own volume. **It is deliberately
+   NOT at stock configuration** — `TASK_LEASE_TTL_SECONDS=10`,
+   `LEASE_DISCONNECT_GRACE_SECONDS=3`, `LEASE_RECLAIM_INTERVAL_SECONDS=2`,
+   `TASK_RETRY_EXCLUSION_SECONDS=5`, `TASK_RETRY_BACKOFF_BASE_SECONDS=1`,
+   `WORKER_MAX_CONCURRENT=2` — so no timing read off it is a measurement of
+   the shipped defaults, and §3.6.4 says so before quoting a number. Its
+   env file lives in **this session's scratchpad and dies with it**; the
+   credentials in it are throwaway and are **not** `.env`'s. `dcds34` and
+   `dcds35` were left up from earlier sessions, including the standalone
+   `dcds34-pg` / `dcds34-redis` unit-test database on **55434** / **6391**
+   that the 438-test run used. Teardown:
+   ```bash
+   docker compose -p dcds36 down -v
+   docker rm -f dcds36-worker-b
+   docker volume rm dcds36-identity-b
+   docker compose -p dcds35 down -v
+   docker compose -p dcds34 down -v
+   docker rm -f dcds34-worker-b dcds34-pg dcds34-redis
+   docker volume rm dcds34-identity-b dcds35-identity-b
+   ```
+5. **The AKS cluster was NOT checked this session.** Per your report at the
+   end of session 25 it was running and billing; that is your report, not
+   my measurement (§10).
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+6. Still open and unchanged: **no remote Internet worker has taken part in
+   any M3 step (§8 not claimed for 3.1–3.6)**, **every M3 demo has been
+   agent-run rather than user-run** (§15 items 3–4), and
+   `GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` are still to rotate.
+
+### What Step 3.6 decided
+
+**An interrupted attempt is discarded and the task is re-executed in full.
+No checkpointing.** The alternatives were compared rather than dismissed:
+executor-level checkpoint-and-resume needs a store for partial state, a
+message type with its own caps, and — decisively — it would make
+worker-supplied state an *input* to the next execution, which §12 forbids
+and which Steps 3.3 and 3.4 exist to prevent. Segmenting tasks is the same
+objection plus a requirement that workloads be decomposable. Both add a
+second recovery path, which gate §3.0.2 already rejected.
+
+The cost of the policy is one abandoned attempt's CPU, and it is a measured
+number rather than a shrug: **28.799 seconds** thrown away in the live
+reassignment below.
+
+### The measurements that matter
+
+- **Seven executions of one 10,000,000-round `hash_rounds` workload across
+  two workers produced ONE digest** —
+  `6b4ab10d92373474a97d10639e667f6b734af012f9be29997f1befd1c7166199`, which
+  was computed **outside the repository** with a plain `hashlib` loop before
+  any of them ran.
+- **The reassignment, reproduced.** Holding worker cut off the Docker
+  network 4s in; lease reclaimed **0.437s overdue**; attempt 1 delivered to
+  the second worker, which **started from zero** and completed in 27.206s.
+  The cut worker finished its abandoned attempt anyway at **28.799s with an
+  identical fingerprint**, reconnected, submitted, and was refused
+  **`superseded`**. One `attempts` row, `outcome: REASSIGNED`.
+- **Four identical tasks: 1 distinct digest, 4 distinct idempotency
+  tokens** — the tokens are what prove these were four real executions
+  rather than one result deduplicated four ways.
+- **Purity enforced two ways and both confirmed to fail on purpose**: an
+  executor that writes a file trips `AssertionError: an executor touched
+  the outside world`, and adding `import os` to `worker/executors.py` trips
+  the static allowlist test.
+
+### The one thing worth carrying forward
+
+**The obvious test for "no partial work was reused" is vacuous, and only a
+mutation check showed it.** A mutant that saved the partial digest and
+resumed from it *passed* a known-answer assertion — because for a pure
+workload, resuming and restarting produce the **same answer**. The return
+value cannot answer "did you redo the work". The tests now count chunk
+boundaries instead (100 progress reports starting at 0.01), and both
+resuming mutants fail. Four mutants were injected in total and **two of
+them initially caught nothing**; that is reported here rather than tidied
+away (§10).
+
+### What is NOT done
+
+- **Nothing merged, nothing deployed, cluster untouched.**
+- **No remote Internet worker**, so §8 is **not** claimed for 3.6.
+- **No user-run demo or failure demo** — every run above was agent-run.
+- **No dashboard work.** A worker that lost a task can still show a stale
+  `current_tasks` entry until its `capacity` arrives or the Redis key
+  expires. That is Step 3.7's territory and was left there deliberately.
+
+**`.env` was not read and not modified this session, and no secret was
+printed.** `dcds36` runs on throwaway credentials from a file in the
+session scratchpad.
+
+---
+
 ## ⇒ 2026-08-05 (session 25) — STEP 3.4 APPROVED, STEP 3.5 BUILT AND VERIFIED, BOTH PUSHED AS PRs #54 AND #55, CI GREEN, NOT MERGED
 
 **You approved Step 3.4 and directed that Step 3.5 be built end to end
