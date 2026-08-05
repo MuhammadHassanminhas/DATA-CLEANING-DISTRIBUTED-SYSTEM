@@ -44,13 +44,13 @@ new table, no new Redis key, no protocol change — zero files under
 4. **⚠ Local Docker stacks are RUNNING.** `dcds35` is this step's demo
    stack (coordinator **9475**, dashboard **9476**) at **stock
    configuration** — unlike `dcds34`, nothing about it was tuned, so
-   numbers read off it are numbers about the shipped defaults. **Its
-   worker container is currently up and its coordinator was last recreated
-   with `SHUTDOWN_DRAIN_SECONDS=0` for the failure demo** — recreate it
-   from `dcds35.env` rather than `dcds35-nodrain.env` before reading
-   anything off it. Both env files live in **this session's scratchpad and
-   die with it**; the credentials in them are throwaway and are **not**
-   `.env`'s. `dcds34` and its standalone `dcds34-pg` / `dcds34-redis` (the
+   numbers read off it are numbers about the shipped defaults. **It was
+   put back on `dcds35.env` at session close and verified: all five
+   containers healthy, `/ready` 200, `coordinator_draining 0.0`.** The
+   failure demo's `dcds35-nodrain.env` (the same file plus
+   `SHUTDOWN_DRAIN_SECONDS=0`) is beside it — do not recreate from that
+   one by accident. Both live in **this session's scratchpad and die with
+   it**; the credentials in them are throwaway and are **not** `.env`'s. `dcds34` and its standalone `dcds34-pg` / `dcds34-redis` (the
    unit-test database on **55434** / **6391**, which the 426-test run
    used) were left up from the previous session. Teardown:
    ```bash
