@@ -59,8 +59,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
+import random
+import shlex
 import ssl
 import statistics
 import sys
@@ -96,6 +99,15 @@ READ_PAGE = 200
 RESULT_RETRY_SECONDS = 10.0
 
 HEARTBEAT_SECONDS = 5.0
+
+# Phase 3.5 reconnect backoff for the simulated fleet. Full jitter, and the
+# same three numbers as `worker.py`'s WS_BACKOFF_* defaults on purpose: the
+# reconnect storm this harness measures has to be the storm the real fleet
+# would produce, and a harness that reconnected faster than the shipped
+# worker would report a herd the coordinator never actually faces.
+RECONNECT_BACKOFF_BASE_SECONDS = 1.0
+RECONNECT_BACKOFF_FACTOR = 2.0
+RECONNECT_BACKOFF_MAX_SECONDS = 30.0
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +268,18 @@ class SimWorker:
         self.ready = asyncio.Event()
         self.failed: str | None = None
 
+        # Phase 3.5. Counted, because "workers reconnect automatically
+        # without re-enrollment" is only checkable if both halves are
+        # measured: `registrations` must stay at 1 across any number of
+        # `reconnects`. A worker that quietly re-registers would satisfy
+        # "reconnected" while failing the criterion.
+        self.registrations = 0
+        self.reconnects = 0
+        self.sessions = 0
+        self.reconnect_seconds: list[float] = []
+        self.disconnected_at: float | None = None
+        self.last_error: str | None = None
+
         self.received: list[str] = []       # task ids delivered here
         self.completed: set[str] = set()     # acked accepted
         self.refused: list[str] = []
@@ -279,6 +303,7 @@ class SimWorker:
             raise RuntimeError(f"register failed: {status} {body}")
         self.worker_id = body["worker_id"]
         self.credential = body["worker_credential"]
+        self.registrations += 1
 
     def _token(self) -> str:
         status, body = _request(
@@ -312,9 +337,21 @@ class SimWorker:
             return False
 
     async def run(self, stop: asyncio.Event) -> None:
+        """Register once, then hold a session for as long as `stop` is clear.
+
+        **Phase 3.5 turned this from one session into a reconnect loop**,
+        and the shape is deliberate: registration happens exactly once,
+        outside the loop, so a run in which the coordinator restarts can
+        distinguish "the fleet came back" from "the fleet enrolled again".
+        The token *is* refreshed per attempt, because it is short-lived by
+        design and an expired one is not a re-enrollment — the long-lived
+        credential from the single registration is what mints it.
+
+        For every scenario written before 3.5 this is a no-op: they set
+        `stop` before the socket ever closes, so the loop runs once.
+        """
         try:
             await asyncio.to_thread(self._register)
-            token = await asyncio.to_thread(self._token)
         except Exception as exc:  # noqa: BLE001
             self.failed = f"{type(exc).__name__}: {exc}"
             self.ready.set()
@@ -323,44 +360,86 @@ class SimWorker:
         self._slots = asyncio.Semaphore(self.max_concurrent)
         self._send_lock = asyncio.Lock()
         ws_url = self.base.replace("https://", "wss://", 1) + "/ws/connect"
+        failures = 0
 
-        try:
-            async with websockets.connect(
-                ws_url,
-                extra_headers={"Authorization": f"Bearer {token}"},
-                ssl=_ctx(self.insecure),
-                max_size=None,
-                open_timeout=60,
-                # The targeted half of the fix in `shutdown_fleet`: do not
-                # spend the library's default patience on a close handshake
-                # the far side may never answer.
-                close_timeout=5,
-            ) as ws:
-                self._ws = ws
-                await self._send("hello", {
-                    "agent_version": "loadtest",
-                    "max_concurrent": self.max_concurrent,
-                    "supported_task_types": self.types,
-                }, str(uuid.uuid4()))
-                ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
-                if ack.get("message_type") != "hello_ack":
-                    raise RuntimeError(f"handshake failed: {ack}")
-                self._epoch = int(ack.get("session_epoch") or 0)
-                self.ready.set()
+        while not stop.is_set():
+            try:
+                await self._session(ws_url, stop)
+                failures = 0
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                # Only the *first* failure is reported. A worker that
+                # reconnected successfully afterwards did not fail the run,
+                # and leaving `failed` set would make `connect_fleet`'s
+                # count of broken workers wrong for every later scenario.
+                if not self.ready.is_set():
+                    self.failed = self.failed or f"{type(exc).__name__}: {exc}"
+                    self.ready.set()
+                    return
+                self.last_error = f"{type(exc).__name__}: {exc}"
 
-                helpers = [
-                    asyncio.create_task(self._heartbeat_loop(stop)),
-                    asyncio.create_task(self._result_retry_loop(stop)),
-                ]
-                try:
-                    await self._receive_loop(stop)
-                finally:
-                    for helper in helpers:
-                        helper.cancel()
-                    await asyncio.gather(*helpers, return_exceptions=True)
-        except Exception as exc:  # noqa: BLE001
-            self.failed = self.failed or f"{type(exc).__name__}: {exc}"
+            if stop.is_set():
+                break
+            self.reconnects += 1
+            # Full jitter, the same shape as `worker.py`'s reconnect
+            # backoff and for the same reason: the whole fleet is
+            # reconnecting at once and an unjittered retry would arrive as
+            # one wavefront. This is the harness half of the thundering
+            # herd the restart scenario measures.
+            delay = random.random() * min(
+                RECONNECT_BACKOFF_MAX_SECONDS,
+                RECONNECT_BACKOFF_BASE_SECONDS * (RECONNECT_BACKOFF_FACTOR ** failures),
+            )
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+
+    async def _session(self, ws_url: str, stop: asyncio.Event) -> None:
+        """One connection, from token refresh to socket close."""
+        token = await asyncio.to_thread(self._token)
+        async with websockets.connect(
+            ws_url,
+            extra_headers={"Authorization": f"Bearer {token}"},
+            ssl=_ctx(self.insecure),
+            max_size=None,
+            open_timeout=60,
+            # The targeted half of the fix in `shutdown_fleet`: do not
+            # spend the library's default patience on a close handshake
+            # the far side may never answer.
+            close_timeout=5,
+        ) as ws:
+            self._ws = ws
+            await self._send("hello", {
+                "agent_version": "loadtest",
+                "max_concurrent": self.max_concurrent,
+                "supported_task_types": self.types,
+                # Declared so the coordinator credits work this worker is
+                # still executing across the restart (Decision #101).
+                # Without it a reconnecting worker looks idle and is handed
+                # a full set of new credits on top of what it is running.
+                "tasks_in_flight": max(0, len(self.received) - len(self.completed)),
+            }, str(uuid.uuid4()))
+            ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+            if ack.get("message_type") != "hello_ack":
+                raise RuntimeError(f"handshake failed: {ack}")
+            self._epoch = int(ack.get("session_epoch") or 0)
+            self.sessions += 1
+            if self.disconnected_at is not None:
+                self.reconnect_seconds.append(time.monotonic() - self.disconnected_at)
+                self.disconnected_at = None
             self.ready.set()
+
+            helpers = [
+                asyncio.create_task(self._heartbeat_loop(stop)),
+                asyncio.create_task(self._result_retry_loop(stop)),
+            ]
+            try:
+                await self._receive_loop(stop)
+            finally:
+                self.disconnected_at = time.monotonic()
+                self._ws = None
+                for helper in helpers:
+                    helper.cancel()
+                await asyncio.gather(*helpers, return_exceptions=True)
 
     async def _receive_loop(self, stop: asyncio.Event) -> None:
         executing: set[asyncio.Task] = set()
@@ -1122,11 +1201,208 @@ async def run_saturation(args) -> dict[str, Any]:
     }
 
 
+async def run_restart(args) -> dict[str, Any]:
+    """Step 3.5 — restart the coordinator mid-drain and measure the recovery.
+
+    The one scenario that does not merely load the coordinator: it kills it
+    while it is working and then answers, from the coordinator's own tables
+    and from the fleet's own counters, whether anything was lost.
+
+    **The restart itself is a command, not something this harness knows how
+    to do.** `--restart-command` takes whatever restarts the coordinator in
+    the environment under test — `docker compose -p X restart coordinator`
+    locally, `kubectl -n staging rollout restart deploy/coordinator` in the
+    cluster — because a harness that shelled out to Docker directly would
+    only ever be able to test one of the two, and the criterion asks about
+    both.
+
+    What is measured, and why each one is here:
+
+    * `read_back` — every task accounted for, and completed exactly once.
+      This is the "loses no durable task record" criterion, taken from the
+      database rather than from the fleet, because the fleet's own view
+      cannot see a row it never received.
+    * `registrations` vs `reconnects` — "reconnect without re-enrollment",
+      which is only meaningful as both numbers together.
+    * `reconnect_seconds` — how long the fleet took to come back, per
+      worker, which is the reconnect-storm measurement. Reported as a
+      distribution rather than a maximum: one straggler on a 30s backoff
+      cap says something very different from a fleet that all took 30s.
+    * `coordinator_cpu_percent_of_one_core` over the restart window — the
+      other half of "does not overwhelm the coordinator". A herd that
+      arrives politely still costs something to answer.
+    """
+    workers, runners, stop = await connect_fleet(args, args.workers)
+    connected = sum(1 for w in workers if w.failed is None)
+    sessions_before = sum(w.sessions for w in workers)
+
+    sampler = Sampler(args)
+    sampler.start()
+
+    correlation_id = str(uuid.uuid4())
+    enqueue_seconds, accepted = await asyncio.to_thread(
+        enqueue, args, args.task_type, json.loads(args.parameters), args.tasks, correlation_id
+    )
+
+    # Let work reach the fleet before pulling the coordinator out from
+    # under it. **`received - completed` and not `received`**: the
+    # criterion is about tasks *in flight* at the restart, and with a
+    # millisecond workload a large `received` can sit alongside nothing
+    # actually running. Use a workload long enough to still be executing
+    # here — the documented demo uses `sleep`.
+    await asyncio.sleep(args.restart_after)
+    in_flight_at_restart = sum(len(w.received) - len(w.completed) for w in workers)
+
+    restart_started = time.monotonic()
+    completed_at_restart = sum(len(w.completed) for w in workers)
+    restart = await _run_restart_command(args.restart_command)
+    restart["seconds"] = round(time.monotonic() - restart_started, 3)
+    restart["tasks_received_at_restart"] = in_flight_at_restart
+    restart["tasks_completed_at_restart"] = completed_at_restart
+
+    # The fleet is now reconnecting. `drain_wait` tolerates the gap: it
+    # watches acks, and falls back to the depth endpoint when nothing has
+    # landed for a while — which is exactly the shape of a restart.
+    elapsed = await drain_wait(args, workers, accepted, args.timeout)
+
+    # **Measured separately from the drain, and after it, on purpose.**
+    # The queue can drain before the last worker is back — a straggler on
+    # a long backoff simply is not needed to finish the work — so folding
+    # the two together would report a convergence time that is really a
+    # drain time. This is the criterion's "converges cleanly, timed".
+    converge_after_drain = await _await_fleet_reconnect(workers, args.reconnect_timeout)
+    await asyncio.sleep(2.0)
+    await sampler.stop()
+
+    delivered = [task_id for w in workers for task_id in w.received]
+    duplicates = [t for t, n in Counter(delivered).items() if n > 1]
+    reconnect_times = [t for w in workers for t in w.reconnect_seconds]
+    back = sum(1 for w in workers if w.sessions >= 2)
+    registrations = sum(w.registrations for w in workers)
+    reconnects = sum(w.reconnects for w in workers)
+    late_failures = [w.last_error for w in workers if w.last_error]
+    await shutdown_fleet(runners, stop)
+
+    rows = await asyncio.to_thread(read_back, args, correlation_id)
+    completions = rows.pop("_completions")
+
+    return {
+        "scenario": "restart",
+        "correlation_id": correlation_id,
+        "fleet": {
+            "requested": args.workers,
+            "connected": connected,
+            "credits_each": args.max_concurrent,
+            "sessions_before_restart": sessions_before,
+            "sessions_total": sum(w.sessions for w in workers),
+        },
+        "enqueue": {
+            "requested": args.tasks,
+            "accepted": accepted,
+            "seconds": round(enqueue_seconds, 3),
+        },
+        "restart": restart,
+        "reconnect": {
+            "registrations": registrations,
+            "reconnect_attempts": reconnects,
+            "workers_back": back,
+            "seconds": summarise(reconnect_times),
+            # Not a failed run on its own: a session that died while the
+            # coordinator was down is the expected shape of a restart. It
+            # is reported because a *persistent* error after the fleet came
+            # back would hide behind a successful drain otherwise.
+            "errors_after_first_connect": len(late_failures),
+            "first_error": late_failures[0] if late_failures else None,
+        },
+        "drain_seconds_after_restart": round(elapsed, 3),
+        # **0.0 means the fleet was already back when the queue drained**,
+        # which is the good case and not a missing measurement. The
+        # convergence time itself is `reconnect.seconds` — this is only the
+        # tail the drain did not already cover.
+        "converge_after_drain_seconds": converge_after_drain,
+        "throughput": throughput(completions, elapsed, rows["completed"]),
+        "latency": {
+            "end_to_end_seconds": rows["end_to_end_seconds"],
+            "queue_wait_seconds": rows["queue_wait_seconds"],
+        },
+        "delivery": {
+            "delivered": len(delivered),
+            "distinct": len(set(delivered)),
+            # **Not a failure in this scenario, unlike `burst`.** A task
+            # whose worker was mid-execution when the coordinator went away
+            # may legitimately be reclaimed and delivered a second time —
+            # that is at-least-once delivery working (§3.0.5), and Step 3.4
+            # is what stops the loser's result from landing. Reported, and
+            # checked against the *result rows* instead.
+            "redeliveries": len(duplicates),
+            "refusals": sum(len(w.refused) for w in workers),
+        },
+        "coordinator": sampler.report(),
+        "read_back": {k: v for k, v in rows.items()
+                      if k not in ("end_to_end_seconds", "queue_wait_seconds")},
+        "rate_limited_retries": _RATE_LIMITED[0],
+        "checks": {
+            "restart_command_succeeded": restart["returncode"] == 0,
+            "work_was_in_flight_at_restart": in_flight_at_restart > 0,
+            "every_task_read_back": rows["rows"] == accepted,
+            "no_task_lost": rows["completed"] == accepted,
+            "no_duplicate_task_rows": rows["distinct_task_ids"] == rows["rows"],
+            "every_completion_has_one_result": rows["with_result"] == rows["completed"],
+            "every_worker_reconnected": back == connected,
+            "no_re_enrollment": registrations == connected,
+        },
+    }
+
+
+async def _await_fleet_reconnect(workers: list[SimWorker], timeout: float) -> float | None:
+    """Seconds until every worker that was connected holds a session again.
+
+    Returns `None` on timeout rather than the elapsed time, so a run that
+    never converged cannot be read as one that converged slowly. The
+    caller's `every_worker_reconnected` check is what turns that into a
+    verdict — this only measures.
+
+    "Holds a session again" is `sessions >= 2`: one before the restart and
+    one after. Counting sessions rather than asking whether the socket is
+    currently open is what makes it immune to a worker that reconnected and
+    then briefly dropped again.
+    """
+    started = time.monotonic()
+    expected = sum(1 for w in workers if w.failed is None)
+    while time.monotonic() - started < timeout:
+        if sum(1 for w in workers if w.sessions >= 2) >= expected:
+            return round(time.monotonic() - started, 3)
+        await asyncio.sleep(0.25)
+    return None
+
+
+async def _run_restart_command(command: str) -> dict[str, Any]:
+    """Run the operator's restart command and report what it did.
+
+    `shlex.split` rather than `shell=True`: the command comes from the
+    operator's own argv, so this is not a trust boundary, but a shell would
+    make the reported `returncode` that of the shell rather than of the
+    thing that was supposed to restart the coordinator.
+    """
+    process = await asyncio.create_subprocess_exec(
+        *shlex.split(command),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await process.communicate()
+    return {
+        "command": command,
+        "returncode": process.returncode,
+        "output": (output or b"").decode(errors="replace").strip()[-2000:],
+    }
+
+
 SCENARIOS = {
     "burst": run_burst,
     "sustained": run_sustained,
     "mixed": run_mixed,
     "saturation": run_saturation,
+    "restart": run_restart,
 }
 
 
@@ -1165,6 +1441,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpu-threshold", type=float, default=75.0,
                         help="saturation: percent of one core that counts as saturated")
 
+    parser.add_argument("--restart-command", default="",
+                        help="restart: the command that restarts the coordinator, e.g. "
+                             "'docker compose -p dcds35 restart coordinator' or "
+                             "'kubectl -n staging rollout restart deploy/coordinator'")
+    parser.add_argument("--restart-after", type=float, default=10.0,
+                        help="restart: seconds to let work flow before restarting")
+    parser.add_argument("--reconnect-timeout", type=float, default=120.0,
+                        help="restart: seconds to wait for the whole fleet to come back")
+
     parser.add_argument("--connect-batch", type=int, default=10,
                         help="workers registered per batch")
     parser.add_argument("--connect-pause", type=float, default=0.5)
@@ -1182,6 +1467,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.url or not args.enrollment_secret or not args.admin_secret:
         print("need --url, --enrollment-secret and --admin-secret "
               "(or COORDINATOR_URL / ENROLLMENT_SECRET / ADMIN_SECRET)", file=sys.stderr)
+        return 2
+    if args.scenario == "restart" and not args.restart_command:
+        # Refused up front rather than run and reported as a pass: a
+        # restart scenario that restarts nothing is a burst with extra
+        # words, and it would produce a green report saying so.
+        print("restart needs --restart-command", file=sys.stderr)
         return 2
 
     started = time.time()

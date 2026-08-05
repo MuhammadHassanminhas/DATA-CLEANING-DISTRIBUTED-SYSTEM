@@ -429,6 +429,23 @@ DUPLICATE = "duplicate"
 # sender held this task, executed it honestly, and lost a race that the
 # design says it may lose (gate §3.0.5 — at-least-once execution).
 SUPERSEDED = "superseded"
+# Phase 3.4. A submission from an attempt that is no longer the task's
+# current one — a stale result from an earlier attempt of a task this worker
+# holds again, or a result from a worker the task has since been reassigned
+# away from while it is still being worked on.
+#
+# **Distinct from `SUPERSEDED` because the task is still live.** Superseded
+# answers a submission for a task some other attempt has already finished;
+# fenced answers one for a task nobody has finished yet. Both tell the
+# worker to stop retrying, and both write no result — but only one of them
+# means the work is done, and an operator watching a recovery needs to know
+# which.
+#
+# **Distinct from `NOT_OWNER` because the sender genuinely held this task.**
+# `NOT_OWNER` keeps its §12 meaning — "you are naming something that was
+# never yours" — which is the signal an impostor produces. A worker that
+# lost a race the design says it may lose must not be recorded as one.
+FENCED = "fenced"
 # Phase 2.6. The task exists but is past the point where a coordinator-side
 # write alone can cancel it — see `cancel_queued_task`. Distinct from
 # ILLEGAL because nothing was attempted: this is a refusal, not a rejected
@@ -577,6 +594,101 @@ async def _terminal_result_outcome(
     return DUPLICATE if stored is not None and stored == token else SUPERSEDED
 
 
+# Phase 3.4. The third way an attempt can end abnormally, beside being
+# reassigned and being given up on: its result arrived after the attempt had
+# stopped being the current one. `models.py` reserved the string when the
+# table was created.
+FENCED_OUTCOME = "FENCED"
+# Which of the two fencing inputs failed, kept apart because they describe
+# different situations to whoever reads the row: the attempt number moved on
+# under a worker that still holds the task, versus the task moving to
+# somebody else entirely.
+REASON_STALE_ATTEMPT = "stale_attempt"
+REASON_TASK_REASSIGNED = "task_reassigned"
+
+# Written under the caller's `FOR UPDATE` lock on the task row, so the
+# `NOT EXISTS` cannot race another submission for the same task.
+#
+# **The guard is not tidiness, it is a bound.** `attempt_number` is
+# worker-reported and therefore untrusted (§12), and a worker that holds one
+# task legitimately could otherwise resubmit the same stale result forever
+# and write one row per submission. With it, a (task, worker) pair can write
+# at most one row per attempt number, and the attempt number itself is
+# bounded by the caller to `<= attempt_count`.
+_RECORD_FENCE_SQL = text(
+    """
+    INSERT INTO task_attempts
+        (id, task_id, attempt_number, worker_id, outcome, reason, correlation_id)
+    SELECT gen_random_uuid(), CAST(:task_id AS uuid), :attempt_number,
+           CAST(:worker_id AS uuid), CAST(:outcome AS text), :reason,
+           :correlation_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM task_attempts
+        WHERE task_id = CAST(:task_id AS uuid)
+          AND worker_id = CAST(:worker_id AS uuid)
+          AND attempt_number = :attempt_number
+          AND outcome = CAST(:outcome AS text)
+    )
+    """
+)
+
+
+def _count_fence(reason: str) -> None:
+    """Increment `coordinator_results_fenced_total{reason}` (gate §3.0.9).
+
+    Counted here rather than by the caller, which is the opposite of what
+    the reassignment counters do, for one reason: **only this module knows
+    which of the two fencing inputs failed.** Handing the reason back would
+    mean widening a return type that every caller and three test modules
+    compare against a plain string, to move one line.
+
+    `app.metrics` imports *this* module for its queue-depth gauges, so the
+    import has to be inside the function or it is a cycle at start-up. It
+    costs a `sys.modules` lookup, on the branch that has already decided to
+    refuse a submission.
+    """
+    from app.metrics import RESULTS_FENCED
+
+    RESULTS_FENCED.labels(reason).inc()
+
+
+async def _ever_held(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    worker_id: uuid.UUID | str,
+    assigned_worker_id: Any,
+) -> bool:
+    """Did this worker ever actually hold this task? (Phase 3.4)
+
+    This is what keeps `NOT_OWNER` meaning what §12 needs it to mean. Once
+    fencing exists, "the row does not name you" covers two completely
+    different senders: a worker whose task was reassigned out from under it
+    mid-execution, and a worker naming a task that was never its own. They
+    deserve opposite answers, and the row alone cannot tell them apart.
+
+    It can be told apart cheaply, because Step 3.2 already writes the
+    evidence: **every reassignment records a `task_attempts` row naming the
+    worker that lost the task.** So a genuine loser has a row here and an
+    impostor has none, read from `ix_task_attempts_task`, on the rare branch
+    only — the accepting path never runs this query.
+
+    The current assignee short-circuits it entirely, which is the case that
+    matters for throughput: a worker submitting a stale attempt number for a
+    task it still holds needs no lookup at all.
+    """
+    if assigned_worker_id is not None and str(assigned_worker_id) == str(worker_id):
+        return True
+    found = await session.execute(
+        text(
+            "SELECT 1 FROM task_attempts WHERE task_id = CAST(:task_id AS uuid) "
+            "AND worker_id = CAST(:worker_id AS uuid) LIMIT 1"
+        ),
+        {"task_id": str(task_id), "worker_id": str(worker_id)},
+    )
+    return found.scalar_one_or_none() is not None
+
+
 async def complete_task(
     session: AsyncSession,
     *,
@@ -639,10 +751,39 @@ async def complete_task(
     submission pending for seven days does not exist — the worker's pending
     buffer is in memory and dies with the process.
 
-    **What this does NOT do is fencing (Step 3.4).** A stale result from an
-    *earlier attempt* of a task the same worker holds again is still
-    accepted here, because `attempt_number` is not yet compared against
-    `attempt_count`. That is 3.4's exit criterion, not this one's.
+    **Phase 3.4 adds the fencing rule, and it is the completion of the
+    sentence 3.3 left unfinished.** A result is accepted **if and only if
+    the sender is the current `assigned_worker_id` and its
+    `attempt_number` equals `tasks.attempt_count`** (gate §3.0.6). Anything
+    else on a live task is `FENCED`: nothing written, the task's state
+    untouched, one `task_attempts` row recording the attempt that was
+    fenced.
+
+    Two things are fenced and they are different situations, which is why
+    the attempt row carries a reason:
+
+    * the sender still holds the task but names an **earlier attempt** —
+      `stale_attempt`. This is the case 3.3 explicitly left accepted, and
+      it is reachable exactly when a reclaimed task comes back to the same
+      worker after its exclusion window (Step 3.2).
+    * the sender no longer holds the task at all because it has been
+      **reassigned** while still live — `task_reassigned`. Before 3.4 this
+      was `NOT_OWNER`, which accuses an honest worker of naming somebody
+      else's task.
+
+    **`NOT_OWNER` is not retired, it is narrowed to what §12 meant by it.**
+    A sender the task has no record of ever holding still gets it — see
+    `_ever_held`. That distinction is what stops fencing from becoming a
+    way for a worker to make the coordinator write rows about tasks it has
+    never been given.
+
+    **`session_epoch` is deliberately not an input** (gate §3.0.12,
+    Decision #169). Step 2.5 measured a legitimate result executed under
+    epoch 4 and submitted on 5 after a reconnect; rejecting on a stale
+    epoch would break the coordinator-outage criterion a shipped step
+    proved. The epoch is recorded and logged, and session conflicts are
+    arbitrated by the Step 1.7 epoch check, which is a different question
+    from result validity.
 
     **A missing `RUNNING` is walked through, not widened.** A result can
     arrive for a task still `ASSIGNED` — the `task_started` report is a
@@ -667,8 +808,13 @@ async def complete_task(
                 # task row. The hot path pays one more column on a row it
                 # was already locking; the token itself is only fetched when
                 # the task is terminal, which is the rare branch.
-                "SELECT status, assigned_worker_id, result_id FROM tasks "
-                "WHERE id = CAST(:id AS uuid) FOR UPDATE"
+                #
+                # `attempt_count` and `correlation_id` join it for Phase
+                # 3.4, and for the same reason: the fencing comparison and
+                # the attempt row it writes both need them, and neither is
+                # worth a second lookup of a row already held under lock.
+                "SELECT status, assigned_worker_id, result_id, attempt_count, "
+                "correlation_id FROM tasks WHERE id = CAST(:id AS uuid) FOR UPDATE"
             ),
             {"id": str(parsed)},
         )
@@ -686,8 +832,46 @@ async def complete_task(
             session, result_id=row["result_id"], token=envelope.get("idempotency_token")
         )
 
-    if str(row["assigned_worker_id"]) != str(worker_id):
-        return NOT_OWNER
+    # Phase 3.4, the fencing rule. Both halves of it are checked here and
+    # nowhere else, so there is exactly one place that decides whether a
+    # submission is the current attempt's — see the docstring.
+    current_attempt = int(row["attempt_count"])
+    submitted_attempt = envelope.get("attempt_number")
+    is_assignee = (
+        row["assigned_worker_id"] is not None
+        and str(row["assigned_worker_id"]) == str(worker_id)
+    )
+    if not is_assignee or submitted_attempt != current_attempt:
+        if not await _ever_held(
+            session,
+            task_id=str(parsed),
+            worker_id=worker_id,
+            assigned_worker_id=row["assigned_worker_id"],
+        ):
+            return NOT_OWNER
+        reason = REASON_STALE_ATTEMPT if is_assignee else REASON_TASK_REASSIGNED
+        _count_fence(reason)
+        # An attempt number the task has never reached is not a history
+        # this coordinator will fabricate a row for — it is fenced, acked
+        # and logged like any other, but nothing durable records an attempt
+        # that did not happen. This is also what bounds the table against a
+        # worker naming arbitrary attempt numbers (§12).
+        if isinstance(submitted_attempt, int) and 0 <= submitted_attempt <= current_attempt:
+            await session.execute(
+                _RECORD_FENCE_SQL,
+                {
+                    "task_id": str(parsed),
+                    "attempt_number": submitted_attempt,
+                    "worker_id": str(worker_id),
+                    "outcome": FENCED_OUTCOME,
+                    "reason": reason,
+                    # The task's own correlation id, not a fresh one, so the
+                    # fence is traceable in the same end-to-end thread as
+                    # the assignment that produced it (§11).
+                    "correlation_id": row["correlation_id"],
+                },
+            )
+        return FENCED
 
     # ASSIGNED needs the RUNNING hop; RUNNING goes straight through. Every
     # step is checked. A terminal task never reaches here — Phase 3.3
@@ -1106,6 +1290,32 @@ async def awaiting_retry_count(session: AsyncSession) -> int:
             "SELECT count(*) FROM tasks "
             "WHERE status = 'QUEUED' AND not_before IS NOT NULL AND not_before > now()"
         )
+    )
+    return int(result.scalar_one())
+
+
+async def fenced_result_count(session: AsyncSession) -> int:
+    """How many result submissions have been fenced (Phase 3.4).
+
+    The figure behind the task console's fenced tile, which is what makes
+    "rejections are visible on the dashboard, not buried in logs" true of an
+    operator who does not already know which task to open.
+
+    **Counted from `task_attempts`, not from the Prometheus counter**, and
+    that is the point: the counter resets with the process and is per
+    replica, so a fleet of three would show three different numbers and all
+    of them would go to zero on a rollout. This is the durable record, and
+    every replica answers identically from it (§3.9).
+
+    No index and none needed. `task_attempts` holds one row per **abnormal**
+    ending, so it is small by construction where `tasks` is not — and the
+    endpoint this serves already runs a grouped scan of `tasks`, which is
+    the larger table by orders of magnitude. Adding an index here would cost
+    a migration to make the cheaper of the two queries cheaper still.
+    """
+    result = await session.execute(
+        text("SELECT count(*) FROM task_attempts WHERE outcome = :outcome"),
+        {"outcome": FENCED_OUTCOME},
     )
     return int(result.scalar_one())
 

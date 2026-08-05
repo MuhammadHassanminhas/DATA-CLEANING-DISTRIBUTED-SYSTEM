@@ -135,6 +135,7 @@ from app.metrics import (
     ASSIGNMENT_PASSES,
     ASSIGNMENT_QUERIES,
     ASSIGNMENTS_IN_FLIGHT,
+    DRAINING,
     LEASE_RECLAIM_SECONDS,
     LEASE_RENEWALS,
     LEASES_EXPIRED,
@@ -154,6 +155,7 @@ from app.results import MalformedResult
 from app.results import validate as validate_result
 from app.task_queue import (
     DUPLICATE,
+    FENCED,
     NOT_FOUND,
     NOT_OWNER,
     TRANSITIONED,
@@ -193,6 +195,42 @@ REFUSE_UNSUPPORTED_TYPE = "unsupported_task_type"
 # same reason: it is the dashboard's read, and a stale entry must expire on
 # its own if the replica holding the socket dies.
 CURRENT_TASKS_TTL_MULTIPLIER = 3
+
+# Phase 3.5. Set once, never cleared: a replica that has begun draining is
+# on its way out of the process table and has no route back to serving.
+# Making it one-way is what lets every reader treat it as a fact rather
+# than as a value that might change under them.
+_draining = False
+
+# How often `drain_local_sessions` re-checks. Short relative to any drain
+# window worth configuring, so the wait ends on the work finishing rather
+# than on the poll's own granularity.
+_DRAIN_POLL_SECONDS = 0.1
+
+
+def is_draining() -> bool:
+    """True once this replica has begun a graceful shutdown.
+
+    Read by `/ready` (which must start failing before the sockets close, so
+    Kubernetes takes this pod out of the Service while it can still finish
+    what it holds) and by `assign_once` (which must stop handing out work
+    it cannot see through).
+    """
+    return _draining
+
+
+def begin_drain() -> None:
+    """Stop taking new work. Idempotent, and deliberately one-way.
+
+    **This does not close anything and does not cancel anything.** Tasks
+    already running on this replica's workers keep running, results already
+    in flight are still accepted, and the reclaimer keeps reclaiming — a
+    draining replica is still a correct replica, it has simply stopped
+    adding to what it will have to abandon.
+    """
+    global _draining
+    _draining = True
+    DRAINING.set(1)
 
 
 @dataclass
@@ -934,6 +972,14 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
     genuinely is free. Holding the credit here would make losing a race
     cost the worker capacity for the life of the session, which is the
     defect Decision #168 fixed on the neighbouring path.
+
+    **Phase 3.4 adds a second, `FENCED`** — a result for a task that is
+    still live but whose current attempt is not this one. It behaves like
+    `SUPERSEDED` in every way the worker can see (definitive ack,
+    `accepted: false`, credit released), and differs in one way the
+    coordinator can: it commits, because the `task_attempts` row recording
+    the fence is what makes the rejection inspectable afterwards. The rule
+    itself lives in `task_queue.complete_task` and nowhere else.
     """
     payload = message.get("payload") or {}
     correlation_id = str(message.get("correlation_id") or "")
@@ -1001,14 +1047,28 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
     task_id = envelope["task_id"]
     async with get_session() as db:
         outcome = await complete_task(db, envelope=envelope, worker_id=session.worker_id)
-        if outcome == TRANSITIONED:
+        # `FENCED` commits too, and it is the one outcome that writes
+        # without transitioning: the result is refused, but the
+        # `task_attempts` row recording that it was refused is the durable
+        # half of "rejections are visible, not buried in logs". Rolling it
+        # back with the rest of the no-op would leave the fence provable
+        # only from a log line on one replica.
+        if outcome in (TRANSITIONED, FENCED):
             await db.commit()
 
     # The same Decision #168 condition as `handle_task_failed`, and for the
     # same reason: after Step 3.1 a `NOT_OWNER` can mean "your task was
     # reassigned while you were finishing it", which is a sincere report
     # from a worker whose slot really is free.
-    if outcome not in (NOT_OWNER, NOT_FOUND) or task_id in session.credited:
+    #
+    # **Phase 3.4 puts `FENCED` in the same guarded set, not outside it.**
+    # A fenced worker's slot genuinely is free, so the credit must come
+    # back — but the outcome is reachable by naming a task id, and
+    # releasing unconditionally would hand any worker a way to free a slot
+    # of a task that is still running by naming an id (§12). Keyed on
+    # `credited`, a genuine id releases and a guessed one does not, which is
+    # exactly the discipline the neighbouring paths already apply.
+    if outcome not in (NOT_OWNER, NOT_FOUND, FENCED) or task_id in session.credited:
         _release_credit(session, task_id)
         session.current_tasks.pop(task_id, None)
         session.lease_renew_due.pop(task_id, None)
@@ -1038,12 +1098,22 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
         )
     else:
         logger.warning(
-            "task_result_not_applied",
+            # Phase 3.4 gives the fence its own event name rather than
+            # folding it into the generic one. "A result was fenced" is the
+            # thing an operator greps for during a recovery, and it should
+            # not require knowing that `outcome` is a field on a line whose
+            # name says only that something was not applied.
+            "task_result_fenced" if outcome == FENCED else "task_result_not_applied",
             extra={
                 "task_id": task_id,
                 "worker_id": session.worker_id,
                 "correlation_id": correlation_id,
                 "outcome": outcome,
+                # Which attempt the worker believed it was submitting. On a
+                # fence this is the whole diagnosis, and it is worker-
+                # reported — recorded, never trusted (§12).
+                "attempt_number": envelope["attempt_number"],
+                "session_epoch": envelope["session_epoch"],
             },
         )
 
@@ -1171,6 +1241,15 @@ async def assign_once() -> int:
     story: with an empty queue this costs one query regardless of whether
     the replica holds one socket or a hundred.
     """
+    # Phase 3.5, and it is checked before the pass is even counted: a
+    # draining replica must not claim a row. `dequeue` moves a task to
+    # ASSIGNED durably, so claiming here and dying a second later strands
+    # that task for a full `TASK_ACK_TIMEOUT_SECONDS` before the reclaimer
+    # can have it back — work thrown away by the shutdown itself, on a
+    # queue another live replica was ready to serve.
+    if _draining:
+        return 0
+
     ASSIGNMENT_PASSES.inc()
 
     candidates = [
@@ -1207,6 +1286,46 @@ async def assign_once() -> int:
     if delivered:
         _refresh_in_flight_gauge()
     return delivered
+
+
+async def drain_local_sessions(timeout: float) -> dict[str, Any]:
+    """Wait for work this replica has handed out to be acknowledged.
+
+    **"In-flight work" here means deliveries, not executions**, and the
+    distinction is the whole design. Waiting for the *tasks* to finish is
+    not an option a shutdown can offer: a `sleep` task may legitimately run
+    for the better part of an hour (`TASK_MAX_EXECUTION_SECONDS`), and no
+    termination grace period is going to cover that. Those tasks do not
+    need waiting for — they survive this process, because a lease is a row
+    and not a socket, and the worker renews them on `hello` against
+    whichever replica it lands on next (§3.0.13).
+
+    What genuinely dies with this process is the frame in the socket buffer
+    that has not been answered yet. A task delivered and not acked is
+    durably `ASSIGNED` with nobody visibly executing it, and recovering it
+    costs a full ack timeout — 30s by default, spent on a task a worker
+    would have picked up in milliseconds. That is the loss a drain can
+    actually prevent, and it usually takes a fraction of a second.
+
+    Returns what it observed rather than a verdict, so the caller can log
+    the honest number including the case where the window ran out.
+    """
+    started = time.monotonic()
+
+    def outstanding() -> int:
+        return sum(len(s.pending_acks) for s in _local_sessions.values())
+
+    at_start = outstanding()
+    while outstanding() and time.monotonic() - started < timeout:
+        await asyncio.sleep(_DRAIN_POLL_SECONDS)
+
+    return {
+        "sessions": len(_local_sessions),
+        "pending_acks_at_start": at_start,
+        "pending_acks_at_end": outstanding(),
+        "waited_seconds": round(time.monotonic() - started, 3),
+        "timed_out": bool(outstanding()),
+    }
 
 
 async def shorten_local_leases(worker_id: str, reason: str) -> int:

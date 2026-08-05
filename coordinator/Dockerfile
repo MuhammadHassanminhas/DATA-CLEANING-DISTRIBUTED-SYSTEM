@@ -24,5 +24,11 @@ ctx.check_hostname = False; \
 ctx.verify_mode = ssl.CERT_NONE; \
 urllib.request.urlopen('https://localhost:8443/health', context=ctx, timeout=3)"
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8443", \
-     "--ssl-certfile", "/certs/coordinator.crt", "--ssl-keyfile", "/certs/coordinator.key"]
+# Phase 3.5: `app.serve` is uvicorn with one behaviour added — a SIGTERM
+# drains before it closes (see that module's docstring). The listen
+# address, port and TLS paths that used to be CMD flags are now env vars
+# defaulting to exactly these values, so the container listens identically.
+#
+# Exec form, so the signal reaches PID 1 rather than a shell that would
+# swallow it and make the drain unreachable.
+CMD ["python", "-m", "app.serve"]

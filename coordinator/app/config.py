@@ -434,6 +434,26 @@ def lease_disconnect_grace_seconds() -> int:
     return int(os.environ.get("LEASE_DISCONNECT_GRACE_SECONDS", "30"))
 
 
+def shutdown_drain_seconds() -> float:
+    """How long a graceful shutdown may hold the process open to finish
+    what it has already handed out (Phase 3.5). **Recommendation, not a
+    measured value** — an upper bound on a wait that normally ends far
+    sooner, because it ends on the last ack rather than on the clock.
+
+    It is a *ceiling*, so the cost of setting it generously is paid only by
+    a shutdown that genuinely has work outstanding. What it must be smaller
+    than is the environment's kill deadline —
+    `terminationGracePeriodSeconds` in Kubernetes,
+    `stop_grace_period` in Compose — or SIGKILL arrives mid-drain and the
+    drain buys nothing. Both are set to 45 in this repo against this
+    default of 15, leaving room for the rest of shutdown.
+
+    Set it to 0 to exit as soon as the signal arrives, which is the
+    pre-3.5 behaviour.
+    """
+    return float(os.environ.get("SHUTDOWN_DRAIN_SECONDS", "15"))
+
+
 def task_max_attempts() -> int:
     """How many executions a task gets before it is terminally `FAILED`
     (Phase 3.2, gate default 3). Recommendation, not a measured value —

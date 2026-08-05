@@ -28,6 +28,18 @@ spec:
     metadata:
       labels: { app: coordinator }
     spec:
+      # Phase 3.5. Must exceed SHUTDOWN_DRAIN_SECONDS (code default 15,
+      # app/config.py) plus the rest of shutdown, or the kubelet SIGKILLs
+      # the pod partway through its drain and the drain buys nothing.
+      # Matches docker-compose's stop_grace_period so the kill deadline is
+      # the same number in both environments.
+      #
+      # **No preStop hook, deliberately.** The drain already flips /ready
+      # to 503 the moment SIGTERM lands, so the endpoints controller takes
+      # this pod out of the Service on its own; a preStop sleep would add a
+      # second mechanism doing the same job in one environment only, which
+      # is the Kubernetes-vs-Compose divergence §3.5 forbids.
+      terminationGracePeriodSeconds: 45
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

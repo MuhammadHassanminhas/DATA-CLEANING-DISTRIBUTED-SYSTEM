@@ -1476,17 +1476,309 @@ each replica, `\dt` in Postgres (six tables, no store), and
 - Rejections are logged and surfaced on the dashboard.
 
 **Exit criteria**
-- [ ] A result from a superseded attempt is rejected — verified by
-      deliberately reproducing it.
-- [ ] **A result submitted under a NEWER session epoch than the one it
+- [x] A result from a superseded attempt is rejected — verified by
+      deliberately reproducing it. **Both shapes reproduced live** —
+      §3.4.3.
+- [x] **A result submitted under a NEWER session epoch than the one it
       was executed under is ACCEPTED** — Step 2.5's measured reconnect
       path, asserted rather than assumed (amended by #169; previously "a
       result from an old session epoch is rejected", which would have
-      broken that path).
-- [ ] Rejected results leave task state untouched.
-- [ ] The worker handles rejection gracefully without crashing.
-- [ ] Rejections visible on the dashboard, not buried in logs.
-- [ ] **No protocol change was required** versus Phase 2.
+      broken that path). **Measured live: executed under epoch 7,
+      submitted on epoch 8, `COMPLETED`** — §3.4.3.
+- [x] Rejected results leave task state untouched — asserted column by
+      column, including `updated_at`.
+- [x] The worker handles rejection gracefully without crashing — against
+      the shipped worker, which **was not changed at all this step**.
+- [x] Rejections visible on the dashboard, not buried in logs — a fenced
+      tile on the task console and a `FENCED` row in the detail drawer.
+- [x] **No protocol change was required** versus Phase 2 — `git status`
+      shows zero changes under `worker/`.
+
+## 3.4.1 What was built
+
+**One rule, in one place**: `task_queue.complete_task` accepts a result if
+and only if the sender is the current `assigned_worker_id` **and** its
+`attempt_number` equals `tasks.attempt_count`. It is checked inside the
+`FOR UPDATE` lock the function already held, on two columns the row read
+already fetches. Anything else on a **live** task is `FENCED`.
+
+| Situation | Before 3.4 | After |
+|---|---|---|
+| Current assignee, current attempt | accepted | accepted |
+| Current assignee, an **earlier** attempt | **accepted — the defect** | **`fenced`** / `stale_attempt` |
+| A worker the task was reassigned away from, task still live | `not_owner` | **`fenced`** / `task_reassigned` |
+| A worker that never held the task | `not_owner` | `not_owner` — unchanged |
+| Any submission for a task already terminal | `duplicate` / `superseded` | unchanged — 3.3 answers first |
+| A result executed under an older session epoch | accepted | accepted — unchanged, and now asserted |
+
+Row 2 is the hole Step 3.3 named and left open. Row 3 is a shipped answer
+being corrected: `not_owner` is what §12 says to an **impostor**, and a
+worker that lost a race the design says it may lose is not one.
+
+Each fence writes **one `task_attempts` row** — outcome `FENCED`, the
+reason, the worker, the attempt number, and the task's own correlation id.
+No migration, no new table, no new Redis key, no protocol change.
+
+## 3.4.2 Four decisions this step made
+
+**1. `NOT_OWNER` is narrowed, not retired (#188).** Once fencing exists,
+"the row does not name you" covers two senders who deserve opposite
+answers: a worker whose task was reassigned mid-execution, and a worker
+naming a task that was never its own. The row alone cannot tell them
+apart — but Step 3.2 already writes the evidence, because **every
+reassignment records a `task_attempts` row naming the worker that lost the
+task**. So `_ever_held` asks one indexed question: is this worker the
+current assignee, or is it named in an attempt row for this task? A
+genuine loser is; an impostor is not.
+
+The alternative — answering `fenced` to everyone — was rejected because it
+would let any worker make the coordinator write rows about tasks it was
+never given, and would destroy the one signal that distinguishes an attack
+from a race.
+
+The lookup runs on the **refusing branch only**, and the current assignee
+short-circuits it, so the accepting path pays nothing and the
+stale-attempt path pays nothing either.
+
+**2. The attempt row is bounded, deliberately (#189).** `attempt_number`
+is worker-reported and therefore untrusted, and a submission is retried
+until it is acked. Two bounds:
+
+- the insert is `WHERE NOT EXISTS` on (task, worker, attempt, `FENCED`),
+  so twenty resubmissions of the same stale result write **one** row. It
+  is race-free because it runs under the task's `FOR UPDATE` lock;
+- a submission naming an attempt the task has **never reached** is fenced,
+  acked and logged, but writes **no row at all**. A `task_attempts` row is
+  a history, and a coordinator that writes worker-invented history is
+  worse than one that writes none.
+
+Together they cap the table at one fence row per (task, worker, real
+attempt) — a function of the work, not of how loudly a worker talks.
+
+**3. `FENCED` joins the credit-guarded set, not the unconditional one
+(#190).** A fenced worker's slot genuinely is free, so the credit must
+come back or losing a race would cost a worker capacity for the life of
+its session — the exact defect Decision #168 fixed on the neighbouring
+path. But `fenced` is reachable by naming a task id, so releasing
+unconditionally would hand any worker a way to free the slot of a task
+that is still running. It is therefore keyed on `task_id in
+session.credited`, the same discipline `handle_task_failed` and the
+malformed-result path already apply: a genuine id releases, a guessed one
+does not.
+
+**4. `FENCED` commits; every other refusal does not (#191).** It is the
+only outcome that writes without transitioning. Rolling the transaction
+back with the rest of the no-op would leave the fence provable only from
+one replica's log — which is precisely what the dashboard criterion
+forbids.
+
+**And one thing deliberately NOT done: `task_failed` is not fenced.** A
+stale `task_failed` from a superseded attempt of a task the same worker
+holds again would move it to terminal `FAILED`. It is not closed here
+because the message **does not carry `attempt_number`** — `task_result`
+has carried it since Phase 2.5 and `task_failed` never has — so fencing it
+means adding a field to the wire, and "no protocol change was required" is
+this step's own exit criterion. Stated rather than left to be found: the
+window is narrow (a `task_failed` is sent once, fire-and-forget, with no
+retry buffer to carry it across a reclaim, and the reclaim clears
+`assigned_worker_id`, so the shipped ownership guard already refuses it in
+every case except the same worker holding the task again). It belongs to
+whichever later step is willing to spend a protocol field.
+
+## 3.4.3 Measurements
+
+All against a real coordinator, worker, Postgres and Redis over TLS in
+Docker (project `dcds34`), plus a second worker container for the
+reassignment case. Suite **414 passed** (was 400 at 3.3), `ruff` clean.
+
+**`task_reassigned`, reproduced rather than described.** `sleep(40)`
+delivered to worker A; A was cut off the Docker network at t=6s, so the
+`task_cancel` the reclaim publishes had nowhere to go. The lease expired,
+the task was reclaimed three times, and worker B took attempt 3. A was
+reconnected at t=41s, finished the work it had never stopped doing, and
+submitted:
+
+```
+task_result_fenced  task_id=c4889798… worker=c02a976a…
+                    outcome=fenced attempt_number=0 session_epoch=2
+```
+
+and on the worker, from the **unmodified** shipped image:
+
+```
+task_result_refused  outcome=fenced  was_pending=true  pending=0
+```
+
+`GET /tasks/{id}` then showed four attempt rows — three `REASSIGNED`
+and one `FENCED` / `task_reassigned` — and `/tasks/depth` showed
+`"fenced_results": 1`. **The task itself reached `COMPLETED`.** Executed
+four times, completed once: at-least-once execution, exactly-once
+completion.
+
+**`stale_attempt`, the case 3.3 left open, reproduced twice.** Same cut,
+but with a single worker so the task can only come back to the worker that
+lost it, and the lease widened after the reclaim so no second reclaim
+intervenes. Recorded at 08:38:19 and 08:40:29 UTC, both:
+
+```
+attempt_number=0  outcome=FENCED  reason=stale_attempt
+worker=c02a976a…  ← the same worker the row names as the current assignee
+```
+
+with `coordinator_results_fenced_total{reason="stale_attempt"} 1.0` and
+`"fenced_results": 1`. Ownership cannot catch this one — the row names
+exactly the worker that is submitting.
+
+**A newer session epoch is ACCEPTED (the amended criterion).** `sleep(40)`
+running, the **coordinator** restarted mid-execution — Step 2.5's measured
+path. The worker reconnected under a new epoch and its result landed:
+
+```
+worker session epoch BEFORE: 7   AFTER: 8
+status: COMPLETED    attempt_count: 0    abnormal endings: []
+session_epoch in the stored envelope: 7   ← the epoch it EXECUTED under
+```
+
+Executed under 7, submitted on 8, accepted. Had the phase plan's original
+wording been implemented, this would have been a rejection.
+
+**No protocol change, checkable rather than asserted.** `git status` for
+this step lists eight files and **not one of them is under `worker/`**.
+The worker image the demo ran is the shipped one, and the ack payload is
+still exactly `{task_id, accepted, outcome}` — asserted by a test, so
+adding a field to it fails CI.
+
+**The metric resets and the count does not.** After a coordinator restart
+`coordinator_results_fenced_total` has **no series at all**, which is why
+the dashboard figure is a `count(*)` over `task_attempts` and not a scrape
+of the counter. That half is measured; the durability of the count itself
+is a property of the query and is asserted by the test suite, **not
+separately measured live** (§10).
+
+## 3.4.4 What running this step found
+
+**Step 3.2's `task_cancel` makes the stale-attempt fence hard to reach,
+and that is the system working.** Three deliberate attempts to reproduce
+it against a healthy socket all failed the same way, visible in the
+worker's own log:
+
+```
+task_cancel_received  reason=lease_expired  elapsed_seconds=13.868
+task_execution_cancelled
+```
+
+The worker cancels the superseded execution the moment it hears about the
+reclaim, so **no stale result is ever produced**. Fencing is only reached
+when the cancel cannot arrive — which is, by definition, the situation the
+task was reclaimed for. It is a backstop, not a hot path, and the two live
+reproductions above both required cutting the worker off the network first.
+
+Recorded honestly (§10): **the live reproduction of `stale_attempt` is
+timing-dependent and did not fire on every attempt.** Four later runs of
+the same recipe produced `task_reassigned` or no fence at all. The branch
+is deterministic in `tests/test_fencing.py` against a real Postgres; its
+live reachability is genuinely narrow, and that is a property of the
+design rather than a gap in it.
+
+**An asyncpg type-inference failure that only a real database finds.** The
+first version of the fence insert used `:outcome` in both the `SELECT`
+list and the `NOT EXISTS`, and asyncpg refused it:
+
+```
+AmbiguousParameterError: inconsistent types deduced for parameter $4
+DETAIL:  text versus character varying
+```
+
+Fixed with an explicit `CAST(:outcome AS text)` at both sites. Nothing
+short of executing the statement would have caught it.
+
+**One test assertion was too strong and said the opposite of the step.**
+The no-new-store test first asserted the Redis key set was *unchanged*
+across a fence storm. It shrank — `worker:{id}:current_tasks` goes away
+because the first fence correctly releases the credit — so asserting
+equality would have been asserting that the credit was **not** released.
+It now asserts that no key is *added*, which is the actual claim.
+
+## 3.4.5 What Step 3.4 deliberately does NOT do
+
+- **`task_failed` is not fenced** — see §3.4.2, it needs a protocol field.
+- **`task_started` is not fenced.** A stale `task_started` re-stamps
+  `started_at` and the lease for a task the same worker holds again. It
+  cannot complete or fail anything, and `mark_status` already refuses it
+  from any other worker.
+- **Nothing is done about a worker that lies about `attempt_number`
+  upward.** It is fenced, and no row is written; there is no penalty, no
+  quarantine and no counter of dishonest workers. Quarantine is §12's and
+  is not in this step.
+- **No dashboard tile for the two reasons separately.** The console shows
+  one `fenced results` count; the split lives on
+  `coordinator_results_fenced_total{reason}` and on each task's own
+  attempt rows.
+- **The fence is not surfaced on the fleet view**, only on the task
+  console and the task detail. Per-worker fencing rates are Step 3.7's if
+  they are wanted at all.
+
+## 3.4.6 Demo and failure demo
+
+One coordinator, one worker, Postgres and Redis. Shorten the lease so a
+reclaim takes seconds instead of a minute:
+
+```bash
+curl -k -X PUT https://localhost:$PORT/tasks/policies/sleep \
+  -H "X-Admin-Secret: $ADMIN_SECRET" -H 'Content-Type: application/json' \
+  -d '{"lease_ttl_seconds": 6, "max_execution_seconds": 300}'
+```
+
+**Failure demo 1 — fence a result from a reassigned attempt.** Start a
+second worker (its own identity volume — one volume per worker, see
+§3.3.4). Submit `sleep(40)`, find the holder in the task console, and cut
+it off the network so the cancel cannot reach it:
+
+```bash
+docker network disconnect <project>_default <holder-container>
+# watch the task go QUEUED -> the other worker -> RUNNING
+docker network connect <project>_default <holder-container>
+```
+
+The reconnected worker finishes and submits. Its log says
+`task_result_refused` with `outcome: fenced`; the coordinator's says
+`task_result_fenced`. **`docker pause` is not enough** — a paused worker's
+socket survives, so it reads the cancel on unpause and never produces a
+stale result.
+
+**Failure demo 2 — fence a stale attempt from the same worker.** One
+worker only. Same cut, then widen the lease before reconnecting so no
+second reclaim can deliver a cancel:
+
+```bash
+curl -k -X PUT .../tasks/policies/sleep -d '{"lease_ttl_seconds": 600, ...}'
+docker network connect <project>_default <worker>
+```
+
+The worker is re-delivered the same task as the current attempt while its
+original execution is still running; when that finishes, `GET /tasks/{id}`
+gains a `FENCED` / `stale_attempt` row. **This one is timing-dependent —
+see §3.4.4.**
+
+**Demo — see it in the browser.** `https://localhost:$DASHBOARD/ui/tasks`
+grows a **fenced results** tile as soon as the count is non-zero, and the
+task's detail drawer lists the `FENCED` row under "attempts that ended
+abnormally" with the sentence "a result arrived for this attempt after it
+had been superseded — refused, nothing written".
+
+**Demo — a newer session epoch is accepted.** Submit `sleep(40)`, then
+`docker restart` the **coordinator** while it runs. The worker reconnects
+under a new epoch, the result lands, and `GET /tasks/{id}` shows
+`attempt_count: 0`, no abnormal endings, and a stored envelope whose
+`session_epoch` is the **old** one.
+
+**Reads worth running:** `GET /tasks/depth` for `fenced_results`,
+`coordinator_results_fenced_total` by reason on `/metrics`, and
+
+```sql
+SELECT attempt_number, worker_id, outcome, reason
+  FROM task_attempts WHERE outcome = 'FENCED';
+```
 
 ---
 
@@ -1500,13 +1792,319 @@ each replica, `\dt` in Postgres (six tables, no store), and
 - Graceful shutdown that drains in-flight work.
 
 **Exit criteria**
-- [ ] Restarting all coordinator replicas loses no durable task record.
-- [ ] Tasks in flight at restart have a deterministic documented outcome.
-- [ ] Workers reconnect automatically without re-enrollment.
-- [ ] Restart with 100 workers and 1,000 queued tasks converges cleanly —
-      timed.
-- [ ] Rolling Kubernetes upgrade completes with no task loss.
-- [ ] Reconnect storm does not overwhelm the coordinator — measured.
+- [x] Restarting all coordinator replicas loses no durable task record —
+      **1,000 enqueued, 1,000 read back, 1,000 `COMPLETED`, 1,000 distinct
+      results** across a restart taken mid-drain (§3.5.3).
+- [x] Tasks in flight at restart have a deterministic documented outcome —
+      stated in §3.5.2 and measured in both shapes: a single `sleep(45)`
+      completed on its **original** worker at `attempt_count: 0`, and a
+      380-task fleet produced **zero redeliveries** (§3.5.3).
+- [x] Workers reconnect automatically without re-enrollment — **100
+      registrations for 100 workers across 200 sessions** (§3.5.3).
+- [x] Restart with 100 workers and 1,000 queued tasks converges cleanly —
+      timed. **Drain 30.9s after the restart; fleet back at p50 17.5s,
+      max 18.5s** (§3.5.3).
+- [ ] **Rolling Kubernetes upgrade completes with no task loss — NOT
+      VERIFIED.** The chart change it needs is made and renders
+      (`terminationGracePeriodSeconds: 45`), but no rollout was performed:
+      the AKS cluster was not started this step. Named, not waived —
+      §3.5.5 carries the exact command.
+- [x] Reconnect storm does not overwhelm the coordinator — measured.
+      **276 reconnect attempts from 100 workers, spread over 15.8–18.5s,
+      coordinator at 28.8% of one core, 0 rate-limited retries** (§3.5.3).
+
+## 3.5.1 What was built
+
+**Almost nothing, and that was the design gate's prediction.** §3.0.13
+committed Step 3.5 to needing *no startup scan*: recovery is the
+continuous reclaimer from 3.1 plus lease renewal on `hello`, both already
+shipped. That held. Re-read in full before writing any code and confirmed
+against the running system — the first bullet of this step's own brief,
+"startup recovery: reload durable task state, identify assignments with
+expired or unknown leases", is **already true continuously** rather than
+at boot, and building a boot-time scan would have added a second recovery
+path that has to agree with the first forever (the design the gate
+rejected in §3.0.2).
+
+What genuinely did not exist was the **fourth** bullet: graceful shutdown.
+Three pieces, one behaviour:
+
+| Piece | Where | What it does |
+|---|---|---|
+| The drain flag | `assignment.begin_drain` / `is_draining` | one-way, process-global, set from the signal handler |
+| The assignment gate | `assignment.assign_once` | returns 0 **before** the pass is counted or the database is touched |
+| The ack wait | `assignment.drain_local_sessions` | waits out this replica's unacknowledged deliveries, bounded |
+| The readiness answer | `main.ready` | 503 `draining` immediately, ahead of the dependency checks |
+| The entrypoint | `app/serve.py` (new) | intercepts SIGTERM, drains, then hands off to uvicorn's own exit |
+
+The container's `CMD` changed from `uvicorn app.main:app …` to
+`python -m app.serve`. The flags that used to live in that CMD are env
+vars defaulting to the identical values, so the listener is unchanged.
+
+## 3.5.2 Five decisions this step made
+
+**#194 — the drain waits for deliveries, not for executions.**
+The alternative, waiting for running tasks to finish, is not an option a
+shutdown can offer: `sleep` has a 3,900-second execution ceiling and no
+termination grace period is going to cover it. It is also unnecessary — a
+lease is a row and not a socket, so a task executing across the restart is
+renewed on `hello` against whichever replica the worker lands on next.
+What actually dies with the process is the **frame in the socket buffer
+that has not been answered**: a task durably `ASSIGNED` with nobody
+visibly executing it, recoverable only after a full
+`TASK_ACK_TIMEOUT_SECONDS`. That is the loss a drain can prevent, and it
+normally takes under a millisecond — **measured at 0.0s with a 45-second
+task running** (§3.5.3).
+
+**#195 — the signal is intercepted above FastAPI, not inside it.**
+The lifespan's post-`yield` code runs *after* uvicorn has already closed
+every WebSocket (recorded at that `yield` in `main.py` since Decision
+#21), so there is no hook inside the app that runs early enough. The
+alternatives were a Kubernetes `preStop` hook — rejected, because it would
+put half the behaviour in one environment only, which is exactly the
+Docker-vs-Internet divergence CLAUDE.md §3.5 forbids — or replacing
+uvicorn's signal handlers outright, rejected because the original handler
+is not reachable to chain to. Subclassing `uvicorn.Server` and overriding
+`handle_exit` keeps one code path for every environment and leaves the
+actual exit to uvicorn.
+
+**#196 — a second signal exits immediately.** An operator who has decided
+a coordinator must stop *now* is answering a question this module cannot
+see, and a shutdown that ignores the second Ctrl-C is one people learn to
+`kill -9` instead. The interruption is logged rather than silent.
+
+**#197 — draining changes what a replica *starts*, never what it
+*finishes*.** The reclaimer keeps reclaiming, results are still accepted,
+progress is still recorded, `/health` still answers. Only `assign_once`
+and `/ready` change. A drain that switched recovery off would take the
+reclaimer out at the exact moment its own workers' tasks are about to need
+it — a fault-tolerance regression dressed as a feature. There is a test
+for this specifically.
+
+**#198 — no minimum drain, and the residual is named rather than
+papered over.** The drain ends on the last ack, so with nothing
+outstanding a replica can be gone in ~180ms — before an endpoints
+controller has necessarily propagated its removal. A worker can therefore
+briefly dial a coordinator that is already gone. It gets a refused
+connection and retries on the backoff it would have used anyway, so the
+cost is bounded by one reconnect and there is **no task loss**: leases are
+durable. A minimum-hold knob was rejected as a number nobody has measured
+a need for. **In a rolling upgrade this window does not arise at all** —
+the pod is *deleted*, and endpoint removal on deletion is immediate and
+parallel with SIGTERM rather than waiting on a probe.
+
+## 3.5.3 Measurements
+
+Local Docker Compose project `dcds35`, stock configuration — coordinator,
+dashboard, worker, Postgres and Redis over TLS. Every number below is
+**measured**, from the coordinator's own logs, its `/metrics`, or its
+tables. **Not a Kubernetes measurement**: see the unmet criterion above.
+
+**A 45-second task does not hold shutdown open.** `sleep(45)` `RUNNING`
+on the one worker, then `docker compose stop coordinator`:
+
+| Event | Timestamp |
+|---|---|
+| `shutdown_drain_started` (signal 15, window 15.0s) | 11:02:16.421104 |
+| `shutdown_drain_complete` — `pending_acks_at_start: 0`, `waited_seconds: 0.0`, `timed_out: false` | 11:02:16.421810 |
+| `coordinator stopped` | 11:02:16.597534 |
+
+**176 milliseconds, end to end, with a 45-second task in flight.** The
+drain window was available and went unused, which is the claim in #194
+demonstrated rather than described.
+
+**That task's outcome, which is the deterministic-outcome criterion.**
+The coordinator was away for 22 seconds. The worker reconnected on its
+existing identity (`worker_connected`, `session_epoch: 1 -> 2`, no
+registration), the coordinator renewed its lease from the *database*
+(`task_leases_renewed_on_hello`, `tasks: 1`), and the task finished on the
+worker that had been running it the whole time:
+
+```
+status COMPLETED · attempt_count 0 · attempts [] · completed_at 11:02:44.104
+```
+
+**No reassignment, no second execution, no abnormal ending.**
+
+**The drain does wait when there is something to wait for.** Worker
+`docker pause`d so it could not acknowledge, one task delivered, then
+stop:
+
+| | |
+|---|---|
+| `pending_acks_at_start` | **1** |
+| `waited_seconds` | **15.053** (the full window) |
+| `timed_out` | **true** |
+| container exit code | **0** — not 137, so no SIGKILL inside the 45s deadline |
+
+and `/ready` polled once a second throughout:
+
+```
+t+1s 200 {"status":"ready",...}
+t+2s … t+12s   503 {"status":"draining","checks":{}}
+```
+
+**The restart run — 100 workers, 1,000 tasks, restarted mid-drain.**
+`scripts/loadtest.py restart`, `sleep(5)` workload, restart fired 6s in.
+All eight checks pass:
+
+| | |
+|---|---|
+| in flight at the restart | **380 delivered, 34 completed** |
+| restart command | `docker compose restart coordinator`, 5.665s, rc 0 |
+| read back | **1,000 rows / 1,000 distinct / 1,000 COMPLETED / 1,000 results** |
+| **redeliveries** | **0** |
+| registrations vs sessions | **100 / 200** — every worker reconnected, none re-enrolled |
+| reconnect distribution | min 15.76s, p50 **17.50s**, p95 17.95s, max 18.47s |
+| reconnect attempts | 276 |
+| drain after restart | 30.9s; queue 548 → 0 |
+| throughput over the whole run | 26.7 tasks/s |
+| coordinator CPU | **28.8% of one core**, RSS 113 MB |
+| rate-limited retries | **0** |
+
+**Read the reconnect numbers honestly.** The fleet came back inside a
+2.7-second band, which is jitter doing its job — but the *floor* is 15.8s,
+not one second, because the coordinator was genuinely unreachable for
+several seconds and each failed attempt doubles the backoff. That is the
+shipped worker's own `WS_BACKOFF_*` shape (the harness uses the same three
+numbers deliberately), so it is what a real fleet would do. It is a
+property of the backoff, not of this step, and it is the price of not
+having a herd.
+
+## 3.5.4 What running this step found
+
+**1. `converge_seconds` measured 0.0 and that was almost a misleading
+number.** The harness first reported "time for the fleet to converge"
+measured *after* the queue drained — by which point everyone was already
+back, so it read 0.0 for a run whose real reconnect time was 17.5s. It is
+now named `converge_after_drain_seconds` with the reading spelled out in
+the report itself, and the actual distribution lives in
+`reconnect.seconds`. A number that is technically true and reads as
+flattering is worse than no number.
+
+**2. `docker pause` is the right tool here, unlike in Step 3.4.** 3.4
+found that pausing a worker does not produce a stale result, because the
+socket survives and the cancel is read on unpause. For *this* step the
+same property is exactly what is wanted: a paused worker holds a delivery
+open without acknowledging it, which is the only way to reach the drain's
+timeout path deliberately.
+
+**3. Every simulated worker logged an error, and that is correct.** The
+report's `errors_after_first_connect: 100` is one `WinError 10053` per
+worker — the connection aborted when the coordinator went away. Reported
+rather than swallowed, because a *persistent* error after the fleet came
+back would otherwise hide behind a successful drain.
+
+**4. The harness's `tasks_in_flight` on reconnect was wrong in its first
+form.** It computed `received - completed - refused`, but a refused task
+is never added to `received`, so refusals were subtracted twice and a
+reconnecting worker would have under-declared what it was holding —
+inviting the coordinator to over-credit it. Now `received - completed`.
+
+## 3.5.5 What Step 3.5 deliberately does NOT do
+
+- **No rolling Kubernetes upgrade was performed.** The cluster was not
+  started. The chart carries `terminationGracePeriodSeconds: 45` and
+  renders, and the drain is environment-independent by construction
+  (#195), but **neither of those is the criterion**. To close it:
+  ```bash
+  az aks start -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+  kubectl -n staging rollout restart deploy/coordinator
+  kubectl -n staging rollout status deploy/coordinator
+  # with scripts/loadtest.py restart pointed at the public ingress and
+  # --restart-command "kubectl -n staging rollout restart deploy/coordinator"
+  ```
+- **No startup scan, no boot-time recovery, no leader election.** §3.0.13,
+  and §3.5.1 above.
+- **No minimum drain hold** — #198, with the residual named.
+- **No drain for the dashboard or the worker.** The dashboard is
+  stateless and holds no task; the worker's own shutdown path
+  (`/workers/release`) shipped in Phase 1.
+- **`task_failed` and `task_progress` in flight are not waited for**, only
+  unacknowledged *deliveries*. A result frame lost to the close is retried
+  by the worker and answered `duplicate` or `superseded` by Step 3.3.
+- **No metric for how long a drain took.** The gauge is binary
+  (`coordinator_draining`); the duration is in the structured log, because
+  a value the process emits once and then exits is not something a scrape
+  interval can be relied on to catch.
+- **No thundering-herd mitigation was added.** The step's brief says
+  "mitigation via the Phase 1 backoff and jitter" — that is a statement
+  that the existing mechanism suffices, and the 276-attempt / 2.7-second
+  spread is the evidence. Nothing new was built.
+- **No new dashboard element, and this is worth stating against §6.**
+  What 3.5 makes watchable is a restart the task console rides out — the
+  queue, the running tasks and the fleet are all already on screen and
+  Demo 3 is performed in the browser. A "which replicas are draining"
+  panel would need a replica inventory the coordinator does not expose,
+  and per-replica views are Step 3.7's. `coordinator_draining` covers the
+  operator's question in the meantime.
+
+## 3.5.6 Demo and failure demo
+
+Stock stack, one coordinator, one worker.
+
+**Demo 1 — a running task does not delay shutdown, and survives it.**
+```bash
+curl -k -X POST https://localhost:$PORT/tasks \
+  -H "X-Admin-Secret: $ADMIN_SECRET" -H 'Content-Type: application/json' \
+  -d '{"task_type":"sleep","parameters":{"seconds":45}}'
+# wait until GET /tasks/depth shows RUNNING: 1, then
+docker compose -p $PROJECT stop coordinator
+docker compose -p $PROJECT start coordinator
+```
+The stop returns in well under a second. `docker logs` shows
+`shutdown_drain_started` and `shutdown_drain_complete` with
+`waited_seconds: 0.0`. After the restart, `GET /tasks/{id}` reaches
+`COMPLETED` with `attempt_count: 0` and an empty attempts list — the same
+worker finished it.
+
+**Demo 2 — the drain waits, and the pod goes unready first.**
+```bash
+docker pause $PROJECT-worker-1
+curl -k -X POST .../tasks -d '{"task_type":"sleep","parameters":{"seconds":5}}'
+# GET /tasks/depth now shows ASSIGNED: 1 — delivered, never acknowledged
+docker compose -p $PROJECT stop coordinator &
+for i in $(seq 1 12); do curl -sk -o /dev/null -w "%{http_code}\n" \
+  https://localhost:$PORT/ready; sleep 1; done
+docker unpause $PROJECT-worker-1
+```
+`200` once, then `503 {"status":"draining"}` for the whole window, and the
+log ends `waited_seconds: 15.053, timed_out: true`. `docker inspect`'s
+`.State.ExitCode` is **0**, not 137.
+
+**Demo 3 — watch it in the browser.** With the dashboard open at
+`/ui/tasks`, run Demo 1. The queue and the running task are visible
+throughout; the console keeps polling and simply shows the coordinator
+gone and back. `coordinator_draining` on `/metrics` is `1.0` during a
+drain and has **no series at all** after the restart, since the process
+that exported it is gone.
+
+**Failure demo — turn the drain off and watch what 3.5 added.** Same
+stack, `SHUTDOWN_DRAIN_SECONDS=0`, which is the pre-3.5 behaviour on the
+same image:
+```bash
+docker compose -p $PROJECT --env-file <env with SHUTDOWN_DRAIN_SECONDS=0> \
+  up -d coordinator
+# stage an unacknowledged delivery exactly as in Demo 2, then stop and poll
+```
+Measured: **zero `shutdown_drain_started` events**, `/ready` answering
+**200** on the last poll before the process disappeared — never `503`,
+never `draining` — and the socket closed with the delivery still
+unacknowledged. Side by side with Demo 2's twelve seconds of `503`, that
+is the whole of what this step is.
+
+**The 100-worker run, if you want it yourself:**
+```bash
+python scripts/loadtest.py restart \
+  --url https://localhost:$PORT --insecure \
+  --enrollment-secret "$ENROLLMENT_SECRET" --admin-secret "$ADMIN_SECRET" \
+  --workers 100 --tasks 1000 --task-type sleep --parameters '{"seconds":5}' \
+  --restart-after 6 \
+  --restart-command "docker compose -p $PROJECT restart coordinator"
+```
+It prints `PASS` or names the failing checks. It refuses to run without
+`--restart-command`, because a restart scenario that restarts nothing is a
+burst with extra words and would report green.
 
 ---
 

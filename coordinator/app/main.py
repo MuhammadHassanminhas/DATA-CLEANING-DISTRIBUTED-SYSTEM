@@ -41,6 +41,7 @@ from app.assignment import (
     handle_task_progress,
     handle_task_result,
     handle_task_started,
+    is_draining,
     log_unacknowledged,
     notification_listener,
     notify_work_available,
@@ -116,6 +117,7 @@ from app.task_queue import (
     counts_by_status,
     dequeue,
     enqueue_batch,
+    fenced_result_count,
     get_task,
     list_tasks,
     purge_expired_results,
@@ -347,6 +349,20 @@ async def ready(response: Response) -> dict[str, object]:
     Checks every external dependency directly rather than trusting
     cached state, since nothing authoritative is held in memory.
     """
+    # Phase 3.5. A draining replica is *healthy* and not *ready*, and the
+    # split is the point: `/health` keeps answering, so the liveness probe
+    # never restarts a pod that is deliberately shutting down, while
+    # `/ready` fails immediately so the Service and the ingress stop
+    # sending it new workers before its sockets close.
+    #
+    # Answered before the dependency checks rather than after, because the
+    # answer cannot change: no result from Postgres or Redis makes a
+    # draining replica ready again, and a shutdown should not be spending
+    # its window on queries whose outcome it will ignore.
+    if is_draining():
+        response.status_code = 503
+        return {"status": "draining", "checks": {}}
+
     checks: dict[str, str] = {}
     healthy = True
 
@@ -1568,6 +1584,14 @@ async def task_queue_depth(
     grouped scan, not the cheap path; `depth` is the index range count.
     Both are recomputed from Postgres per call — nothing is cached here,
     so every replica answers identically (§3.9).
+
+    **Phase 3.4 adds `fenced_results`**, and it belongs here rather than on
+    an endpoint of its own for the reason `counts` does: this is the read
+    the task console already polls, so a fenced result becomes visible
+    without a second request and without an operator having to know which
+    task to open. It is strictly the cheaper of the two scans this handler
+    already performs — `task_attempts` holds one row per abnormal ending
+    where `tasks` holds every task there has ever been.
     """
     rejection = await _operator_guard(
         request, response, secret=x_admin_secret, event="task_depth"
@@ -1578,8 +1602,9 @@ async def task_queue_depth(
     async with get_session() as session:
         depth = await queue_depth(session)
         counts = await counts_by_status(session)
+        fenced = await fenced_result_count(session)
 
-    return {"depth": depth, "counts": counts}
+    return {"depth": depth, "counts": counts, "fenced_results": fenced}
 
 
 @app.get("/tasks/throughput")

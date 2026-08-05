@@ -226,6 +226,42 @@ none and use `updated_at`, which is correct because a terminal state is the
 last write the row receives. A task created before this feature shipped has
 no `started_at`, so its `RUNNING` entry is **absent rather than invented**.
 
+**About `attempts`** (Phase 3.2, extended in 3.4). One entry per attempt of
+this task that ended **abnormally**, oldest first. A task that has run
+cleanly has `[]` — this records endings, not history, so an empty list is a
+fact about the task rather than a gap.
+
+```json
+"attempts":[
+  {"attempt_number":0,"worker_id":"ae0c0a8d-…","outcome":"REASSIGNED",
+   "reason":"lease_expired","recorded_at":"2026-08-05T09:14:02.117+00:00",
+   "correlation_id":"9bb2cd64-…"},
+  {"attempt_number":0,"worker_id":"ae0c0a8d-…","outcome":"FENCED",
+   "reason":"stale_attempt","recorded_at":"2026-08-05T09:14:51.884+00:00",
+   "correlation_id":"9bb2cd64-…"}]
+```
+
+| `outcome` | `reason` | Meaning |
+|---|---|---|
+| `REASSIGNED` | `lease_expired` | the worker stopped answering; the task went back to the queue |
+| `REASSIGNED` | `execution_deadline_exceeded` | the worker was slower than its type's execution cap |
+| `FAILED` | either of the above | the same, but the attempts had run out — the task is terminally `FAILED` |
+| `FENCED` | `stale_attempt` | a result arrived from an **earlier attempt** of a task this worker holds again; refused, nothing written |
+| `FENCED` | `task_reassigned` | a result arrived from a worker the task had been reassigned away from; refused, nothing written |
+| `EXPIRED` | `stranded_pre_m3` | closed by migration `0006`'s backfill, before the lease engine existed |
+
+The two `FENCED` rows are the only entries here that record a **refusal**
+rather than something the coordinator did to an attempt. Both mean real
+work was computed and then discarded, and neither changes the task's state
+— the task is still live and some attempt of it will still run to
+completion.
+
+At most one `FENCED` row exists per (task, worker, attempt number), however
+many times the submission is retried. `attempt_number` is worker-reported
+and therefore untrusted, so a submission naming an attempt the task has
+never reached is refused **without** writing a row: the coordinator will
+not record a history that did not happen.
+
 **`result` is `null` after the retention period** (`RESULT_RETENTION_DAYS`,
 default 7). The task row survives forever as the audit trail; only the body
 expires. That is documented behaviour, not a lost result — `completed_at`
@@ -273,12 +309,29 @@ its status is read, so a task is never both cancelled and handed out.
 ### 5.5 `GET /tasks/depth` — queue depth and lifecycle counts
 
 ```json
-{"depth":376,"counts":{"QUEUED":376,"ASSIGNED":1,"COMPLETED":626,"CANCELLED":1}}
+{"depth":376,"counts":{"QUEUED":376,"ASSIGNED":1,"COMPLETED":626,"CANCELLED":1},
+ "fenced_results":0}
 ```
 
 `depth` is the cheap index count of queued work — measured at 2.4 ms
 against 320,025 rows. `counts` groups the whole table and is the more
 expensive read; they are separate so the cheap path stays cheap.
+
+`fenced_results` (Phase 3.4) is how many result submissions have been
+refused because the attempt that produced them had been superseded. It is
+here rather than on an endpoint of its own because this is the read the
+task console already polls, and a fenced result leaves **no trace in any
+lifecycle state** — nothing in `counts` moves when one happens, so without
+this field a discarded result would be findable only by opening the right
+task or grepping one replica's logs.
+
+Counted from `task_attempts`, not from the Prometheus counter, so every
+replica answers identically and the figure survives a restart. It is the
+cheaper of this endpoint's two scans: `task_attempts` holds one row per
+**abnormal** ending where `tasks` holds every task there has ever been.
+
+Which submissions were fenced, and why, is on `GET /tasks/{id}` under
+`attempts` — outcome `FENCED`, reason `stale_attempt` or `task_reassigned`.
 
 ### 5.6 `GET /tasks/throughput` — completions per minute
 
