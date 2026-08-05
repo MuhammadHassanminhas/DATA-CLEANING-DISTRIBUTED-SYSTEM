@@ -2118,11 +2118,435 @@ building checkpointing machinery nobody needs. Document what would
 change for real SQL workloads later, without building it.
 
 **Exit criteria**
-- [ ] Policy stated with alternatives and reasoning.
-- [ ] If checkpointing is deferred, deferral is explicit and justified.
-- [ ] Re-execution safety established — dummy tasks verified pure.
-- [ ] Repeated re-execution produces identical results — verified.
-- [ ] Forward path for future stateful workloads noted, not built.
+- [x] Policy stated with alternatives and reasoning — §3.6.1, Decision
+      **#200**, three alternatives compared.
+- [x] Checkpointing deferral explicit and justified — §3.6.3, with the
+      three things that would have to be built and what each would cost.
+- [x] Re-execution safety established — dummy tasks verified pure.
+      Enforced by `tests/test_reexecution.py`, at runtime (`open` and
+      `socket.socket` denied during execution) and statically (an import
+      allowlist over `worker/executors.py`), and **both checks were
+      confirmed to fail against a deliberately impure executor** (§3.6.5).
+- [x] Repeated re-execution produces identical results — verified on the
+      running system. **Seven executions of one workload across two
+      workers, one digest**, matching a value computed outside the
+      repository. `sleep` is the stated exception and is duration-valued
+      (Decision **#201**, §3.6.4).
+- [x] Forward path for future stateful workloads noted, not built —
+      §3.6.7.
+
+---
+
+# Step 3.6 — the decided policy (2026-08-05)
+
+**Status: BUILT and VERIFIED, AWAITING APPROVAL.** Decisions
+**#200–#203**. Suite **438 passed** (was 426 at 3.5). **No production
+code was changed: the twelve new tests and this document are the whole
+step**, and `git diff --stat` against `phase-3.5-restart-recovery` shows
+nothing under `coordinator/`, `worker/`, `dashboard/`, `protocol/`,
+`infra/` or `alembic/`.
+
+That is the honest outcome rather than a thin one, and this step's own
+brief predicted it: *"For V1 dummy workloads, full re-execution is likely
+correct — the tasks are pure and side-effect free. If so, say so and
+justify it rather than building checkpointing machinery nobody needs."*
+The work of the step was to establish whether the premise is true, and
+that turned out to be less obvious than it reads (§3.6.5).
+
+## 3.6.1 The policy
+
+**An interrupted attempt is discarded in full. The task is re-executed
+from the beginning by whoever gets it next. Nothing of the abandoned
+attempt is kept, resumed, credited or merged.**
+
+Written out against the mechanisms that already exist:
+
+| Question | The policy's answer | Where it is already enforced |
+|---|---|---|
+| What happens to a partial execution when the lease expires? | It is abandoned. The worker is told to stop (`task_cancel`) purely to save CPU, and nothing waits for that message. | `assignment.cancel_on_worker`, gate §3.0.6 |
+| What does the next attempt start from? | The original parameters, unchanged. | `_deliver` sends `task["parameters"]`, not any accumulated state |
+| Where would partial state be stored? | Nowhere. No column, no Redis key, no message type carries it. | schema §3.0.7 — `tasks` has `attempt_count`, never a checkpoint |
+| What if the abandoned attempt finishes anyway and reports? | Refused — `fenced` while the task is live (3.4), `superseded` once another attempt has completed it (3.3). | `results.complete_task` |
+| What is lost? | CPU, and only CPU. **Measured: 28.799 seconds of it** in §3.6.4. | — |
+| What is the guarantee? | Unchanged from the gate: **at-least-once delivery with idempotent completion**. Re-execution is what "at-least-once" *means* here. | §3.0.5 |
+
+The policy is therefore not new behaviour. It is the name for behaviour
+Steps 3.1–3.4 already produce, made explicit and — this is the part that
+needed work — **verified rather than assumed**.
+
+## 3.6.2 Four decisions this step made
+
+**#200 — Discard and re-execute in full. No checkpointing, no partial
+result accumulation.**
+Alternatives: (a) executor-level checkpoint and resume, with the
+coordinator storing the partial state a worker sends up; (b) split a task
+into idempotent segments the coordinator tracks individually, so a
+reassignment resumes at a segment boundary; (c) discard and re-execute.
+Chose (c). (a) needs a place to put partial state (a column or a new
+table), a message type to carry it, a size cap and a retention rule for
+partial state that no attempt ever comes back for, and — worst — it makes
+the coordinator trust worker-supplied state as *input to the next
+execution*, which §12 forbids and which fencing exists precisely to avoid.
+(b) is a bigger version of the same thing and additionally requires every
+workload to be decomposable, which is a property of real SQL work and not
+of `count_to_n`. Both would add a **second recovery path**, and gate
+§3.0.2 rejected having two on the ground that the one that runs rarely is
+the one that is broken. (c) costs the CPU of the abandoned attempt, and on
+V1 workloads that is the whole bill.
+
+**#201 — `sleep` is duration-valued, and the criterion is stated against
+that rather than the criterion being made to look met.**
+`run_sleep` returns *measured* elapsed time, so two executions of
+`sleep(0.3)` do not return the same float, and the exit criterion's words
+("repeated re-execution produces identical results") are false for it as
+written. Alternatives: (a) change `run_sleep` to return the requested
+duration, making all four types bit-identical; (b) exclude `sleep` from
+the claim and say why. Chose (b). (a) would be editing the system so a
+document could make a cleaner claim — it would delete a genuine
+measurement (the docstring in `executors.py` argues for it explicitly:
+"the result reflects what happened rather than what was asked"), it would
+touch `worker/` in a step that needs to touch nothing, and it would buy
+nothing operationally: **the coordinator stores the result body and
+compares it against nothing**, so a duration that differs between attempts
+has no consumer. What *is* asserted for `sleep`, and is the property the
+policy actually needs, is that a re-execution sleeps the **whole**
+requested duration rather than the remainder (§3.6.4).
+
+**#202 — Purity is enforced by tests, not by convention.**
+Alternatives: (a) document that executors must stay pure and rely on
+review; (b) enforce it mechanically. Chose (b), two ways, because they
+fail at different times: a runtime check that makes `open` and
+`socket.socket` raise for the duration of an execution catches an
+executor that *does* something, and a static import allowlist over
+`worker/executors.py` catches an import that is added now and used two
+phases later. The allowlist is eight modules
+(`base64 binascii hashlib json threading time typing __future__`);
+adding `os`, `random`, `pathlib`, `socket` or `requests` fails CI, which
+makes widening it a deliberate act with a reviewer attached.
+
+**#203 — Re-execution safety is evidenced by the WORK DONE, not by the
+result value.**
+This one was forced by a mutation check rather than chosen up front, and
+§3.6.5 tells it as it happened. For a pure workload a resumed execution
+and a restarted one return **the same answer**, so an assertion on the
+result cannot distinguish them: a mutant that saved the partial digest and
+continued from it passed a known-answer assertion cleanly. The tests
+therefore count chunk boundaries — a full re-execution of 100,000 in
+chunks of 1,000 reports 100 progress fractions starting at 0.01, a resumed
+one would report fewer and start higher — and the same reasoning is what
+makes the live measurement in §3.6.4 meaningful.
+
+## 3.6.3 Checkpointing: deferred, and what deferring it costs
+
+**Deferred deliberately, not overlooked.** Three things would have to
+exist before a checkpoint could be honoured, and none of them is cheap:
+
+1. **A place to put partial state.** Either a column on `tasks` — which
+   is the queue's hot path under Decision #79, so widening its rows costs
+   throughput on every claim — or a new table with its own retention
+   sweep for partial state belonging to attempts that never return.
+2. **A protocol message to carry it**, with a size cap of its own. The
+   result envelope already has one (`TASK_RESULT_MAX_BYTES`) because a
+   worker is untrusted; a checkpoint would need the same treatment plus a
+   frequency limit, since checkpoints arrive *during* execution rather
+   than once at the end.
+3. **A trust decision this project has already made the other way.**
+   Resuming from a checkpoint means feeding worker-supplied state back
+   into an execution as input. §12 says every worker is untrusted, and
+   Steps 3.3 and 3.4 exist entirely to stop worker-supplied state being
+   accepted when it should not be. Checkpointing would introduce a
+   worker-supplied input with no equivalent of the fence to guard it.
+
+**What the deferral costs today, stated as a number rather than as a
+shrug: one abandoned attempt's CPU per reassignment.** In §3.6.4 that is
+**28.799 seconds** of hashing thrown away — the whole of an attempt whose
+result arrived and was refused. On a fleet where reassignment is rare that
+is the correct trade; on one where it is common the fix is to find out why
+leases are expiring, not to build resume.
+
+**The condition that would reverse this decision** is stated so a later
+phase can test for it rather than re-argue it: a workload where
+re-execution is *not* free — because it is long enough that redoing it
+misses a deadline, or because it has side effects that must not happen
+twice. Neither is reachable in V1: CLAUDE.md §2 permits four pure dummy
+workloads and nothing else, and every one is bounded by
+`DEFAULT_MAX_EXECUTION_SECONDS`.
+
+## 3.6.4 Measurements
+
+**Environment, declared before the numbers (§10).** One 4-core laptop,
+Docker Compose project `dcds36`, **two** workers (`worker-1` and a second
+container `worker-b` with its own identity volume), and a **deliberately
+tuned** coordinator: `TASK_LEASE_TTL_SECONDS=10`,
+`LEASE_DISCONNECT_GRACE_SECONDS=3`, `LEASE_RECLAIM_INTERVAL_SECONDS=2`,
+`TASK_RETRY_EXCLUSION_SECONDS=5`, `TASK_RETRY_BACKOFF_BASE_SECONDS=1`,
+`WORKER_MAX_CONCURRENT=2`. Those are **not** the shipped defaults — they
+shorten a reassignment demo from minutes to seconds. **Nothing below is a
+measurement of the shipped configuration's timings**; what is being
+measured here is which *values* come out, and those are configuration
+independent.
+
+**The workload is `hash_rounds` with `rounds: 10000000, algorithm:
+sha256`**, chosen because its answer is a known quantity: iterated SHA-256
+from a 32-zero-byte seed.
+
+**Independently computed, outside the repository, with a plain
+`hashlib` loop rather than the executor's chunked one:**
+
+```
+6b4ab10d92373474a97d10639e667f6b734af012f9be29997f1befd1c7166199
+```
+
+### The reassignment: one task, three executions, one answer
+
+Task `941b3aad`, submitted at 13:08:29 UTC. The holding worker's container
+was **disconnected from the Docker network 4 seconds in**, while it was
+executing — `docker pause` is not enough, because Step 3.4 found a paused
+worker reads the cancel on unpause and stops.
+
+| t | What happened | Evidence |
+|---|---|---|
+| +3s | `RUNNING` on worker `a80a9c3f` (A) | `GET /tasks/{id}` |
+| +4s | A cut off the network. It keeps computing. | `docker network disconnect` |
+| +10.5s | Lease expired and reclaimed, **`overdue_seconds: 0.437`**, `excluded_worker_id: a80a9c3f` | coordinator `task_lease_expired` |
+| +11.4s | Attempt **1** delivered to worker `0852497f` (B), which **starts from the beginning** | `assigned_at 13:08:40.520` |
+| +38.6s | `COMPLETED` by B, `duration_seconds: 27.206` | `GET /tasks/{id}` |
+| +50.9s | A, reconnected, submits the result of the attempt it finished anyway → **refused `superseded`** | coordinator `task_result_not_applied outcome=superseded attempt_number=0` |
+
+**The three executions and their fingerprints** (Decision #106's 12-hex
+result fingerprint, from the workers' own logs):
+
+| Execution | Worker | Elapsed | Fingerprint |
+|---|---|---|---|
+| An earlier, uninterrupted task of the same shape | A | 13.597s | `2c7324ca2eca` |
+| Attempt 0 — abandoned, finished anyway, refused | A | **28.799s** | `2c7324ca2eca` |
+| Attempt 1 — the full re-execution that counted | B | 27.206s | `2c7324ca2eca` |
+
+The stored result body is `6b4ab10d92…`, **identical to the independently
+computed digest**, with `attempt_number: 1` and `session_epoch: 2`. The
+task's `attempts` array carries exactly one row —
+`attempt_number: 0, worker_id: a80a9c3f, outcome: REASSIGNED, reason:
+lease_expired` — and `GET /tasks/depth` reports `fenced_results: 0`,
+because a late result for a task that has already **completed** is 3.3's
+`superseded`, not 3.4's fence. The two answers are ordered, and this run
+shows the ordering rather than describing it.
+
+**Why 27.206s and not 13.597s, said plainly:** both workers were computing
+the same 10,000,000 rounds simultaneously on a 4-core laptop. The
+re-execution was slowed by contention, **not** by any per-attempt
+overhead. It is quoted rather than tuned away because tuning it would mean
+not running the abandoned attempt, which is the thing being demonstrated.
+
+### Repeated execution: four identical tasks, one digest
+
+Four separate tasks with identical parameters, submitted in one call
+(`count: 4`) and spread across both workers:
+
+| Task | Worker | Attempt | Duration | Idempotency token | Digest |
+|---|---|---|---|---|---|
+| `feb79b1f` | B | 0 | 29.992s | `c2804322` | `6b4ab10d92…` |
+| `de1adc1c` | A | 0 | 27.427s | `7bcf2c47` | `6b4ab10d92…` |
+| `c8fdca6f` | B | 0 | 29.993s | `da069d3e` | `6b4ab10d92…` |
+| `410dc2d4` | A | 0 | 27.384s | `2673f690` | `6b4ab10d92…` |
+
+**1 distinct digest, 4 distinct idempotency tokens.** The tokens matter:
+they prove these were four genuine executions rather than one result
+deduplicated four ways, which is exactly the confusion Step 3.3's
+machinery could otherwise create.
+
+**Totals across the step: seven executions of the workload on two
+different workers produced one value**, and that value was computed
+independently before any of them ran. Final ledger for the demo stack:
+`{"depth": 0, "counts": {"COMPLETED": 6}, "fenced_results": 0}`.
+
+### The unit-level evidence
+
+`tests/test_reexecution.py`, 12 tests, in the suite:
+
+- Three runs of each value-deterministic type return an identical value
+  **and an identical fingerprint** — the fingerprint too, because that is
+  what a live run logs, so a determinism claim that held for the value but
+  not for its canonical JSON could not be checked from a log.
+- A `count_to_n` cancelled after exactly 3 chunks (a deterministic cancel
+  flag, not a timer) is redone in **100** chunks starting at 0.01, and
+  returns `n`.
+- A `hash_rounds` cancelled after 5 chunks is redone in **100** and
+  reaches `SHA256_1000_ROUNDS`, the vector `test_executors.py` computed
+  independently.
+- Execution with `open` and `socket.socket` replaced by a raising stub
+  succeeds for all four types.
+- `worker/executors.py`'s imports are within the eight-module allowlist.
+- Concurrent execution in a thread pool agrees with serial execution,
+  three times over — the property one worker running several tasks in one
+  process depends on.
+- **On the real worker path**: a `sleep(1.0)` cancelled at ~0.3s reports
+  `capacity` and **no result**, and when the same task id is delivered
+  again the second execution runs a **full** second (`result >= 1.0`,
+  `duration_seconds >= 1.0`) rather than the 0.7s a resume would take, and
+  `runner.running` is empty afterwards.
+- `sleep`'s two executions are asserted to agree only within 0.5s and to
+  each meet their requested duration — the honest form of the criterion
+  for a duration-valued result.
+
+## 3.6.5 What building this step found
+
+**1. The obvious test for "no partial work is reused" is vacuous, and it
+took a mutation check to see it.**
+The first version of this file's tests asserted that a cancelled execution
+followed by a clean one returns the right answer. Both a `count_to_n`
+mutant that kept its counter in module state and a `hash_rounds` mutant
+that saved the partial digest and resumed from it **passed** — because for
+these workloads resuming *is* correct: the chain restarted from a
+half-built digest ends at the same place. The assertion could not fail for
+the reason it was written. Rewritten to count chunk boundaries, both
+mutants fail. **This is the single most useful thing the step produced**,
+and it generalises: for a pure function, "did you redo the work" is not a
+question the return value can answer.
+
+**2. The strongest argument for the policy is structural, not
+behavioural.** There is no message type, no column and no Redis key that
+can carry partial state, so a resume is not something the system could do
+incorrectly — it is something it cannot express. Re-reading the wire
+protocol to confirm that was worth more than another test.
+
+**3. The mutation checks were run rather than assumed, and two of four
+initially found nothing.** Four deliberate defects were injected: an
+impure executor that writes a file (**caught** — `AssertionError: an
+executor touched the outside world`), a non-deterministic executor
+returning `random.random()` (**caught**), a resuming counter (**not
+caught** until #203's rewrite), and a resuming digest (**not caught**
+until #203's rewrite). Reported including the two that initially failed
+to catch anything, per §10.
+
+**4. The late result was `superseded`, not `fenced`, and that is
+correct.** Fencing (3.4) answers a result for a task that is still live;
+once another attempt has driven the task to `COMPLETED`, the terminal
+state check from 3.3 answers first. A reader expecting `fenced_results` to
+tick on this demo would be reading the wrong counter, so the ordering is
+written down here rather than discovered again in Step 3.9.
+
+## 3.6.6 Demo and failure demo
+
+Both run against a local Compose stack with **two** workers. `$A` is the
+stack's admin secret and `$P` its compose project name.
+
+**Demo — an interrupted task is redone in full and gets the same answer**
+
+1. Start the stack, then a second worker with its own identity volume:
+   ```bash
+   docker run -d --name $P-worker-b --network ${P}_default \
+     -v $P-identity-b:/var/lib/worker-identity \
+     -v "$PWD/certs:/certs:ro" \
+     -e COORDINATOR_URL=https://coordinator:8443 \
+     -e ENROLLMENT_SECRET=<the stack's enrollment secret> \
+     $P-worker
+   ```
+2. Submit the known-answer workload:
+   ```bash
+   curl -sk https://localhost:$PORT/tasks -H "X-Admin-Secret: $A" \
+     -H 'Content-Type: application/json' \
+     -d '{"task_type":"hash_rounds","parameters":{"rounds":10000000}}'
+   ```
+3. Poll `GET /tasks/{id}` until `RUNNING`, note `assigned_worker_id`, then
+   **cut that worker off the network** — not `docker pause`, which lets it
+   read the cancel:
+   ```bash
+   docker network disconnect ${P}_default $P-worker-1
+   ```
+4. Watch `attempt_count` go to 1 and `assigned_worker_id` change. The new
+   worker starts at zero: its `duration_seconds` on completion is a **full**
+   execution, not a remainder.
+5. Reconnect the cut worker (`docker network connect`) and watch its late
+   result be refused — `task_result_refused outcome=superseded` in the
+   worker log, `task_result_not_applied` in the coordinator's.
+6. **Verify the answer:** the stored `result` equals
+   `6b4ab10d92373474a97d10639e667f6b734af012f9be29997f1befd1c7166199`,
+   and both workers logged the same `result_fingerprint`.
+
+**On screen:** two `task_execution_completed` lines with the same
+fingerprint from different workers; one `COMPLETED` task; one `attempts`
+row with `outcome: REASSIGNED`.
+
+**Failure demo — the cost of the policy, shown rather than described**
+
+The same run *is* the failure demo. What it deliberately triggers is
+**work being thrown away**: worker A computes 28.8 seconds of hashing
+whose result is refused. Read it off the two logs side by side —
+A's `task_execution_completed elapsed_seconds: 28.799` immediately
+followed by `task_result_refused`, against B's identical fingerprint that
+was kept. If the policy were checkpoint-and-resume, that 28.8s would have
+been salvaged; it is not, and this is what that decision costs.
+
+**Second failure demo — the purity guard actually fails**
+
+Break the property on purpose and watch the suite catch it:
+```bash
+python - <<'PY'
+from worker import executors
+real = executors.run_count_to_n
+def impure(parameters, progress=None, cancel=None):
+    open("side-effect.tmp", "w").write("x")     # the defect
+    return real(parameters, progress, cancel)
+executors.EXECUTORS["count_to_n"] = impure
+PY
+pytest tests/test_reexecution.py -k opens_no_file
+```
+→ `AssertionError: an executor touched the outside world`. Adding
+`import os` to `worker/executors.py` fails
+`test_the_executor_module_imports_nothing_that_can_reach_the_outside_world`
+in the same file.
+
+**Capturable:** the two-fingerprint log excerpt; the task detail JSON with
+its single `REASSIGNED` attempt row; the four-task table with one digest
+and four tokens; the red test output from the impure executor.
+
+## 3.6.7 Forward path for stateful workloads — noted, NOT built
+
+For the record only. **None of this is scaffolded, and no code in the
+repository anticipates it** (CLAUDE.md §2 forbids it in V1).
+
+When real SQL work arrives, the workloads stop being pure in two distinct
+ways, and they need different answers:
+
+- **Read-only work — profiling, schema extraction, statistics.** Still
+  re-executable. The only cost of redoing it is the query time, so this
+  policy carries over unchanged. It is the case to keep in mind when
+  someone argues checkpointing is mandatory for V2: for most of the
+  pipeline it will not be.
+- **Mutating work — applying a cleaning plan to a customer's rows.**
+  Re-execution is not safe by construction, and no amount of executor
+  purity makes it so. The recovery unit has to become a **transaction the
+  worker can be told to retry or roll back**, keyed by the same
+  idempotency token that is already on the wire (Step 2.5) — so the
+  natural shape is: the coordinator hands out a token, the worker writes
+  it into the target database inside the same transaction as the change,
+  and a re-execution that finds its own token there reports the earlier
+  outcome instead of applying anything. That moves the idempotency
+  boundary from the coordinator's result table into the customer's
+  database, which is a design gate of its own and is where the argument
+  should happen.
+
+What would have to change here, listed so the estimate is not made from
+scratch later: a per-task-type declaration of whether it is re-executable,
+carried in the registry beside `DEFAULT_MAX_EXECUTION_SECONDS`; a retry
+policy that consults it instead of retrying unconditionally; and a
+terminal state for "not safe to retry" distinct from `FAILED`. **Three
+changes, all in the coordinator, none in the protocol** — which is the
+reason it is safe to defer.
+
+## 3.6.8 What Step 3.6 deliberately does NOT do
+
+- **It does not add a partial-progress view to the dashboard.** A worker
+  that lost a task can still show a stale `current_tasks` entry until its
+  `capacity` arrives or its Redis key expires. That is Step 3.7's
+  territory (reassignment visible in real time), not this step's.
+- **It does not add a determinism check to the coordinator.** Comparing a
+  refused attempt's result against the stored one would need the refused
+  body kept, which is a store this step exists to avoid.
+- **It does not claim §8.** No remote Internet worker took part; both
+  workers were local containers.
+- **It was not run by the user** — every measurement above is agent-run
+  (§15 items 3–4).
 
 ---
 
