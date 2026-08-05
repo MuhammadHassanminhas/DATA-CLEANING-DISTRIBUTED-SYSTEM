@@ -80,8 +80,18 @@ services:
       TASK_RETRY_BACKOFF_FACTOR: ${TASK_RETRY_BACKOFF_FACTOR:-2}
       TASK_RETRY_BACKOFF_MAX_SECONDS: ${TASK_RETRY_BACKOFF_MAX_SECONDS:-60}
       TASK_RETRY_EXCLUSION_SECONDS: ${TASK_RETRY_EXCLUSION_SECONDS:-60}
+      # Phase 3.5 graceful shutdown. Default matches app/config.py. Set to
+      # 0 for the pre-3.5 behaviour (exit on the signal, drain nothing),
+      # which is how the failure side of the demo is run.
+      SHUTDOWN_DRAIN_SECONDS: ${SHUTDOWN_DRAIN_SECONDS:-15}
     ports:
       - "${COORDINATOR_PORT}:8443"
+    # Phase 3.5. Compose's default is 10s, which is *shorter* than the
+    # drain window — every graceful shutdown would be SIGKILLed partway
+    # through it and the drain would buy nothing. Matches the chart's
+    # terminationGracePeriodSeconds so both environments kill on the same
+    # deadline.
+    stop_grace_period: 45s
     volumes:
       - ./certs:/certs:ro
     depends_on:

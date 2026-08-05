@@ -1792,13 +1792,319 @@ SELECT attempt_number, worker_id, outcome, reason
 - Graceful shutdown that drains in-flight work.
 
 **Exit criteria**
-- [ ] Restarting all coordinator replicas loses no durable task record.
-- [ ] Tasks in flight at restart have a deterministic documented outcome.
-- [ ] Workers reconnect automatically without re-enrollment.
-- [ ] Restart with 100 workers and 1,000 queued tasks converges cleanly —
-      timed.
-- [ ] Rolling Kubernetes upgrade completes with no task loss.
-- [ ] Reconnect storm does not overwhelm the coordinator — measured.
+- [x] Restarting all coordinator replicas loses no durable task record —
+      **1,000 enqueued, 1,000 read back, 1,000 `COMPLETED`, 1,000 distinct
+      results** across a restart taken mid-drain (§3.5.3).
+- [x] Tasks in flight at restart have a deterministic documented outcome —
+      stated in §3.5.2 and measured in both shapes: a single `sleep(45)`
+      completed on its **original** worker at `attempt_count: 0`, and a
+      380-task fleet produced **zero redeliveries** (§3.5.3).
+- [x] Workers reconnect automatically without re-enrollment — **100
+      registrations for 100 workers across 200 sessions** (§3.5.3).
+- [x] Restart with 100 workers and 1,000 queued tasks converges cleanly —
+      timed. **Drain 30.9s after the restart; fleet back at p50 17.5s,
+      max 18.5s** (§3.5.3).
+- [ ] **Rolling Kubernetes upgrade completes with no task loss — NOT
+      VERIFIED.** The chart change it needs is made and renders
+      (`terminationGracePeriodSeconds: 45`), but no rollout was performed:
+      the AKS cluster was not started this step. Named, not waived —
+      §3.5.5 carries the exact command.
+- [x] Reconnect storm does not overwhelm the coordinator — measured.
+      **276 reconnect attempts from 100 workers, spread over 15.8–18.5s,
+      coordinator at 28.8% of one core, 0 rate-limited retries** (§3.5.3).
+
+## 3.5.1 What was built
+
+**Almost nothing, and that was the design gate's prediction.** §3.0.13
+committed Step 3.5 to needing *no startup scan*: recovery is the
+continuous reclaimer from 3.1 plus lease renewal on `hello`, both already
+shipped. That held. Re-read in full before writing any code and confirmed
+against the running system — the first bullet of this step's own brief,
+"startup recovery: reload durable task state, identify assignments with
+expired or unknown leases", is **already true continuously** rather than
+at boot, and building a boot-time scan would have added a second recovery
+path that has to agree with the first forever (the design the gate
+rejected in §3.0.2).
+
+What genuinely did not exist was the **fourth** bullet: graceful shutdown.
+Three pieces, one behaviour:
+
+| Piece | Where | What it does |
+|---|---|---|
+| The drain flag | `assignment.begin_drain` / `is_draining` | one-way, process-global, set from the signal handler |
+| The assignment gate | `assignment.assign_once` | returns 0 **before** the pass is counted or the database is touched |
+| The ack wait | `assignment.drain_local_sessions` | waits out this replica's unacknowledged deliveries, bounded |
+| The readiness answer | `main.ready` | 503 `draining` immediately, ahead of the dependency checks |
+| The entrypoint | `app/serve.py` (new) | intercepts SIGTERM, drains, then hands off to uvicorn's own exit |
+
+The container's `CMD` changed from `uvicorn app.main:app …` to
+`python -m app.serve`. The flags that used to live in that CMD are env
+vars defaulting to the identical values, so the listener is unchanged.
+
+## 3.5.2 Five decisions this step made
+
+**#194 — the drain waits for deliveries, not for executions.**
+The alternative, waiting for running tasks to finish, is not an option a
+shutdown can offer: `sleep` has a 3,900-second execution ceiling and no
+termination grace period is going to cover it. It is also unnecessary — a
+lease is a row and not a socket, so a task executing across the restart is
+renewed on `hello` against whichever replica the worker lands on next.
+What actually dies with the process is the **frame in the socket buffer
+that has not been answered**: a task durably `ASSIGNED` with nobody
+visibly executing it, recoverable only after a full
+`TASK_ACK_TIMEOUT_SECONDS`. That is the loss a drain can prevent, and it
+normally takes under a millisecond — **measured at 0.0s with a 45-second
+task running** (§3.5.3).
+
+**#195 — the signal is intercepted above FastAPI, not inside it.**
+The lifespan's post-`yield` code runs *after* uvicorn has already closed
+every WebSocket (recorded at that `yield` in `main.py` since Decision
+#21), so there is no hook inside the app that runs early enough. The
+alternatives were a Kubernetes `preStop` hook — rejected, because it would
+put half the behaviour in one environment only, which is exactly the
+Docker-vs-Internet divergence CLAUDE.md §3.5 forbids — or replacing
+uvicorn's signal handlers outright, rejected because the original handler
+is not reachable to chain to. Subclassing `uvicorn.Server` and overriding
+`handle_exit` keeps one code path for every environment and leaves the
+actual exit to uvicorn.
+
+**#196 — a second signal exits immediately.** An operator who has decided
+a coordinator must stop *now* is answering a question this module cannot
+see, and a shutdown that ignores the second Ctrl-C is one people learn to
+`kill -9` instead. The interruption is logged rather than silent.
+
+**#197 — draining changes what a replica *starts*, never what it
+*finishes*.** The reclaimer keeps reclaiming, results are still accepted,
+progress is still recorded, `/health` still answers. Only `assign_once`
+and `/ready` change. A drain that switched recovery off would take the
+reclaimer out at the exact moment its own workers' tasks are about to need
+it — a fault-tolerance regression dressed as a feature. There is a test
+for this specifically.
+
+**#198 — no minimum drain, and the residual is named rather than
+papered over.** The drain ends on the last ack, so with nothing
+outstanding a replica can be gone in ~180ms — before an endpoints
+controller has necessarily propagated its removal. A worker can therefore
+briefly dial a coordinator that is already gone. It gets a refused
+connection and retries on the backoff it would have used anyway, so the
+cost is bounded by one reconnect and there is **no task loss**: leases are
+durable. A minimum-hold knob was rejected as a number nobody has measured
+a need for. **In a rolling upgrade this window does not arise at all** —
+the pod is *deleted*, and endpoint removal on deletion is immediate and
+parallel with SIGTERM rather than waiting on a probe.
+
+## 3.5.3 Measurements
+
+Local Docker Compose project `dcds35`, stock configuration — coordinator,
+dashboard, worker, Postgres and Redis over TLS. Every number below is
+**measured**, from the coordinator's own logs, its `/metrics`, or its
+tables. **Not a Kubernetes measurement**: see the unmet criterion above.
+
+**A 45-second task does not hold shutdown open.** `sleep(45)` `RUNNING`
+on the one worker, then `docker compose stop coordinator`:
+
+| Event | Timestamp |
+|---|---|
+| `shutdown_drain_started` (signal 15, window 15.0s) | 11:02:16.421104 |
+| `shutdown_drain_complete` — `pending_acks_at_start: 0`, `waited_seconds: 0.0`, `timed_out: false` | 11:02:16.421810 |
+| `coordinator stopped` | 11:02:16.597534 |
+
+**176 milliseconds, end to end, with a 45-second task in flight.** The
+drain window was available and went unused, which is the claim in #194
+demonstrated rather than described.
+
+**That task's outcome, which is the deterministic-outcome criterion.**
+The coordinator was away for 22 seconds. The worker reconnected on its
+existing identity (`worker_connected`, `session_epoch: 1 -> 2`, no
+registration), the coordinator renewed its lease from the *database*
+(`task_leases_renewed_on_hello`, `tasks: 1`), and the task finished on the
+worker that had been running it the whole time:
+
+```
+status COMPLETED · attempt_count 0 · attempts [] · completed_at 11:02:44.104
+```
+
+**No reassignment, no second execution, no abnormal ending.**
+
+**The drain does wait when there is something to wait for.** Worker
+`docker pause`d so it could not acknowledge, one task delivered, then
+stop:
+
+| | |
+|---|---|
+| `pending_acks_at_start` | **1** |
+| `waited_seconds` | **15.053** (the full window) |
+| `timed_out` | **true** |
+| container exit code | **0** — not 137, so no SIGKILL inside the 45s deadline |
+
+and `/ready` polled once a second throughout:
+
+```
+t+1s 200 {"status":"ready",...}
+t+2s … t+12s   503 {"status":"draining","checks":{}}
+```
+
+**The restart run — 100 workers, 1,000 tasks, restarted mid-drain.**
+`scripts/loadtest.py restart`, `sleep(5)` workload, restart fired 6s in.
+All eight checks pass:
+
+| | |
+|---|---|
+| in flight at the restart | **380 delivered, 34 completed** |
+| restart command | `docker compose restart coordinator`, 5.665s, rc 0 |
+| read back | **1,000 rows / 1,000 distinct / 1,000 COMPLETED / 1,000 results** |
+| **redeliveries** | **0** |
+| registrations vs sessions | **100 / 200** — every worker reconnected, none re-enrolled |
+| reconnect distribution | min 15.76s, p50 **17.50s**, p95 17.95s, max 18.47s |
+| reconnect attempts | 276 |
+| drain after restart | 30.9s; queue 548 → 0 |
+| throughput over the whole run | 26.7 tasks/s |
+| coordinator CPU | **28.8% of one core**, RSS 113 MB |
+| rate-limited retries | **0** |
+
+**Read the reconnect numbers honestly.** The fleet came back inside a
+2.7-second band, which is jitter doing its job — but the *floor* is 15.8s,
+not one second, because the coordinator was genuinely unreachable for
+several seconds and each failed attempt doubles the backoff. That is the
+shipped worker's own `WS_BACKOFF_*` shape (the harness uses the same three
+numbers deliberately), so it is what a real fleet would do. It is a
+property of the backoff, not of this step, and it is the price of not
+having a herd.
+
+## 3.5.4 What running this step found
+
+**1. `converge_seconds` measured 0.0 and that was almost a misleading
+number.** The harness first reported "time for the fleet to converge"
+measured *after* the queue drained — by which point everyone was already
+back, so it read 0.0 for a run whose real reconnect time was 17.5s. It is
+now named `converge_after_drain_seconds` with the reading spelled out in
+the report itself, and the actual distribution lives in
+`reconnect.seconds`. A number that is technically true and reads as
+flattering is worse than no number.
+
+**2. `docker pause` is the right tool here, unlike in Step 3.4.** 3.4
+found that pausing a worker does not produce a stale result, because the
+socket survives and the cancel is read on unpause. For *this* step the
+same property is exactly what is wanted: a paused worker holds a delivery
+open without acknowledging it, which is the only way to reach the drain's
+timeout path deliberately.
+
+**3. Every simulated worker logged an error, and that is correct.** The
+report's `errors_after_first_connect: 100` is one `WinError 10053` per
+worker — the connection aborted when the coordinator went away. Reported
+rather than swallowed, because a *persistent* error after the fleet came
+back would otherwise hide behind a successful drain.
+
+**4. The harness's `tasks_in_flight` on reconnect was wrong in its first
+form.** It computed `received - completed - refused`, but a refused task
+is never added to `received`, so refusals were subtracted twice and a
+reconnecting worker would have under-declared what it was holding —
+inviting the coordinator to over-credit it. Now `received - completed`.
+
+## 3.5.5 What Step 3.5 deliberately does NOT do
+
+- **No rolling Kubernetes upgrade was performed.** The cluster was not
+  started. The chart carries `terminationGracePeriodSeconds: 45` and
+  renders, and the drain is environment-independent by construction
+  (#195), but **neither of those is the criterion**. To close it:
+  ```bash
+  az aks start -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+  kubectl -n staging rollout restart deploy/coordinator
+  kubectl -n staging rollout status deploy/coordinator
+  # with scripts/loadtest.py restart pointed at the public ingress and
+  # --restart-command "kubectl -n staging rollout restart deploy/coordinator"
+  ```
+- **No startup scan, no boot-time recovery, no leader election.** §3.0.13,
+  and §3.5.1 above.
+- **No minimum drain hold** — #198, with the residual named.
+- **No drain for the dashboard or the worker.** The dashboard is
+  stateless and holds no task; the worker's own shutdown path
+  (`/workers/release`) shipped in Phase 1.
+- **`task_failed` and `task_progress` in flight are not waited for**, only
+  unacknowledged *deliveries*. A result frame lost to the close is retried
+  by the worker and answered `duplicate` or `superseded` by Step 3.3.
+- **No metric for how long a drain took.** The gauge is binary
+  (`coordinator_draining`); the duration is in the structured log, because
+  a value the process emits once and then exits is not something a scrape
+  interval can be relied on to catch.
+- **No thundering-herd mitigation was added.** The step's brief says
+  "mitigation via the Phase 1 backoff and jitter" — that is a statement
+  that the existing mechanism suffices, and the 276-attempt / 2.7-second
+  spread is the evidence. Nothing new was built.
+- **No new dashboard element, and this is worth stating against §6.**
+  What 3.5 makes watchable is a restart the task console rides out — the
+  queue, the running tasks and the fleet are all already on screen and
+  Demo 3 is performed in the browser. A "which replicas are draining"
+  panel would need a replica inventory the coordinator does not expose,
+  and per-replica views are Step 3.7's. `coordinator_draining` covers the
+  operator's question in the meantime.
+
+## 3.5.6 Demo and failure demo
+
+Stock stack, one coordinator, one worker.
+
+**Demo 1 — a running task does not delay shutdown, and survives it.**
+```bash
+curl -k -X POST https://localhost:$PORT/tasks \
+  -H "X-Admin-Secret: $ADMIN_SECRET" -H 'Content-Type: application/json' \
+  -d '{"task_type":"sleep","parameters":{"seconds":45}}'
+# wait until GET /tasks/depth shows RUNNING: 1, then
+docker compose -p $PROJECT stop coordinator
+docker compose -p $PROJECT start coordinator
+```
+The stop returns in well under a second. `docker logs` shows
+`shutdown_drain_started` and `shutdown_drain_complete` with
+`waited_seconds: 0.0`. After the restart, `GET /tasks/{id}` reaches
+`COMPLETED` with `attempt_count: 0` and an empty attempts list — the same
+worker finished it.
+
+**Demo 2 — the drain waits, and the pod goes unready first.**
+```bash
+docker pause $PROJECT-worker-1
+curl -k -X POST .../tasks -d '{"task_type":"sleep","parameters":{"seconds":5}}'
+# GET /tasks/depth now shows ASSIGNED: 1 — delivered, never acknowledged
+docker compose -p $PROJECT stop coordinator &
+for i in $(seq 1 12); do curl -sk -o /dev/null -w "%{http_code}\n" \
+  https://localhost:$PORT/ready; sleep 1; done
+docker unpause $PROJECT-worker-1
+```
+`200` once, then `503 {"status":"draining"}` for the whole window, and the
+log ends `waited_seconds: 15.053, timed_out: true`. `docker inspect`'s
+`.State.ExitCode` is **0**, not 137.
+
+**Demo 3 — watch it in the browser.** With the dashboard open at
+`/ui/tasks`, run Demo 1. The queue and the running task are visible
+throughout; the console keeps polling and simply shows the coordinator
+gone and back. `coordinator_draining` on `/metrics` is `1.0` during a
+drain and has **no series at all** after the restart, since the process
+that exported it is gone.
+
+**Failure demo — turn the drain off and watch what 3.5 added.** Same
+stack, `SHUTDOWN_DRAIN_SECONDS=0`, which is the pre-3.5 behaviour on the
+same image:
+```bash
+docker compose -p $PROJECT --env-file <env with SHUTDOWN_DRAIN_SECONDS=0> \
+  up -d coordinator
+# stage an unacknowledged delivery exactly as in Demo 2, then stop and poll
+```
+Measured: **zero `shutdown_drain_started` events**, `/ready` answering
+**200** on the last poll before the process disappeared — never `503`,
+never `draining` — and the socket closed with the delivery still
+unacknowledged. Side by side with Demo 2's twelve seconds of `503`, that
+is the whole of what this step is.
+
+**The 100-worker run, if you want it yourself:**
+```bash
+python scripts/loadtest.py restart \
+  --url https://localhost:$PORT --insecure \
+  --enrollment-secret "$ENROLLMENT_SECRET" --admin-secret "$ADMIN_SECRET" \
+  --workers 100 --tasks 1000 --task-type sleep --parameters '{"seconds":5}' \
+  --restart-after 6 \
+  --restart-command "docker compose -p $PROJECT restart coordinator"
+```
+It prints `PASS` or names the failing checks. It refuses to run without
+`--restart-command`, because a restart scenario that restarts nothing is a
+burst with extra words and would report green.
 
 ---
 

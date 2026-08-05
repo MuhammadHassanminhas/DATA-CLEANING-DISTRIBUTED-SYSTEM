@@ -41,6 +41,7 @@ from app.assignment import (
     handle_task_progress,
     handle_task_result,
     handle_task_started,
+    is_draining,
     log_unacknowledged,
     notification_listener,
     notify_work_available,
@@ -348,6 +349,20 @@ async def ready(response: Response) -> dict[str, object]:
     Checks every external dependency directly rather than trusting
     cached state, since nothing authoritative is held in memory.
     """
+    # Phase 3.5. A draining replica is *healthy* and not *ready*, and the
+    # split is the point: `/health` keeps answering, so the liveness probe
+    # never restarts a pod that is deliberately shutting down, while
+    # `/ready` fails immediately so the Service and the ingress stop
+    # sending it new workers before its sockets close.
+    #
+    # Answered before the dependency checks rather than after, because the
+    # answer cannot change: no result from Postgres or Redis makes a
+    # draining replica ready again, and a shutdown should not be spending
+    # its window on queries whose outcome it will ignore.
+    if is_draining():
+        response.status_code = 503
+        return {"status": "draining", "checks": {}}
+
     checks: dict[str, str] = {}
     healthy = True
 
