@@ -57,7 +57,7 @@ from app.assignment import (  # noqa: E402
 from app.config import database_url  # noqa: E402
 from app.task_queue import (  # noqa: E402
     DUPLICATE,
-    NOT_OWNER,
+    FENCED,
     SUPERSEDED,
     TRANSITIONED,
     complete_task,
@@ -443,10 +443,17 @@ def test_the_slow_workers_result_loses_to_the_reassignment_that_finished_first()
             b = make_session(b_id)
             await _reassign_to(sm, task_id, a, b)
             winner = uuid.uuid4().hex
-            await handle_task_result(b, result_message(task_id, token=winner))
+            # `attempt_number=1` because that is the attempt B was handed.
+            # Phase 3.4 fences a submission whose attempt is not the task's
+            # current one, so the number is no longer decoration here — B
+            # echoing 0 would be refused, correctly.
+            await handle_task_result(
+                b, result_message(task_id, token=winner, attempt_number=1)
+            )
 
-            # A finally finishes the work it never stopped doing.
-            await handle_task_result(a, result_message(task_id))
+            # A finally finishes the work it never stopped doing, under the
+            # attempt number it was given.
+            await handle_task_result(a, result_message(task_id, attempt_number=0))
 
             assert b.websocket.outcomes() == [TRANSITIONED]  # type: ignore[attr-defined]
             assert a.websocket.outcomes() == [SUPERSEDED]  # type: ignore[attr-defined]
@@ -496,8 +503,16 @@ def test_a_result_that_beats_the_reclaimer_wins_and_the_reclaim_matches_nothing(
 
 def test_a_result_for_a_task_reassigned_but_not_yet_finished_writes_nothing():
     """The third order: A's result arrives while B is still running the
-    reassigned task. The task is not terminal, so the ownership guard is what
-    refuses it — `not_owner`, nothing written, and B can still complete it."""
+    reassigned task. The task is not terminal, so 3.3's terminal branch does
+    not answer it — nothing is written, and B can still complete it.
+
+    **The outcome this test asserts changed in Step 3.4, and the change is
+    the point.** It was `not_owner`, which is the answer §12 reserves for a
+    worker naming a task that was never its own; A held this task and lost
+    it to a reassignment the design says it may lose. It is now `fenced`,
+    with a `task_attempts` row recording that a real result was refused.
+    `not_owner` still exists and is still what an impostor gets — see
+    `test_fencing.py`."""
 
     def _body(sessionmaker):
         async def inner(sm):
@@ -513,14 +528,14 @@ def test_a_result_for_a_task_reassigned_but_not_yet_finished_writes_nothing():
             b = make_session(b_id)
             await _reassign_to(sm, task_id, a, b)
 
-            await handle_task_result(a, result_message(task_id))
+            await handle_task_result(a, result_message(task_id, attempt_number=0))
 
-            assert a.websocket.outcomes() == [NOT_OWNER]  # type: ignore[attr-defined]
+            assert a.websocket.outcomes() == [FENCED]  # type: ignore[attr-defined]
             assert await _result_rows(sm) == []
             assert await _statuses(sm) == {"RUNNING": 1}
 
             # B's own result still lands — refusing A must not poison the task.
-            await handle_task_result(b, result_message(task_id))
+            await handle_task_result(b, result_message(task_id, attempt_number=1))
             assert b.websocket.outcomes() == [TRANSITIONED]  # type: ignore[attr-defined]
             assert len(await _result_rows(sm)) == 1
 

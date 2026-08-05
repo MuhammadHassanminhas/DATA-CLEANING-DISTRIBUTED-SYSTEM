@@ -236,6 +236,24 @@ TASKS_AWAITING_RETRY = Gauge(
     "coordinator_tasks_awaiting_retry",
     "Queued tasks not yet eligible to be claimed because a retry backoff is running.",
 )
+# Phase 3.4, named by the design gate (§3.0.9). It overlaps
+# `coordinator_task_results_total{outcome="fenced"}` deliberately and is not
+# redundant with it: that counter answers "what happened to submissions",
+# this one answers "why work is being thrown away", and only this one
+# carries the reason.
+#
+# **The reason label is the whole value of a separate series.**
+# `stale_attempt` means a worker raced *itself* — it got its own task back
+# after a reclaim and its old execution finished late, which points at a
+# lease TTL that is short for the work. `task_reassigned` means the work
+# went somewhere else, which points at a worker that stopped answering.
+# Those have different causes and different fixes, and a single number
+# cannot tell them apart. Cardinality is two, fixed by the code.
+RESULTS_FENCED = Counter(
+    "coordinator_results_fenced_total",
+    "Result submissions refused because the attempt that produced them was superseded.",
+    ["reason"],
+)
 
 # Per-instance request latency. Route template keeps label cardinality bounded.
 REQUEST_LATENCY = Histogram(

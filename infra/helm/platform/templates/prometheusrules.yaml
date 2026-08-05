@@ -129,6 +129,29 @@ spec:
           labels: { severity: warning, team: dcds }
           annotations:
             summary: "Tasks are being reassigned at over 1/s for 10 minutes — the fleet is losing work faster than one bad machine explains."
+        # Phase 3.4. Sustained fencing, which the design gate asked for by
+        # name (§3.0.9). This is the only alert in this file that fires on
+        # **work being thrown away rather than retried**: every fenced
+        # submission is a task that was genuinely executed and whose result
+        # was refused, so the CPU that produced it is spent for nothing.
+        #
+        # Any sustained rate is worth a look, hence a threshold of zero over
+        # a long window rather than a rate. `by (reason)` is kept rather than
+        # summed away because the two reasons have different fixes — a
+        # `stale_attempt` storm says the lease TTL is short for the work
+        # being run, a `task_reassigned` storm says workers are dropping off
+        # — and grouping by it puts the reason on the firing alert's own
+        # labels, where Alertmanager renders it without this template needing
+        # to escape a `$labels` reference through Helm.
+        #
+        # Threshold and window are RECOMMENDATIONS, not measured. `sum` not
+        # `max`: this is a per-instance counter.
+        - alert: ResultsFencedSustained
+          expr: sum by (reason) (rate(coordinator_results_fenced_total[10m])) > 0
+          for: 15m
+          labels: { severity: warning, team: dcds }
+          annotations:
+            summary: "Results are being fenced continuously for 15 minutes — completed work is being discarded, not retried. See the alert's `reason` label."
         # A queue that is entirely retry backlog. Not a failure on its own —
         # every one of these tasks is waiting out a backoff that will end —
         # but a queue whose depth is all backed-off retries for half an hour

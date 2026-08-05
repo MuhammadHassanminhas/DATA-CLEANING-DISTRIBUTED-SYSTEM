@@ -116,6 +116,7 @@ from app.task_queue import (
     counts_by_status,
     dequeue,
     enqueue_batch,
+    fenced_result_count,
     get_task,
     list_tasks,
     purge_expired_results,
@@ -1568,6 +1569,14 @@ async def task_queue_depth(
     grouped scan, not the cheap path; `depth` is the index range count.
     Both are recomputed from Postgres per call — nothing is cached here,
     so every replica answers identically (§3.9).
+
+    **Phase 3.4 adds `fenced_results`**, and it belongs here rather than on
+    an endpoint of its own for the reason `counts` does: this is the read
+    the task console already polls, so a fenced result becomes visible
+    without a second request and without an operator having to know which
+    task to open. It is strictly the cheaper of the two scans this handler
+    already performs — `task_attempts` holds one row per abnormal ending
+    where `tasks` holds every task there has ever been.
     """
     rejection = await _operator_guard(
         request, response, secret=x_admin_secret, event="task_depth"
@@ -1578,8 +1587,9 @@ async def task_queue_depth(
     async with get_session() as session:
         depth = await queue_depth(session)
         counts = await counts_by_status(session)
+        fenced = await fenced_result_count(session)
 
-    return {"depth": depth, "counts": counts}
+    return {"depth": depth, "counts": counts, "fenced_results": fenced}
 
 
 @app.get("/tasks/throughput")

@@ -529,7 +529,7 @@
 
   // ---------- lifecycle tiles + queue depth ----------
 
-  function renderSummary(depth, counts) {
+  function renderSummary(depth, counts, fenced) {
     el.depthCount.textContent = depth;
     const tiles = [
       `<div class="tile" style="--tile-color: var(--accent)"><div class="n">${depth}</div><div class="l">queue depth</div></div>`,
@@ -539,6 +539,20 @@
         `<div class="tile" style="--tile-color: ${STATE_COLOR[state]}"><div class="n">${counts[state] || 0}</div><div class="l">${state.toLowerCase()}</div></div>`
       );
     });
+    // Phase 3.4. Results the coordinator refused because the attempt that
+    // produced them was no longer the task's current one. It is the one
+    // tile here that is not a task count — a fenced result leaves no trace
+    // in any lifecycle state, which is exactly why it needs its own tile
+    // rather than being findable only by opening the right task.
+    //
+    // Shown only when it is non-zero: a fleet that has never lost a race
+    // should not carry a permanent zero suggesting there is something to
+    // watch, and the tile appearing is itself the signal.
+    if (fenced > 0) {
+      tiles.push(
+        `<div class="tile" style="--tile-color: var(--offline)" title="results refused because the attempt that produced them had been superseded — nothing was written and no task state changed"><div class="n">${fenced}</div><div class="l">fenced results</div></div>`
+      );
+    }
     el.summary.innerHTML = tiles.join("");
   }
 
@@ -584,7 +598,7 @@
       el.clock.classList.remove("stale");
       el.clockText.textContent = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
 
-      renderSummary(depth.data.depth, depth.data.counts || {});
+      renderSummary(depth.data.depth, depth.data.counts || {}, depth.data.fenced_results || 0);
       renderRows(list.data.tasks || []);
 
       hasMore = Boolean(list.data.has_more);
@@ -653,15 +667,33 @@
   // **not** end normally, oldest first. A healthy task has none, and says
   // so rather than showing an empty box — `task_attempts` records abnormal
   // endings only, so "no rows" is a fact about the task, not a gap.
+  //
+  // Phase 3.4 adds a third outcome to the two 3.2 wrote, `FENCED`, and it
+  // is the one that reads differently from the others: `REASSIGNED` and
+  // `FAILED` are things the coordinator did to an attempt, a fence is a
+  // submission the coordinator refused. It is spelled out rather than left
+  // as a lowercased constant, because "fenced" alone does not tell an
+  // operator that a real result was thrown away on purpose.
+  const ATTEMPT_NOTE = {
+    FENCED: "a result arrived for this attempt after it had been superseded — refused, nothing written",
+  };
+
+  function attemptColor(outcome) {
+    if (outcome === "FAILED") return STATE_COLOR.FAILED;
+    if (outcome === "FENCED") return "var(--offline)";
+    return "var(--suspect)";
+  }
+
   function renderAttempts(attempts) {
     if (!attempts || attempts.length === 0) {
       return "<p class=\"idle\">none — no attempt of this task has ended abnormally</p>";
     }
     return `<ul class="timeline">${attempts.map((a) => `
-      <li style="--dot-color: ${a.outcome === "FAILED" ? STATE_COLOR.FAILED : "var(--suspect)"}">
+      <li style="--dot-color: ${attemptColor(a.outcome)}">
         attempt ${esc(a.attempt_number + 1)} — ${esc(a.outcome.toLowerCase())}
         <span class="at">${esc(a.recorded_at)}</span>
         <span class="src">${esc(a.reason || "no reason recorded")}${a.worker_id ? " · worker " + esc(shortId(a.worker_id)) : ""}</span>
+        ${ATTEMPT_NOTE[a.outcome] ? `<span class="src">${esc(ATTEMPT_NOTE[a.outcome])}</span>` : ""}
       </li>`).join("")}</ul>`;
   }
 

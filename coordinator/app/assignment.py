@@ -154,6 +154,7 @@ from app.results import MalformedResult
 from app.results import validate as validate_result
 from app.task_queue import (
     DUPLICATE,
+    FENCED,
     NOT_FOUND,
     NOT_OWNER,
     TRANSITIONED,
@@ -934,6 +935,14 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
     genuinely is free. Holding the credit here would make losing a race
     cost the worker capacity for the life of the session, which is the
     defect Decision #168 fixed on the neighbouring path.
+
+    **Phase 3.4 adds a second, `FENCED`** — a result for a task that is
+    still live but whose current attempt is not this one. It behaves like
+    `SUPERSEDED` in every way the worker can see (definitive ack,
+    `accepted: false`, credit released), and differs in one way the
+    coordinator can: it commits, because the `task_attempts` row recording
+    the fence is what makes the rejection inspectable afterwards. The rule
+    itself lives in `task_queue.complete_task` and nowhere else.
     """
     payload = message.get("payload") or {}
     correlation_id = str(message.get("correlation_id") or "")
@@ -1001,14 +1010,28 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
     task_id = envelope["task_id"]
     async with get_session() as db:
         outcome = await complete_task(db, envelope=envelope, worker_id=session.worker_id)
-        if outcome == TRANSITIONED:
+        # `FENCED` commits too, and it is the one outcome that writes
+        # without transitioning: the result is refused, but the
+        # `task_attempts` row recording that it was refused is the durable
+        # half of "rejections are visible, not buried in logs". Rolling it
+        # back with the rest of the no-op would leave the fence provable
+        # only from a log line on one replica.
+        if outcome in (TRANSITIONED, FENCED):
             await db.commit()
 
     # The same Decision #168 condition as `handle_task_failed`, and for the
     # same reason: after Step 3.1 a `NOT_OWNER` can mean "your task was
     # reassigned while you were finishing it", which is a sincere report
     # from a worker whose slot really is free.
-    if outcome not in (NOT_OWNER, NOT_FOUND) or task_id in session.credited:
+    #
+    # **Phase 3.4 puts `FENCED` in the same guarded set, not outside it.**
+    # A fenced worker's slot genuinely is free, so the credit must come
+    # back — but the outcome is reachable by naming a task id, and
+    # releasing unconditionally would hand any worker a way to free a slot
+    # of a task that is still running by naming an id (§12). Keyed on
+    # `credited`, a genuine id releases and a guessed one does not, which is
+    # exactly the discipline the neighbouring paths already apply.
+    if outcome not in (NOT_OWNER, NOT_FOUND, FENCED) or task_id in session.credited:
         _release_credit(session, task_id)
         session.current_tasks.pop(task_id, None)
         session.lease_renew_due.pop(task_id, None)
@@ -1038,12 +1061,22 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
         )
     else:
         logger.warning(
-            "task_result_not_applied",
+            # Phase 3.4 gives the fence its own event name rather than
+            # folding it into the generic one. "A result was fenced" is the
+            # thing an operator greps for during a recovery, and it should
+            # not require knowing that `outcome` is a field on a line whose
+            # name says only that something was not applied.
+            "task_result_fenced" if outcome == FENCED else "task_result_not_applied",
             extra={
                 "task_id": task_id,
                 "worker_id": session.worker_id,
                 "correlation_id": correlation_id,
                 "outcome": outcome,
+                # Which attempt the worker believed it was submitting. On a
+                # fence this is the whole diagnosis, and it is worker-
+                # reported — recorded, never trusted (§12).
+                "attempt_number": envelope["attempt_number"],
+                "session_epoch": envelope["session_epoch"],
             },
         )
 

@@ -8,7 +8,188 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-08-04 — STEP 3.3 BUILT AND VERIFIED, AWAITING APPROVAL
+## ⇒ 2026-08-05 — STEP 3.4 BUILT AND VERIFIED, AWAITING APPROVAL
+
+**Step 3.4 (stale result fencing) is built, all six exit criteria are
+measured, and it awaits your approval.** Decisions **#188–#192**, full
+record in `docs/phase-3-fault-tolerance.md` §3.4.1–§3.4.6. Suite **414
+passed** (was 400 at 3.3), `ruff` clean, `helm lint` clean. **No
+migration, no new table, no new Redis key, and no protocol change — zero
+files under `worker/` were touched.**
+
+**Note on the entry below this one: it says Step 3.3 awaits approval. It
+does not — 3.3 was approved (Decision #187) and merged as PR #53.**
+`PHASE_STATE.md` was right and this file was stale.
+
+### ⇒ START HERE NEXT SESSION
+
+1. **Approve or reject Step 3.4.** It is **on `main` as uncommitted
+   working-tree changes** — no branch, no commit, no PR was created this
+   session, because none was asked for. `main` is still at
+   **`770d937`** (the PR #53 merge). Twelve files, verified at close:
+   ```
+   M PHASE_STATE.md                                   M coordinator/app/task_queue.py
+   M SESSION_HANDOFF.md                               M dashboard/app/static/tasks.html
+   M coordinator/app/assignment.py                    M docs/operator-api.md
+   M coordinator/app/main.py                          M docs/phase-3-fault-tolerance.md
+   M coordinator/app/metrics.py                       M infra/helm/platform/templates/prometheusrules.yaml
+   M tests/test_idempotency.py                        ?? tests/test_fencing.py
+   ```
+   **⚠ Nothing is committed, so an accidental `git checkout .` or a
+   `git stash` loses the whole step.** Branching it (the pattern every
+   prior M3 step used — `phase-3.4-fencing`) is the first thing to do if
+   it is not being reviewed immediately.
+
+   `tests/test_idempotency.py` is in that list for a real reason, not a
+   drive-by: two of its assertions **legitimately changed**, because the
+   answer to "a result for a task reassigned but not yet finished" moved
+   from `not_owner` to `fenced`, and because a winner after a reassignment
+   must now echo `attempt_number: 1` rather than 0. Both are documented in
+   place.
+
+   **Steps 3.5–3.9 are NOT STARTED and must not begin without an explicit
+   go-ahead (§9).**
+2. **⚠ A local Docker stack is RUNNING and was left up deliberately.**
+   Verified at session close: `dcds34-coordinator-1`, `dcds34-worker-1`,
+   `dcds34-dashboard-1`, `dcds34-postgres-1`, `dcds34-redis-1` all **Up
+   (healthy)** — coordinator **9465**, dashboard **9466**. Beside them:
+   `dcds34-worker-b` **Exited (0)** (the second worker, stopped after the
+   reassignment demo) and `dcds34-pg` / `dcds34-redis`, the standalone
+   **unit-test** database on **55434** / **6391** that the 414-test run
+   used. Teardown, all of it:
+   ```bash
+   docker compose -p dcds34 down -v
+   docker rm -f dcds34-worker-b dcds34-pg dcds34-redis
+   docker volume rm dcds34-identity-b
+   ```
+   **`dcds31`, `dcds32` and `dcds33` were NOT running when this session
+   started** — Docker Desktop itself was stopped, and only `dcds34` was
+   created.
+
+   **Two things about `dcds34` that are NOT defaults, so nothing read off
+   it is a measurement of the shipped configuration:**
+   - its `sleep` task policy was left at **`lease_ttl_seconds: 600`,
+     `max_execution_seconds: 900`** from the last demo (`GET
+     /tasks/policies` shows it), and
+   - it runs with **`LEASE_DISCONNECT_GRACE_SECONDS=200`**, raised from
+     the compose default of 30 so a network cut would not be reclaimed on
+     the grace clock.
+
+   Its env file lives in **this session's scratchpad and dies with the
+   session**, so a recreate needs a fresh `--env-file`. The credentials in
+   it are throwaway and are **not** `.env`'s.
+
+   To restore stock behaviour without a teardown:
+   ```bash
+   curl -k -X PUT https://localhost:9465/tasks/policies/sleep \
+     -H "X-Admin-Secret: <the demo secret>" -H 'Content-Type: application/json' \
+     -d '{"lease_ttl_seconds": 60, "max_execution_seconds": 300}'
+   ```
+3. **The AKS cluster was NOT checked this session.** Its state is unknown
+   and it may be billing:
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+4. Still open and unchanged: **no remote Internet worker has taken part in
+   any M3 step (§8 not claimed for 3.1–3.4)**, **every M3 demo has been
+   agent-run rather than user-run** (§15 items 3–4), and
+   `GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` are still to rotate.
+
+### What Step 3.4 actually changes
+
+One comparison, inside the `FOR UPDATE` lock `complete_task` already held,
+on two columns its row read already fetched:
+
+| Situation | Before | After |
+|---|---|---|
+| Current assignee, current attempt | accepted | accepted |
+| Current assignee, an **earlier** attempt | **accepted — the defect** | **`fenced`** / `stale_attempt` |
+| Reassigned away, task still live | `not_owner` | **`fenced`** / `task_reassigned` |
+| A worker that never held the task | `not_owner` | `not_owner` — unchanged |
+| Task already terminal | `duplicate` / `superseded` | unchanged — 3.3 answers first |
+| Executed under an older session epoch | accepted | accepted, and now asserted |
+
+Row 2 is the hole 3.3 named and left open: **ownership cannot catch a
+stale submission from the worker the row names.** Row 3 corrects a shipped
+answer — `not_owner` is what §12 says to an impostor, and a worker that
+lost a race the design says it may lose is not one.
+
+`NOT_OWNER` is **narrowed, not retired** (#188). The discriminator needed
+no new state: Step 3.2 already writes an attempt row naming the worker
+that lost a task, so a genuine loser has evidence and an impostor does
+not. One indexed lookup, on the refusing branch only, short-circuited when
+the sender is the current assignee.
+
+### The measurements that matter
+
+- **`task_reassigned`, reproduced rather than described.** `sleep(40)`,
+  the holding worker cut off the Docker network so the reclaim's
+  `task_cancel` had nowhere to go. Reclaimed three times, completed by a
+  second worker; the original — reconnected, having genuinely finished its
+  own work — was refused `task_result_fenced attempt_number=0
+  session_epoch=2`, and the **unmodified** worker logged
+  `task_result_refused / was_pending: true / pending: 0`. **The task still
+  reached `COMPLETED`: executed four times, completed once.**
+- **`stale_attempt` reproduced twice** (08:38:19 and 08:40:29 UTC), both
+  `attempt_number=0`, both with the fenced worker being the same worker
+  the row names as current assignee.
+- **The amended epoch criterion (#169) measured on its accepting side:**
+  coordinator restarted mid-execution, worker reconnected epoch 7 → 8,
+  result **`COMPLETED`** with `attempt_count: 0` and no abnormal endings,
+  the stored envelope carrying epoch **7**. The phase plan's original
+  wording would have made that a rejection.
+- **Visibility:** a `fenced results` tile on `/ui/tasks`, from a new
+  `fenced_results` field on `GET /tasks/depth`, counted from
+  `task_attempts` rather than from the counter — **and the counter's reset
+  was measured: after a coordinator restart
+  `coordinator_results_fenced_total` has no series at all.**
+- **No protocol change, checkable:** `git status` lists eight files and
+  not one is under `worker/`; a test asserts the ack payload is still
+  exactly `{task_id, accepted, outcome}`.
+
+### Three things running it found
+
+1. **Step 3.2's `task_cancel` makes the stale-attempt fence hard to reach
+   on a healthy socket** — the worker cancels the superseded execution
+   (`task_cancel_received / task_execution_cancelled` at 13.9s) before it
+   can produce a stale result at all. Fencing is a **backstop for the case
+   the cancel cannot arrive**, which is by definition the case the task
+   was reclaimed for. Both live reproductions needed the worker cut off
+   the network first, and **`docker pause` is not enough** — a paused
+   worker's socket survives and it reads the cancel on unpause.
+2. **asyncpg refuses a parameter used in two type contexts.**
+   `AmbiguousParameterError: inconsistent types deduced for parameter $4
+   (text versus character varying)` — `:outcome` in both the `SELECT` list
+   and the `NOT EXISTS`. Fixed with `CAST(:outcome AS text)` at both
+   sites. Nothing short of executing the statement finds this.
+3. **One of my own assertions said the opposite of the step.** The
+   no-new-store test first asserted the Redis key set was *unchanged*
+   across a fence storm. It shrinks — `worker:{id}:current_tasks` goes
+   away because the first fence correctly releases the credit — so
+   equality would have been asserting the credit was **not** released. It
+   now asserts no key is *added*.
+
+### What is NOT done
+
+- **No commit, no branch, no PR, no CI run, no deployment.** The changes
+  are uncommitted on `main`.
+- **No remote Internet worker**, so §8 is **not** claimed for 3.4.
+- **No user-run demo or failure demo** — every run above was agent-run.
+- **`task_failed` is not fenced** (#192), because it does not carry
+  `attempt_number` and adding it would break this step's own
+  no-protocol-change criterion. The residual window is narrow and is
+  written up rather than glossed.
+- **The live `stale_attempt` reproduction is timing-dependent** — four
+  later runs of the same recipe produced `task_reassigned` or no fence.
+  The branch is deterministic in `tests/test_fencing.py`.
+
+**`.env` was not read and not modified this session, and no secret was
+printed.** The demo stack runs on throwaway credentials from a file in the
+session scratchpad, not from `.env`.
+
+---
+
+## ⇒ 2026-08-04 — STEP 3.3 BUILT AND VERIFIED, AWAITING APPROVAL (SUPERSEDED — 3.3 was approved as #187 and merged as PR #53)
 
 **⚠ This file has a gap and `PHASE_STATE.md` does not.** The entry below
 this one is session 23; **the sessions that built Steps 3.1 and 3.2 wrote
