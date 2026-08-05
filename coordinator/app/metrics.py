@@ -254,6 +254,21 @@ RESULTS_FENCED = Counter(
     "Result submissions refused because the attempt that produced them was superseded.",
     ["reason"],
 )
+# Phase 3.5. 1 while this replica is shutting down gracefully.
+#
+# A gauge and not a counter, because the question it answers is "is this
+# replica still taking work" and that has no history worth keeping: the
+# process is about to exit and the series ends with it. It is scraped at
+# most once or twice per drain, which is exactly enough to tell a rolling
+# upgrade (one replica draining at a time, briefly) from a fleet that has
+# stopped assigning for some other reason.
+#
+# **It is the only observable that distinguishes an idle replica from a
+# draining one**, since both assign nothing and both answer /health.
+DRAINING = Gauge(
+    "coordinator_draining",
+    "1 while this replica is draining for shutdown and assigning no new work.",
+)
 
 # Per-instance request latency. Route template keeps label cardinality bounded.
 REQUEST_LATENCY = Histogram(

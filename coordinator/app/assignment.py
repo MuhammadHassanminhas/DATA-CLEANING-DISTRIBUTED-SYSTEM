@@ -135,6 +135,7 @@ from app.metrics import (
     ASSIGNMENT_PASSES,
     ASSIGNMENT_QUERIES,
     ASSIGNMENTS_IN_FLIGHT,
+    DRAINING,
     LEASE_RECLAIM_SECONDS,
     LEASE_RENEWALS,
     LEASES_EXPIRED,
@@ -194,6 +195,42 @@ REFUSE_UNSUPPORTED_TYPE = "unsupported_task_type"
 # same reason: it is the dashboard's read, and a stale entry must expire on
 # its own if the replica holding the socket dies.
 CURRENT_TASKS_TTL_MULTIPLIER = 3
+
+# Phase 3.5. Set once, never cleared: a replica that has begun draining is
+# on its way out of the process table and has no route back to serving.
+# Making it one-way is what lets every reader treat it as a fact rather
+# than as a value that might change under them.
+_draining = False
+
+# How often `drain_local_sessions` re-checks. Short relative to any drain
+# window worth configuring, so the wait ends on the work finishing rather
+# than on the poll's own granularity.
+_DRAIN_POLL_SECONDS = 0.1
+
+
+def is_draining() -> bool:
+    """True once this replica has begun a graceful shutdown.
+
+    Read by `/ready` (which must start failing before the sockets close, so
+    Kubernetes takes this pod out of the Service while it can still finish
+    what it holds) and by `assign_once` (which must stop handing out work
+    it cannot see through).
+    """
+    return _draining
+
+
+def begin_drain() -> None:
+    """Stop taking new work. Idempotent, and deliberately one-way.
+
+    **This does not close anything and does not cancel anything.** Tasks
+    already running on this replica's workers keep running, results already
+    in flight are still accepted, and the reclaimer keeps reclaiming — a
+    draining replica is still a correct replica, it has simply stopped
+    adding to what it will have to abandon.
+    """
+    global _draining
+    _draining = True
+    DRAINING.set(1)
 
 
 @dataclass
@@ -1204,6 +1241,15 @@ async def assign_once() -> int:
     story: with an empty queue this costs one query regardless of whether
     the replica holds one socket or a hundred.
     """
+    # Phase 3.5, and it is checked before the pass is even counted: a
+    # draining replica must not claim a row. `dequeue` moves a task to
+    # ASSIGNED durably, so claiming here and dying a second later strands
+    # that task for a full `TASK_ACK_TIMEOUT_SECONDS` before the reclaimer
+    # can have it back — work thrown away by the shutdown itself, on a
+    # queue another live replica was ready to serve.
+    if _draining:
+        return 0
+
     ASSIGNMENT_PASSES.inc()
 
     candidates = [
@@ -1240,6 +1286,46 @@ async def assign_once() -> int:
     if delivered:
         _refresh_in_flight_gauge()
     return delivered
+
+
+async def drain_local_sessions(timeout: float) -> dict[str, Any]:
+    """Wait for work this replica has handed out to be acknowledged.
+
+    **"In-flight work" here means deliveries, not executions**, and the
+    distinction is the whole design. Waiting for the *tasks* to finish is
+    not an option a shutdown can offer: a `sleep` task may legitimately run
+    for the better part of an hour (`TASK_MAX_EXECUTION_SECONDS`), and no
+    termination grace period is going to cover that. Those tasks do not
+    need waiting for — they survive this process, because a lease is a row
+    and not a socket, and the worker renews them on `hello` against
+    whichever replica it lands on next (§3.0.13).
+
+    What genuinely dies with this process is the frame in the socket buffer
+    that has not been answered yet. A task delivered and not acked is
+    durably `ASSIGNED` with nobody visibly executing it, and recovering it
+    costs a full ack timeout — 30s by default, spent on a task a worker
+    would have picked up in milliseconds. That is the loss a drain can
+    actually prevent, and it usually takes a fraction of a second.
+
+    Returns what it observed rather than a verdict, so the caller can log
+    the honest number including the case where the window ran out.
+    """
+    started = time.monotonic()
+
+    def outstanding() -> int:
+        return sum(len(s.pending_acks) for s in _local_sessions.values())
+
+    at_start = outstanding()
+    while outstanding() and time.monotonic() - started < timeout:
+        await asyncio.sleep(_DRAIN_POLL_SECONDS)
+
+    return {
+        "sessions": len(_local_sessions),
+        "pending_acks_at_start": at_start,
+        "pending_acks_at_end": outstanding(),
+        "waited_seconds": round(time.monotonic() - started, 3),
+        "timed_out": bool(outstanding()),
+    }
 
 
 async def shorten_local_leases(worker_id: str, reason: str) -> int:

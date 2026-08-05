@@ -8,7 +8,183 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-08-05 — STEP 3.4 BUILT AND VERIFIED, AWAITING APPROVAL
+## ⇒ 2026-08-05 (session 25) — STEP 3.4 APPROVED, STEP 3.5 BUILT AND VERIFIED, BOTH PUSHED AS PRs #54 AND #55, CI GREEN, NOT MERGED
+
+**You approved Step 3.4 and directed that Step 3.5 be built end to end
+with the decisions taken here.** Both are done. 3.4 is committed (it was
+loose in the working tree and is not any more). 3.5 is built, **five of
+its six exit criteria are measured and the sixth is named UNMET, not
+waived.** Decisions **#193** (the 3.4 approval) and **#194–#198**, full
+record in `docs/phase-3-fault-tolerance.md` §3.5.1–§3.5.6. Suite **426
+passed** (was 414), `ruff` clean, `helm lint` clean. **No migration, no
+new table, no new Redis key, no protocol change — zero files under
+`worker/`.**
+
+### ⇒ START HERE NEXT SESSION
+
+1. **Merge PR #54, then PR #55.** Both are pushed, open, and **green —
+   14 of 14 checks each, `MERGEABLE` / `CLEAN`**, verified from the API
+   rather than taken off a tick. The `test` job on #55 reports **426
+   passed**, corroborating the local count on ephemeral Postgres/Redis.
+
+   | PR | Branch | Base | Carries |
+   |---|---|---|---|
+   | **#54** | `phase-3.4-fencing` (`bf1e819`) | `main` | Step 3.4 |
+   | **#55** | `phase-3.5-restart-recovery` (`b0c993d`) | **`phase-3.4-fencing`** | Step 3.5 |
+
+   **#55 is STACKED on #54, not on `main`.** Merge #54 first; GitHub
+   retargets #55 to `main` when it does. `main` is untouched at
+   **`770d937`**.
+
+   **⚠ Merging #54 triggers CD**, which deploys both environments and
+   needs the cluster up. It is up. **Do not `az aks stop` while the
+   production reviewer gate is parked** — that is what broke the deploy
+   in session 23.
+
+   **Steps 3.6–3.9 are NOT STARTED and must not begin without an explicit
+   go-ahead (§9).**
+
+1a. **PR #50 is still open** — `docs/session-24-close`, from an earlier
+   session. Not touched this session, and it is sitting against `main`.
+2. **⚠ One exit criterion is genuinely unmet: the rolling Kubernetes
+   upgrade — and it CANNOT be closed until #55 merges.** The chart carries
+   `terminationGracePeriodSeconds: 45` and renders, and the drain is
+   environment-independent by construction, but no rollout was performed.
+   **The reason is now sequencing, not the cluster:** staging cannot test
+   a rolling upgrade of the drain until an image that *contains* the drain
+   is deployed there, and that needs the merge. Command sequence in
+   §3.5.5. This is the one thing standing between 3.5 and six of six.
+3. **⚠ The AKS cluster is RUNNING and is BILLING**, per your own report at
+   session close. It was not started by me and not checked by me — stated
+   as your report rather than as my measurement (§10). Once both PRs have
+   merged, deployed, and the §3.5.5 rollout has been run:
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+4. **⚠ Local Docker stacks are RUNNING.** `dcds35` is this step's demo
+   stack (coordinator **9475**, dashboard **9476**) at **stock
+   configuration** — unlike `dcds34`, nothing about it was tuned, so
+   numbers read off it are numbers about the shipped defaults. **It was
+   put back on `dcds35.env` at session close and verified: all five
+   containers healthy, `/ready` 200, `coordinator_draining 0.0`.** The
+   failure demo's `dcds35-nodrain.env` (the same file plus
+   `SHUTDOWN_DRAIN_SECONDS=0`) is beside it — do not recreate from that
+   one by accident. Both live in **this session's scratchpad and die with
+   it**; the credentials in them are throwaway and are **not** `.env`'s. `dcds34` and its standalone `dcds34-pg` / `dcds34-redis` (the
+   unit-test database on **55434** / **6391**, which the 426-test run
+   used) were left up from the previous session. Teardown:
+   ```bash
+   docker compose -p dcds35 down -v
+   docker compose -p dcds34 down -v
+   docker rm -f dcds34-worker-b dcds34-pg dcds34-redis
+   docker volume rm dcds34-identity-b
+   ```
+5. Still open and unchanged: **no remote Internet worker has taken part in
+   any M3 step (§8 not claimed for 3.1–3.5)**, **every M3 demo has been
+   agent-run rather than user-run** (§15 items 3–4), and
+   `GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` are still to rotate.
+
+### What Step 3.5 actually changes
+
+**The design gate predicted most of this step away and it was right.**
+§3.0.13 committed 3.5 to needing no startup scan — recovery is 3.1's
+continuous reclaimer plus lease renewal on `hello`. Verified against the
+running system rather than taken on trust, and it held: the step's own
+first bullet ("identify assignments with expired or unknown leases") is
+**already true continuously**, and building a boot-time scan would have
+added the second recovery path §3.0.2 rejected.
+
+What did not exist was graceful shutdown:
+
+| On SIGTERM | Before | After |
+|---|---|---|
+| New assignments | one more pass could claim a row | `assign_once` returns 0 before touching the database |
+| `/ready` | 200 until the process dies | **503 `draining`**, ahead of its dependency checks |
+| `/health` | 200 | 200 — unchanged, so no liveness restart |
+| Unacknowledged deliveries | die in the socket buffer | waited for, bounded by 15s |
+| A running task | abandoned | **still abandoned, deliberately** — it survives on its lease |
+| Exit | immediate | after the drain, through uvicorn's own path |
+
+The entrypoint moved from `uvicorn app.main:app` to `python -m app.serve`
+— a `uvicorn.Server` subclass that intercepts the signal, drains, then
+calls uvicorn's own `handle_exit`. **One code path for Compose and
+Kubernetes**; a `preStop` hook was rejected for putting half the behaviour
+in one environment only (§3.5). `terminationGracePeriodSeconds: 45` and
+`stop_grace_period: 45s` are the matching kill deadlines, and a test fails
+if the 15s default window ever grows past them.
+
+### The measurements that matter
+
+- **176 milliseconds to stop, with a `sleep(45)` task running.**
+  `waited_seconds: 0.0` — the drain window was available and went unused,
+  which is the "deliveries, not executions" decision demonstrated rather
+  than described. **That task then completed on its original worker at
+  `attempt_count: 0` with an empty attempts list**, after reconnecting on
+  its existing identity (epoch 1 → 2) and having its lease renewed from
+  the database on `hello`.
+- **15.053s and `timed_out: true`** when a `docker pause`d worker
+  genuinely held an unacknowledged delivery — and `/ready` returned
+  `503 {"status":"draining"}` on every one-second poll from t+2s to t+12s.
+  **Container exit code 0, not 137**, so the drain finished inside the
+  45s deadline rather than being SIGKILLed.
+- **100 workers, 1,000 tasks, coordinator restarted 6s in with 380 tasks
+  in flight — all eight checks pass.** 1,000 rows / 1,000 distinct /
+  1,000 `COMPLETED` / 1,000 results, **0 redeliveries**, **100
+  registrations across 200 sessions** (every worker back, none
+  re-enrolled), reconnect p50 **17.50s** inside a 2.7s band from 276
+  attempts, coordinator **28.8% of one core**, 0 rate-limited retries.
+- **The failure demo is the same image with `SHUTDOWN_DRAIN_SECONDS=0`:**
+  zero `shutdown_drain_started` events, `/ready` answering **200** on the
+  last poll before the process vanished, delivery still unacknowledged
+  when the socket closed. Side by side with twelve seconds of `503`, that
+  is the whole of what this step is.
+
+### Four things building it found
+
+1. **A number that was true and read as flattering.** The harness first
+   reported the fleet's convergence time measured *after* the queue
+   drained — by which point everyone was already back, so it read **0.0**
+   for a run whose real reconnect time was 17.5s. Renamed
+   `converge_after_drain_seconds` with the reading spelled out, and the
+   real distribution moved to `reconnect.seconds`.
+2. **`docker pause` is the right tool here and was the wrong one in 3.4.**
+   3.4 found that a paused worker's socket survives, so it reads the
+   cancel on unpause and never produces a stale result. For 3.5 that same
+   property is exactly what is wanted: it is the only way to hold a
+   delivery unacknowledged and reach the drain's timeout path on purpose.
+3. **The harness under-declared `tasks_in_flight` on reconnect.** It
+   computed `received - completed - refused`, but a refused task never
+   enters `received`, so refusals were subtracted twice — inviting the
+   coordinator to over-credit a reconnecting worker. Found by reading it,
+   not by a failing test.
+4. **The reconnect floor is 15.8s, not 1s, and that is the backoff not the
+   bug.** Each failed attempt doubles the shipped worker's own
+   `WS_BACKOFF_*`, and the coordinator was genuinely unreachable for
+   several seconds. Reported as-is rather than tuned away: it is the price
+   of not having a herd.
+
+### What is NOT done
+
+- **The rolling Kubernetes upgrade — the one unmet criterion.** See item 2
+  above.
+- **Nothing is merged and nothing is deployed.** Both branches are pushed
+  and both PRs are green, but `main` is still at `770d937`, so **neither
+  environment runs any of Step 3.4 or Step 3.5**.
+- **No remote Internet worker**, so §8 is **not** claimed for 3.5.
+- **No user-run demo or failure demo** — every run above was agent-run.
+- **No minimum drain hold** (#198), so a replica with nothing outstanding
+  can be gone in ~180ms, before endpoint removal has necessarily
+  propagated. The residual is one refused connection and a retry on the
+  backoff the worker would have used anyway; no task loss, because leases
+  are durable.
+
+**`.env` was not read and not modified this session, and no secret was
+printed.** `dcds35` runs on throwaway credentials from a file in the
+session scratchpad.
+
+---
+
+## ⇒ 2026-08-05 — STEP 3.4 BUILT AND VERIFIED, AWAITING APPROVAL (SUPERSEDED — 3.4 was approved as #193 and committed as `bf1e819`)
 
 **Step 3.4 (stale result fencing) is built, all six exit criteria are
 measured, and it awaits your approval.** Decisions **#188–#192**, full
