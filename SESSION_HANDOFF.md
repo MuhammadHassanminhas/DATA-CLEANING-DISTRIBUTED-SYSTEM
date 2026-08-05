@@ -21,13 +21,17 @@ step, which is the answer the step's own brief invited.
 
 ### ⇒ START HERE NEXT SESSION
 
-1. **Approve or reject Step 3.6.** It is on branch
-   `phase-3.6-partial-completion`, stacked on `phase-3.5-restart-recovery`.
+1. **Approve or reject Step 3.6.** It is **PR #56**, branch
+   `phase-3.6-partial-completion`, based on `phase-3.5-restart-recovery`
+   and **green — 14 of 14 checks, `MERGEABLE` / `CLEAN`**, read from the
+   API rather than off a tick. The `test` job reports **438 passed**,
+   corroborating the local count on ephemeral Postgres/Redis.
    **Steps 3.7–3.9 are NOT STARTED and must not begin without an explicit
    go-ahead (§9).**
-2. **⚠ The merge queue is now THREE deep and unchanged from last session:
-   PR #54 (`phase-3.4-fencing` → `main`), PR #55 (`phase-3.5-restart-recovery`
-   → `phase-3.4-fencing`), and 3.6 on top of #55.** `main` is still at
+2. **⚠ The merge queue is now THREE deep: PR #54 (`phase-3.4-fencing` →
+   `main`), PR #55 (`phase-3.5-restart-recovery` → `phase-3.4-fencing`),
+   PR #56 (`phase-3.6-partial-completion` → `phase-3.5-restart-recovery`).
+   All three are green and `CLEAN`.** `main` is still at
    **`770d937`**, so **neither environment runs 3.4, 3.5 or 3.6**. Merge
    order is #54, then #55, then 3.6. **I did not merge anything and did not
    touch the cluster:** merging #54 triggers CD, which deploys both
