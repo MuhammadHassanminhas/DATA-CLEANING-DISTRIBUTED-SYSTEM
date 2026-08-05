@@ -8,7 +8,7 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-08-05 (session 25) — STEP 3.4 APPROVED AND COMMITTED, STEP 3.5 BUILT AND VERIFIED, AWAITING APPROVAL
+## ⇒ 2026-08-05 (session 25) — STEP 3.4 APPROVED, STEP 3.5 BUILT AND VERIFIED, BOTH PUSHED AS PRs #54 AND #55, CI GREEN, NOT MERGED
 
 **You approved Step 3.4 and directed that Step 3.5 be built end to end
 with the decisions taken here.** Both are done. 3.4 is committed (it was
@@ -22,22 +22,42 @@ new table, no new Redis key, no protocol change — zero files under
 
 ### ⇒ START HERE NEXT SESSION
 
-1. **Approve or reject Step 3.5.** Two branches exist and **neither is
-   pushed and neither has a PR**:
-   - `phase-3.4-fencing` — commit `bf1e819`, the whole of Step 3.4.
-     `main` is untouched at `770d937`.
-   - `phase-3.5-restart-recovery` — branched off that one, carrying 3.5.
+1. **Merge PR #54, then PR #55.** Both are pushed, open, and **green —
+   14 of 14 checks each, `MERGEABLE` / `CLEAN`**, verified from the API
+   rather than taken off a tick. The `test` job on #55 reports **426
+   passed**, corroborating the local count on ephemeral Postgres/Redis.
+
+   | PR | Branch | Base | Carries |
+   |---|---|---|---|
+   | **#54** | `phase-3.4-fencing` (`bf1e819`) | `main` | Step 3.4 |
+   | **#55** | `phase-3.5-restart-recovery` (`b0c993d`) | **`phase-3.4-fencing`** | Step 3.5 |
+
+   **#55 is STACKED on #54, not on `main`.** Merge #54 first; GitHub
+   retargets #55 to `main` when it does. `main` is untouched at
+   **`770d937`**.
+
+   **⚠ Merging #54 triggers CD**, which deploys both environments and
+   needs the cluster up. It is up. **Do not `az aks stop` while the
+   production reviewer gate is parked** — that is what broke the deploy
+   in session 23.
 
    **Steps 3.6–3.9 are NOT STARTED and must not begin without an explicit
    go-ahead (§9).**
+
+1a. **PR #50 is still open** — `docs/session-24-close`, from an earlier
+   session. Not touched this session, and it is sitting against `main`.
 2. **⚠ One exit criterion is genuinely unmet: the rolling Kubernetes
-   upgrade.** The chart carries `terminationGracePeriodSeconds: 45` and
-   renders, and the drain is environment-independent by construction, but
-   **no rollout was performed** — the AKS cluster was not started, because
-   starting it bills and that was not asked for. The command sequence is
-   in §3.5.5. This is the one thing standing between 3.5 and six of six.
-3. **⚠ The AKS cluster was NOT checked this session.** State unknown, may
-   be billing:
+   upgrade — and it CANNOT be closed until #55 merges.** The chart carries
+   `terminationGracePeriodSeconds: 45` and renders, and the drain is
+   environment-independent by construction, but no rollout was performed.
+   **The reason is now sequencing, not the cluster:** staging cannot test
+   a rolling upgrade of the drain until an image that *contains* the drain
+   is deployed there, and that needs the merge. Command sequence in
+   §3.5.5. This is the one thing standing between 3.5 and six of six.
+3. **⚠ The AKS cluster is RUNNING and is BILLING**, per your own report at
+   session close. It was not started by me and not checked by me — stated
+   as your report rather than as my measurement (§10). Once both PRs have
+   merged, deployed, and the §3.5.5 rollout has been run:
    ```powershell
    az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
    ```
@@ -147,7 +167,9 @@ if the 15s default window ever grows past them.
 
 - **The rolling Kubernetes upgrade — the one unmet criterion.** See item 2
   above.
-- **No push, no PR, no CI run, no deployment.** Two local branches.
+- **Nothing is merged and nothing is deployed.** Both branches are pushed
+  and both PRs are green, but `main` is still at `770d937`, so **neither
+  environment runs any of Step 3.4 or Step 3.5**.
 - **No remote Internet worker**, so §8 is **not** claimed for 3.5.
 - **No user-run demo or failure demo** — every run above was agent-run.
 - **No minimum drain hold** (#198), so a replica with nothing outstanding
