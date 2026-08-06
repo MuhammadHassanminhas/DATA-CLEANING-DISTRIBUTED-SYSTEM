@@ -173,6 +173,96 @@ def test_both_pages_are_served(dashboard):
 
 
 # --------------------------------------------------------------------------
+# The recovery console (Phase 3.7)
+# --------------------------------------------------------------------------
+
+
+def test_the_recovery_feed_forwards_only_its_own_filters(dashboard):
+    """`outcome` is repeatable so the page can watch reassignments and
+    fences together, and everything else is dropped for the same reason
+    `/api/tasks` drops it: the dashboard must not become a way to reach
+    coordinator parameters that are not part of the documented surface."""
+    client, calls, _ = dashboard
+    client.get(
+        "/api/tasks/attempts",
+        params={
+            "outcome": ["REASSIGNED", "FENCED"],
+            "worker_id": "9f1e0c2a-0000-0000-0000-000000000000",
+            "limit": "100",
+            "task_id": "smuggled",
+        },
+    )
+    assert calls[-1]["path"] == "/tasks/attempts"
+    assert calls[-1]["params"] == {
+        "outcome": ["REASSIGNED", "FENCED"],
+        "worker_id": "9f1e0c2a-0000-0000-0000-000000000000",
+        "limit": "100",
+    }
+
+
+def test_the_attempts_path_is_not_swallowed_by_the_task_id_route(dashboard):
+    """`/api/tasks/attempts` shares its prefix with `/api/tasks/{task_id}`,
+    exactly as `/depth` and `/throughput` do. Declaration order is the only
+    thing keeping it a feed rather than a lookup of a task called
+    "attempts", so it gets the same regression test they have."""
+    client, calls, _ = dashboard
+    client.get("/api/tasks/attempts")
+    assert calls[-1]["path"] == "/tasks/attempts"
+
+
+def test_an_unknown_outcome_is_the_coordinators_refusal_not_the_proxys(dashboard):
+    """The proxy does not validate outcome values. The coordinator owns that
+    vocabulary, and a second validator here could only ever disagree with
+    it — so the 400 must arrive from behind the proxy, with its detail."""
+    client, calls, replies = dashboard
+    replies["status"] = 400
+    replies["body"] = {"detail": "unknown outcome 'REASIGNED'"}
+    response = client.get("/api/tasks/attempts", params={"outcome": "REASIGNED"})
+    assert response.status_code == 400
+    assert "REASIGNED" in response.json()["detail"]
+    assert calls[-1]["params"] == {"outcome": ["REASIGNED"]}
+
+
+def test_the_worker_failure_counters_are_proxied(dashboard):
+    client, calls, _ = dashboard
+    client.get("/api/workers/failures")
+    assert calls[-1] == {
+        "method": "GET",
+        "path": "/workers/failures",
+        "params": None,
+        "body": None,
+    }
+
+
+def test_the_recovery_page_is_served_and_carries_no_credential(dashboard):
+    client, _, _ = dashboard
+    page = client.get("/ui/recovery")
+    assert page.status_code == 200
+    assert FAKE_ADMIN not in page.text
+    # The four panels the step's exit criteria name, identified by the text
+    # the operator actually sees rather than by an id only this test knows.
+    for panel in ("failed tasks", "failed workers", "worker reliability", "recovery timeline"):
+        assert panel in page.text
+
+
+def test_every_endpoint_the_recovery_page_calls_exists_on_the_proxy(dashboard):
+    """The page is static HTML, so a renamed proxy route breaks it silently
+    — the browser 404s and a panel stays on "loading…". This walks the
+    `/api/...` literals out of the page and asserts each one routes."""
+    import re
+
+    client, _, _ = dashboard
+    page = client.get("/ui/recovery").text
+    # Trailing slash stripped because the page builds one path by
+    # interpolation (`/api/tasks/${taskId}`), and what is being checked is
+    # the route it lands on, not the id.
+    paths = {match.rstrip("/") for match in re.findall(r"/api/[a-z/]+", page)}
+    assert paths, "the page should call the dashboard's own API"
+    for path in paths:
+        assert client.get(path).status_code != 404, f"{path} is called by the page and does not route"
+
+
+# --------------------------------------------------------------------------
 # Writes
 # --------------------------------------------------------------------------
 

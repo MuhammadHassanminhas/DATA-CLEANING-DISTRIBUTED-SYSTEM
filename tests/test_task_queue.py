@@ -85,7 +85,7 @@ async def _reset(sessionmaker) -> uuid.UUID:
     CI database.
     """
     async with sessionmaker() as session:
-        await session.execute(text("TRUNCATE tasks"))
+        await session.execute(text("TRUNCATE tasks CASCADE"))
         worker_id = uuid.uuid4()
         await session.execute(
             text(
@@ -185,7 +185,7 @@ def test_enqueue_batch_respects_its_cap():
 # --------------------------------------------------------------------------
 
 
-def test_dequeue_claims_the_task_and_leaves_phase_3_columns_alone():
+def test_dequeue_claims_the_task_and_stamps_an_acknowledgement_lease():
     async def body(sessionmaker):
         worker_id = await _reset(sessionmaker)
         async with sessionmaker() as session:
@@ -207,7 +207,7 @@ def test_dequeue_claims_the_task_and_leaves_phase_3_columns_alone():
                 await session.execute(
                     text(
                         "SELECT status, assigned_worker_id, assigned_at, "
-                        "lease_expires_at, attempt_count FROM tasks"
+                        "lease_expires_at, deadline_at, attempt_count FROM tasks"
                     )
                 )
             ).mappings().one()
@@ -215,9 +215,21 @@ def test_dequeue_claims_the_task_and_leaves_phase_3_columns_alone():
         assert row["status"] == "ASSIGNED"
         assert row["assigned_worker_id"] == worker_id
         assert row["assigned_at"] is not None
-        # Phase 2.1 exit criterion: these exist and nothing in M2 writes
-        # them. A dequeue is the most tempting place to break that.
-        assert row["lease_expires_at"] is None
+        # Phase 3.1 reverses the M2 assertion that used to stand here
+        # ("nothing writes `lease_expires_at`"). The claim now carries an
+        # acknowledgement lease, written in the same statement, so a task
+        # delivered to a worker that never answers is recoverable rather
+        # than merely visible.
+        assert row["lease_expires_at"] is not None
+        # The execution cap is stamped at delivery too, not only at
+        # `task_started`. A live run found the reason: the shipped worker
+        # ignores a re-delivery of a task id it is already running, so a
+        # reclaimed task handed back to the same worker never sends a
+        # second `task_started` — and a deadline set only there would
+        # leave that task's lease renewable forever.
+        assert row["deadline_at"] is not None
+        # `attempt_count` still starts at zero and is written by the
+        # reclaimer alone — a first delivery is attempt 0 on the wire.
         assert row["attempt_count"] == 0
 
     run(body)

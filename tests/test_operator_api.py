@@ -31,7 +31,11 @@ from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
 
 from app.config import database_url, redis_url  # noqa: E402
-from app.task_queue import complete_task, mark_status  # noqa: E402
+from app.task_queue import (  # noqa: E402
+    complete_task,
+    mark_status,
+    reclaim_expired_leases,
+)
 
 ADMIN = os.environ["ADMIN_SECRET"]
 AUTH = {"X-Admin-Secret": ADMIN}
@@ -107,7 +111,7 @@ def db(body):
 def reset_tasks():
     async def body(sessionmaker):
         async with sessionmaker() as session:
-            await session.execute(text("TRUNCATE tasks"))
+            await session.execute(text("TRUNCATE tasks CASCADE"))
             await session.commit()
 
     db(body)
@@ -565,3 +569,205 @@ def test_the_validation_handler_keeps_the_error_useful(client):
     assert r.status_code == 422
     body = json.dumps(r.json())
     assert "count" in body and "int" in body
+
+
+# --------------------------------------------------------------------------
+# Per-task-type timeout policy (Phase 3.1)
+# --------------------------------------------------------------------------
+
+
+def clear_policies():
+    async def body(sessionmaker):
+        async with sessionmaker() as session:
+            await session.execute(text("DELETE FROM task_policies"))
+            await session.commit()
+
+    db(body)
+
+
+def test_the_policy_listing_covers_every_type_and_names_its_source(client):
+    """A surface that listed only what had been changed could not answer the
+    question an operator actually has, which is what is in force now."""
+    clear_policies()
+    r = client.get("/tasks/policies", headers=AUTH)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 4
+    by_type = {entry["task_type"]: entry for entry in body["policies"]}
+    assert set(by_type) == {"count_to_n", "hash_rounds", "sleep", "opaque_payload"}
+    assert by_type["sleep"]["max_execution_seconds"] == 3900
+    assert by_type["sleep"]["max_execution_seconds_source"] == "default"
+    # Phase 3.2: the attempt cap is real now, so the listing reports it and
+    # says it came from the code rather than from an operator. In 3.1 this
+    # was `None`, because any number would have been invented (§10).
+    assert by_type["sleep"]["max_attempts"] == 3
+    assert by_type["sleep"]["max_attempts_source"] == "default"
+
+
+def test_a_policy_can_be_set_and_cleared_without_a_restart(client):
+    """Step 3.1's sixth exit criterion, driven the way an operator would.
+    Nothing is restarted or reloaded between these calls."""
+    clear_policies()
+    r = client.put(
+        "/tasks/policies/sleep", headers=AUTH, json={"max_execution_seconds": 120}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["effective"]["max_execution_seconds"] == 120
+    assert r.json()["effective"]["max_execution_seconds_source"] == "policy"
+
+    # Read back through the listing, not the write's own response.
+    listed = {
+        e["task_type"]: e
+        for e in client.get("/tasks/policies", headers=AUTH).json()["policies"]
+    }
+    assert listed["sleep"]["max_execution_seconds"] == 120
+    assert listed["sleep"]["updated_at"] is not None
+    # Untouched fields stay on their code defaults.
+    assert listed["sleep"]["lease_ttl_seconds_source"] == "default"
+
+    r = client.delete("/tasks/policies/sleep", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["removed"] is True
+    assert r.json()["effective"]["max_execution_seconds"] == 3900
+    # A second delete is 200, not 404: the intent is satisfied either way.
+    assert client.delete("/tasks/policies/sleep", headers=AUTH).json()["removed"] is False
+
+
+def test_a_nonsense_policy_is_a_400_naming_the_field(client):
+    """A zero lease TTL would reclaim every task the instant it was
+    assigned. That is a typo, not an attack, and the operator has to be
+    told which field was wrong."""
+    clear_policies()
+    r = client.put("/tasks/policies/sleep", headers=AUTH, json={"lease_ttl_seconds": 0})
+    assert r.status_code == 400
+    assert "lease_ttl_seconds" in r.json()["detail"]
+
+    r = client.put("/tasks/policies/not_a_type", headers=AUTH, json={"lease_ttl_seconds": 60})
+    assert r.status_code == 400
+    assert "not_a_type" in r.json()["detail"]
+
+    r = client.put("/tasks/policies/sleep", headers=AUTH, json={})
+    assert r.status_code == 400
+
+
+def test_every_policy_endpoint_needs_the_operator_credential(client):
+    """The same guard the rest of the task API carries. A worker holds
+    ENROLLMENT_SECRET, and a worker that could rewrite the lease policy
+    could give itself an unbounded execution cap (§12)."""
+    clear_policies()
+    for method, path in (
+        ("get", "/tasks/policies"),
+        ("put", "/tasks/policies/sleep"),
+        ("delete", "/tasks/policies/sleep"),
+    ):
+        call = getattr(client, method)
+        kwargs = {"json": {"lease_ttl_seconds": 60}} if method == "put" else {}
+        assert call(path, **kwargs).status_code == 401
+        assert call(path, headers={"X-Admin-Secret": "wrong"}, **kwargs).status_code == 401
+
+
+def test_a_task_reports_its_lease_and_deadline(client):
+    """§6: the lease has to be visible in the browser, or a reassignment is
+    something that happens off-screen. `lease_seconds_remaining` is computed
+    against the coordinator's clock, not the viewer's."""
+    reset_tasks()
+    task_id = one_task_id(client)
+
+    listed = client.get("/tasks", headers=AUTH).json()["tasks"][0]
+    # A queued task holds no lease, and that is the honest answer.
+    assert listed["lease_expires_at"] is None
+    assert listed["lease_seconds_remaining"] is None
+
+    worker_id = register_worker(client)
+    r = client.post(
+        "/tasks/dequeue",
+        json={"admin_secret": ADMIN, "worker_id": worker_id, "limit": 1},
+    )
+    assert r.status_code == 200, r.text
+    # The raw queue primitive reports the deadline it just imposed — a claim
+    # that did not say so would be a trap for anything driving it directly.
+    assert r.json()["tasks"][0]["lease_expires_at"] is not None
+
+    detail = client.get(f"/tasks/{task_id}", headers=AUTH).json()
+    assert detail["lease_expires_at"] is not None
+    # The execution cap is stamped at delivery too — `task_started`
+    # re-stamps it from the real start.
+    assert detail["deadline_at"] is not None
+    assert 0 < detail["lease_seconds_remaining"] <= 30
+
+
+def test_a_reassigned_task_reports_its_retry_state_and_its_attempt_rows(client):
+    """Phase 3.2, through the API an operator actually drives. A task that
+    lost its worker reports **why it is not being picked up** — the backoff
+    and the excluded worker — and its detail carries one attempt row per
+    abnormal ending, which is what "failed tasks are inspectable, never
+    silently dropped" means in practice."""
+    reset_tasks()
+    task_id = one_task_id(client)
+    worker_id = register_worker(client)
+    assert dequeue_for(client, worker_id)
+
+    def expire_and_reclaim(sessionmaker):
+        async def body(sessionmaker):
+            async with sessionmaker() as session:
+                await session.execute(
+                    text(
+                        "UPDATE tasks SET lease_expires_at = now() - interval '1 second' "
+                        "WHERE id = CAST(:id AS uuid)"
+                    ),
+                    {"id": task_id},
+                )
+                await session.commit()
+            async with sessionmaker() as session:
+                await reclaim_expired_leases(session, batch=100)
+                await session.commit()
+
+        return body(sessionmaker)
+
+    db(expire_and_reclaim)
+
+    listed = client.get("/tasks", headers=AUTH).json()["tasks"][0]
+    assert listed["status"] == "QUEUED"
+    assert listed["attempt_count"] == 1
+    assert listed["excluded_worker_id"] == worker_id
+    assert listed["not_before"] is not None
+    # Ceiling only. The backoff is `random() * 5` seconds, so asserting it
+    # is still in the future would be a flake waiting to happen.
+    assert listed["retry_in_seconds"] <= 5
+
+    detail = client.get(f"/tasks/{task_id}", headers=AUTH).json()
+    assert len(detail["attempts"]) == 1
+    assert detail["attempts"][0]["outcome"] == "REASSIGNED"
+    assert detail["attempts"][0]["reason"] == "lease_expired"
+    assert detail["attempts"][0]["worker_id"] == worker_id
+    # Zero-based on the wire, exactly as the worker was told.
+    assert detail["attempts"][0]["attempt_number"] == 0
+
+    failures = client.get("/workers/failures", headers=AUTH)
+    assert failures.status_code == 200, failures.text
+    rows = failures.json()["workers"]
+    assert [r["worker_id"] for r in rows] == [worker_id]
+    assert rows[0]["failures"] == 1
+    assert rows[0]["outcome"] == "REASSIGNED"
+
+
+def test_a_healthy_task_has_no_attempt_rows_and_no_retry_state(client):
+    """`task_attempts` records abnormal endings **only** (gate §3.0.7), so
+    an empty list here is a fact about the task rather than a gap in the
+    record. Asserted so a later change that starts writing a row per
+    attempt has to justify itself against the hot-path cost."""
+    reset_tasks()
+    task_id = one_task_id(client)
+
+    detail = client.get(f"/tasks/{task_id}", headers=AUTH).json()
+    assert detail["attempts"] == []
+    assert detail["not_before"] is None
+    assert detail["retry_in_seconds"] is None
+    assert detail["excluded_worker_id"] is None
+
+
+def test_the_failure_counters_need_the_operator_credential(client):
+    """Same guard as every other operator read. A per-worker failure
+    profile is exactly the kind of thing that must not be public."""
+    assert client.get("/workers/failures").status_code == 401
+    assert client.get("/workers/failures", headers={"X-Admin-Secret": "wrong"}).status_code == 401

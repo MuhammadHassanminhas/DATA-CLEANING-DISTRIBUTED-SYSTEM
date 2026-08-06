@@ -226,6 +226,43 @@ none and use `updated_at`, which is correct because a terminal state is the
 last write the row receives. A task created before this feature shipped has
 no `started_at`, so its `RUNNING` entry is **absent rather than invented**.
 
+**About `attempts`** (Phase 3.2, extended in 3.4). One entry per attempt of
+this task that ended **abnormally**, oldest first. A task that has run
+cleanly has `[]` — this records endings, not history, so an empty list is a
+fact about the task rather than a gap.
+
+```json
+"attempts":[
+  {"attempt_number":0,"worker_id":"ae0c0a8d-…","outcome":"REASSIGNED",
+   "reason":"lease_expired","recorded_at":"2026-08-05T09:14:02.117+00:00",
+   "correlation_id":"9bb2cd64-…"},
+  {"attempt_number":0,"worker_id":"ae0c0a8d-…","outcome":"FENCED",
+   "reason":"stale_attempt","recorded_at":"2026-08-05T09:14:51.884+00:00",
+   "correlation_id":"9bb2cd64-…"}]
+```
+
+| `outcome` | `reason` | Meaning |
+|---|---|---|
+| `REASSIGNED` | `lease_expired` | the worker stopped answering; the task went back to the queue |
+| `REASSIGNED` | `execution_deadline_exceeded` | the worker was slower than its type's execution cap |
+| `FAILED` | either of the above | the same, but the attempts had run out — the task is terminally `FAILED` |
+| `FENCED` | `stale_attempt` | a result arrived from an **earlier attempt** of a task this worker holds again; refused, nothing written |
+| `FENCED` | `task_reassigned` | a result arrived from a worker the task had been reassigned away from; refused, nothing written |
+| `FAILED` | `executor_error:<type>` | **Phase 3.7** — the worker reported `task_failed`: its executor raised, and this is the exception **type**, never a message and never a traceback (§12). The task is terminally `FAILED` after one attempt; nothing was retried, because a task whose code raises will raise again |
+| `EXPIRED` | `stranded_pre_m3` | closed by migration `0006`'s backfill, before the lease engine existed |
+
+The two `FENCED` rows are the only entries here that record a **refusal**
+rather than something the coordinator did to an attempt. Both mean real
+work was computed and then discarded, and neither changes the task's state
+— the task is still live and some attempt of it will still run to
+completion.
+
+At most one `FENCED` row exists per (task, worker, attempt number), however
+many times the submission is retried. `attempt_number` is worker-reported
+and therefore untrusted, so a submission naming an attempt the task has
+never reached is refused **without** writing a row: the coordinator will
+not record a history that did not happen.
+
 **`result` is `null` after the retention period** (`RESULT_RETENTION_DAYS`,
 default 7). The task row survives forever as the audit trail; only the body
 expires. That is documented behaviour, not a lost result — `completed_at`
@@ -273,12 +310,29 @@ its status is read, so a task is never both cancelled and handed out.
 ### 5.5 `GET /tasks/depth` — queue depth and lifecycle counts
 
 ```json
-{"depth":376,"counts":{"QUEUED":376,"ASSIGNED":1,"COMPLETED":626,"CANCELLED":1}}
+{"depth":376,"counts":{"QUEUED":376,"ASSIGNED":1,"COMPLETED":626,"CANCELLED":1},
+ "fenced_results":0}
 ```
 
 `depth` is the cheap index count of queued work — measured at 2.4 ms
 against 320,025 rows. `counts` groups the whole table and is the more
 expensive read; they are separate so the cheap path stays cheap.
+
+`fenced_results` (Phase 3.4) is how many result submissions have been
+refused because the attempt that produced them had been superseded. It is
+here rather than on an endpoint of its own because this is the read the
+task console already polls, and a fenced result leaves **no trace in any
+lifecycle state** — nothing in `counts` moves when one happens, so without
+this field a discarded result would be findable only by opening the right
+task or grepping one replica's logs.
+
+Counted from `task_attempts`, not from the Prometheus counter, so every
+replica answers identically and the figure survives a restart. It is the
+cheaper of this endpoint's two scans: `task_attempts` holds one row per
+**abnormal** ending where `tasks` holds every task there has ever been.
+
+Which submissions were fenced, and why, is on `GET /tasks/{id}` under
+`attempts` — outcome `FENCED`, reason `stale_attempt` or `task_reassigned`.
 
 ### 5.6 `GET /tasks/throughput` — completions per minute
 
@@ -335,6 +389,61 @@ task for a worker by hand bypasses that and the worker will never be told.
 Phase 1.8. Same credential. Returns every registered worker with its live
 status, last heartbeat, CPU/memory, latency, declared capabilities and
 current tasks. This is what the dashboard reads.
+
+### 5.9 `GET /tasks/attempts` — the recovery feed
+
+Every abnormal ending across the whole fleet, **newest first** (Phase 3.7).
+The read behind the recovery console's live feed.
+
+```bash
+curl -sk "https://localhost:8443/tasks/attempts?outcome=REASSIGNED&limit=20" \
+  -H "X-Admin-Secret: $ADMIN_SECRET"
+```
+
+| Query parameter | Notes |
+|---|---|
+| `outcome` | repeatable — `?outcome=REASSIGNED&outcome=FENCED`. One of `EXPIRED`, `REASSIGNED`, `FENCED`, `FAILED` |
+| `worker_id` | UUID; the events belonging to one worker |
+| `limit` | default 50, capped by `TASK_LIST_MAX_LIMIT` (default 200) — the same cap §5.2 uses, not a second tunable |
+
+```json
+{"attempts":[{"attempt_id":"452f0db5-…","task_id":"372237f8-…",
+              "attempt_number":0,"worker_id":"5ace0370-…",
+              "outcome":"REASSIGNED","reason":"lease_expired",
+              "correlation_id":"4a34fd35-…",
+              "recorded_at":"2026-08-06T07:19:21.613226+00:00"}],
+ "count":1,"limit":50,
+ "filters":{"outcome":null,"worker_id":null}}
+```
+
+The rows are the same `task_attempts` rows §5.3 shows under `attempts` for
+one task, and §5.5 counts for `fenced_results` — read the other way. The
+vocabulary is §5.3's table, unchanged.
+
+**This is the read the other two cannot replace.** §5.3 answers "what
+happened to *this* task" and `GET /workers/failures` answers "how often has
+*this* worker failed"; both need to be told where to look. Watching a
+reassignment happen is the case where nothing is known in advance.
+
+**Ordering is `recorded_at DESC, id DESC`.** The tie-break is not
+decoration: one reclaim writes several rows in a single statement and they
+share `recorded_at` to the microsecond, so without it two consecutive polls
+can return the same rows in a different order — which reads on screen as
+events shuffling.
+
+**An unknown `outcome` is a 400, not an empty list**, for the same reason
+§5.2's unknown status is: on a console opened because something is
+suspected, a typo answered with "no events" reads as "nothing is going
+wrong".
+
+**No index and no migration** (Phase 3.7). This orders by `recorded_at`
+where the table's two indexes lead with `task_id` and `worker_id`, so an
+unfiltered call is a scan and a top-N sort — the same trade §5.5's
+`fenced_results` already takes, because `task_attempts` holds one row per
+*abnormal* ending and is small by construction. **Measured at 29 ms
+end-to-end for `limit=100` against 166 rows** over local TLS, mid-churn.
+An index belongs here when the table passes ~10⁶ rows or the query appears
+in the slow log.
 
 ---
 
@@ -410,5 +519,7 @@ Stated so none of it is mistaken for an oversight:
   deployment that puts many operators behind one dashboard should raise it.
 
 Since Step 2.7 there **is** a browser view of all of this — the task console
-at `/ui/tasks` on the dashboard. It reads the endpoints above through a
-server-side proxy, so the operator credential never reaches the browser.
+at `/ui/tasks` on the dashboard, and since Step 3.7 the recovery console at
+`/ui/recovery` (§5.9's feed, §5.3's attempts, `GET /workers/failures`). Both
+read the endpoints above through a server-side proxy, so the operator
+credential never reaches the browser.

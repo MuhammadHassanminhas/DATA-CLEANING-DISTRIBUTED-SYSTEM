@@ -8,10 +8,25 @@ single-write-path discipline `Worker.status` already follows via
     QUEUED -> ASSIGNED -> RUNNING -> COMPLETED
 
 `FAILED` and `CANCELLED` are terminal and reachable from any live state.
-`REASSIGNED` is reserved for Phase 3 and is deliberately unreachable in
-V1: the constant exists so Phase 3 adds a transition rather than a state,
-but no entry in `_ALLOWED` targets it, so attempting the move raises
-today. There is a test asserting exactly that.
+
+**Phase 3.1 adds `ASSIGNED -> QUEUED` and `RUNNING -> QUEUED`** — the
+lease reclaimer returning a task whose worker stopped answering. That is
+the recovery move the whole milestone stands on, and it is a *return to
+the queue*, not a new state.
+
+`REASSIGNED` stays unreachable as a **status**, and the gate is explicit
+that this is a decision rather than an oversight (§3.0.7): the queue is
+`WHERE status = 'QUEUED'`, so a recovered task must genuinely be `QUEUED`
+to be claimable again. A `REASSIGNED` status would be either a state
+nothing can observe or a second queue predicate to maintain forever. The
+constant is kept for the meaning it does have — the *attempt* that was
+superseded, which Step 3.2 records in `task_attempts`.
+
+This corrects the pre-M3 wording here and in `task_queue`'s module
+docstring, both of which said returning a task to the queue *is* the
+`REASSIGNED` transition. They were written before the queue predicate had
+its present shape; the gate named the contradiction rather than quietly
+resolving it, and this is where it is resolved.
 
 **All transitions are coordinator-authoritative.** A worker never writes
 task state; it reports, and the coordinator decides what that means.
@@ -43,10 +58,16 @@ TERMINAL_STATES = frozenset({COMPLETED, FAILED, CANCELLED})
 # Reachability, not policy. That a task *can* move to FAILED is settled
 # here; what the coordinator does about a failure — retry, reassign,
 # give up — is Phase 3 and is deliberately not encoded in this table.
+#
+# The two `-> QUEUED` moves are Phase 3.1's, and they are reachable *only*
+# from the lease reclaimer: no worker-reported message can ask for them.
+# `mark_status` takes a worker's word for `RUNNING` and `FAILED`; a worker
+# asking to put its own task back in the queue would be a worker deciding
+# scheduling, which §3.2 forbids outright.
 _ALLOWED: dict[str, frozenset[str]] = {
     QUEUED: frozenset({ASSIGNED, CANCELLED}),
-    ASSIGNED: frozenset({RUNNING, FAILED, CANCELLED}),
-    RUNNING: frozenset({COMPLETED, FAILED, CANCELLED}),
+    ASSIGNED: frozenset({RUNNING, FAILED, CANCELLED, QUEUED}),
+    RUNNING: frozenset({COMPLETED, FAILED, CANCELLED, QUEUED}),
     COMPLETED: frozenset(),
     FAILED: frozenset(),
     CANCELLED: frozenset(),

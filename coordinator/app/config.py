@@ -327,6 +327,201 @@ def heartbeat_sweep_interval_seconds() -> int:
     return int(os.environ.get("HEARTBEAT_SWEEP_INTERVAL_SECONDS", "5"))
 
 
+def task_ack_timeout_seconds() -> int:
+    """How long a delivered task may sit unacknowledged before its lease
+    expires (Phase 3.1, gate default 30).
+
+    **Recommendation, not a measured value** — but derived rather than
+    picked: it is roughly 3x the *measured* worst heartbeat gap under
+    saturation (10.52s, Step 2.9), so a worker that is merely busy has
+    room to answer before the coordinator gives up on the delivery.
+
+    This is the first of the three distinct timeouts the step's own exit
+    criterion names. It covers **delivery**: the window between
+    `QUEUED -> ASSIGNED` and any coordinator-observed message about that
+    task. Once the worker reports `task_started`, `task_lease_ttl_seconds`
+    takes over.
+
+    Per-type overrides live in the `task_policies` table and win over this
+    default without a redeploy (see `app.task_policies`).
+    """
+    return int(os.environ.get("TASK_ACK_TIMEOUT_SECONDS", "30"))
+
+
+def task_lease_ttl_seconds() -> int:
+    """How far into the future a renewal pushes a task's lease (Phase 3.1,
+    gate default 60).
+
+    **Recommendation, not a measured value.** It is six worker progress
+    intervals — the cadence *is* measured at 10s (`worker/worker.py`) — so
+    five consecutive dropped progress messages still do not cost a healthy
+    task its lease.
+
+    It is also the third of the three timeouts, and the gate is explicit
+    that it does double duty rather than getting its own column: the
+    **result-submission** window is the lease. A worker that finishes
+    executing and then never submits stops sending anything about that
+    task, so its lease runs out one TTL after its last observed message.
+    A fourth timeout would have been a second name for the same clock.
+    """
+    return int(os.environ.get("TASK_LEASE_TTL_SECONDS", "60"))
+
+
+def task_lease_renew_fraction() -> float:
+    """Renew a lease only once less than this fraction of it remains
+    (Phase 3.1, gate default 0.5).
+
+    **This is the whole cost-control story for lease renewal.** Every
+    observed message about a running task is a renewal opportunity, and
+    the worker sends progress every 10s; writing on each one would put ~10
+    UPDATEs per second per 100 running tasks onto the `tasks` table, which
+    under Decision #79 *is* the queue's hot path. At half of a 60s TTL the
+    same fleet writes roughly one UPDATE per task per 30s.
+
+    The check is made against this replica's own monotonic clock from the
+    session that holds the socket, so a message that is not yet due costs
+    **no database round trip at all**, not merely no write.
+    """
+    return float(os.environ.get("TASK_LEASE_RENEW_FRACTION", "0.5"))
+
+
+def task_max_execution_seconds_default() -> int:
+    """Fallback execution cap for a task type with no per-type default
+    (Phase 3.1). Recommendation, not a measured value.
+
+    The per-type defaults live in `app.task_types.DEFAULT_MAX_EXECUTION_SECONDS`
+    because an execution cap is a property of the workload, not of the
+    deployment. This exists so a type added later without one is still
+    bounded rather than unbounded.
+    """
+    return int(os.environ.get("TASK_MAX_EXECUTION_SECONDS", "300"))
+
+
+def lease_reclaim_interval_seconds() -> int:
+    """How often each replica runs the lease reclaimer (Phase 3.1, gate
+    default 5). Recommendation, not a measured value — it matches the
+    shipped heartbeat sweep cadence, which is the other loop of this shape.
+
+    It is one half of the detection bound the step has to verify: a socket
+    close is followed by reassignment within
+    `LEASE_DISCONNECT_GRACE_SECONDS + this`, and a silent worker within
+    `TASK_LEASE_TTL_SECONDS + this`.
+    """
+    return int(os.environ.get("LEASE_RECLAIM_INTERVAL_SECONDS", "5"))
+
+
+def lease_reclaim_batch() -> int:
+    """Most tasks one reclaim pass may take. Recommendation, not measured.
+
+    Matches `TASK_DEQUEUE_MAX_BATCH` for the same reason that one exists:
+    the pass holds a row lock per task for the length of its transaction,
+    and an unbounded reclaim after a large fleet outage would hold
+    thousands. The loop simply runs again on the next tick.
+    """
+    return int(os.environ.get("LEASE_RECLAIM_BATCH", "100"))
+
+
+def lease_disconnect_grace_seconds() -> int:
+    """How long a task's lease survives its worker's socket closing
+    (Phase 3.1, gate default 30). Recommendation, not a measured value.
+
+    Deliberately **longer than the worker's reconnect backoff**, so a
+    worker that drops and comes straight back renews its own leases on
+    `hello` and loses nothing. Shorter than the lease TTL, so an observed
+    close still accelerates detection — which is the entire reason a close
+    shortens a lease instead of reclaiming outright (gate §3.0.2).
+    """
+    return int(os.environ.get("LEASE_DISCONNECT_GRACE_SECONDS", "30"))
+
+
+def shutdown_drain_seconds() -> float:
+    """How long a graceful shutdown may hold the process open to finish
+    what it has already handed out (Phase 3.5). **Recommendation, not a
+    measured value** — an upper bound on a wait that normally ends far
+    sooner, because it ends on the last ack rather than on the clock.
+
+    It is a *ceiling*, so the cost of setting it generously is paid only by
+    a shutdown that genuinely has work outstanding. What it must be smaller
+    than is the environment's kill deadline —
+    `terminationGracePeriodSeconds` in Kubernetes,
+    `stop_grace_period` in Compose — or SIGKILL arrives mid-drain and the
+    drain buys nothing. Both are set to 45 in this repo against this
+    default of 15, leaving room for the rest of shutdown.
+
+    Set it to 0 to exit as soon as the signal arrives, which is the
+    pre-3.5 behaviour.
+    """
+    return float(os.environ.get("SHUTDOWN_DRAIN_SECONDS", "15"))
+
+
+def task_max_attempts() -> int:
+    """How many executions a task gets before it is terminally `FAILED`
+    (Phase 3.2, gate default 3). Recommendation, not a measured value —
+    one retry for a transient fault, one for an unlucky second, then stop.
+
+    **Zero-based, and this is exactly where an off-by-one hides.**
+    `attempt_count` is 0 for a first delivery and is already on the wire as
+    `attempt: 0` (`assignment._deliver`), so 3 means the executions
+    numbered 0, 1 and 2. A task whose incremented count reaches this number
+    has no attempt left and goes to `FAILED`.
+
+    Per-type overrides live in `task_policies.max_attempts` and win over
+    this default without a redeploy, so a type that is expensive to re-run
+    can be given one attempt while a cheap one gets five.
+    """
+    return int(os.environ.get("TASK_MAX_ATTEMPTS", "3"))
+
+
+def task_retry_backoff_base_seconds() -> float:
+    """First retry delay before jitter (Phase 3.2, gate default 5).
+
+    Recommendation, not a measured value. It mirrors the worker's shipped
+    reconnect backoff (`worker.py`'s `_full_jitter`), which is the other
+    place in this system where something failed and is about to be tried
+    again — one backoff shape to reason about rather than two.
+    """
+    return float(os.environ.get("TASK_RETRY_BACKOFF_BASE_SECONDS", "5"))
+
+
+def task_retry_backoff_factor() -> float:
+    """Multiplier per attempt (Phase 3.2, gate default 2). Recommendation.
+
+    The delay is **full jitter**: `random() * min(max, base * factor^attempt)`.
+    Full rather than fixed because the failure that produces retries is
+    usually a worker or a network dying under many tasks at once — an
+    unjittered backoff would return every one of them to the queue in the
+    same instant, which is the thundering herd the recovery system would
+    then be causing itself.
+    """
+    return float(os.environ.get("TASK_RETRY_BACKOFF_FACTOR", "2"))
+
+
+def task_retry_backoff_max_seconds() -> float:
+    """Ceiling on the pre-jitter retry delay (Phase 3.2, gate default 60).
+
+    Recommendation, not a measured value. It bounds the exponential so a
+    task with a high per-type `max_attempts` cannot end up waiting hours
+    between attempts.
+    """
+    return float(os.environ.get("TASK_RETRY_BACKOFF_MAX_SECONDS", "60"))
+
+
+def task_retry_exclusion_seconds() -> int:
+    """How long the worker that lost a task stays ineligible for it
+    (Phase 3.2, gate default 60). Recommendation, not a measured value.
+
+    **The window is bounded deliberately, and the gate is explicit about
+    why** (§3.0.6): a permanent exclusion starves the task to death on a
+    single-worker fleet, which is precisely the shape of a laptop demo and
+    of one Internet worker on a hotspot. Eventually retrying on the same
+    worker is better than never retrying at all.
+
+    Measured from `not_before`, which is the retry-backoff instant — one
+    column, one meaning: this row is not eligible yet.
+    """
+    return int(os.environ.get("TASK_RETRY_EXCLUSION_SECONDS", "60"))
+
+
 def worker_claim_ttl_seconds() -> int:
     """Recommendation, not a measured value.
 

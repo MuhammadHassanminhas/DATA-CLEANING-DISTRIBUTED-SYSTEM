@@ -168,7 +168,7 @@ def run(body):
 async def _reset(sessionmaker, workers: int = 1) -> list[uuid.UUID]:
     ids = [uuid.uuid4() for _ in range(workers)]
     async with sessionmaker() as session:
-        await session.execute(text("TRUNCATE tasks"))
+        await session.execute(text("TRUNCATE tasks CASCADE"))
         for worker_id in ids:
             await session.execute(
                 text(
@@ -599,6 +599,98 @@ def test_the_phase_3_columns_stay_untouched_by_execution():
             # Completion timestamps belong to Step 2.5, including for a
             # failure: `updated_at` already records when this moved.
             assert row["completed_at"] is None
+
+        return inner(sessionmaker)
+
+    run(_body)
+
+
+def test_a_worker_reported_failure_records_why_it_failed():
+    """Phase 3.7. The failure carries a reason, end to end.
+
+    Until this step `handle_task_failed` logged `error_type` and stored
+    nothing, so the only two places a failure's cause existed were one
+    replica's log stream and the worker's own. The recovery console reads
+    `task_attempts`, so a failure that writes no row there is a task the GUI
+    can only describe as "failed".
+
+    Asserted through the real handler rather than against
+    `record_execution_failure` directly — the unit is covered in
+    `test_recovery_views.py`, and what is worth proving here is that the
+    handler's transaction is the one that carries it, so a task cannot be
+    terminal without its explanation.
+    """
+
+    def _body(sessionmaker):
+        async def inner(sm):
+            worker_id = (await _reset(sm))[0]
+            await _fill(sm, count=1)
+            session = make_session(worker_id)
+            register_session(session)
+            await assign_once()
+            task_id = session.websocket.assignments()[0]["payload"]["task_id"]  # type: ignore[attr-defined]
+
+            await handle_task_started(session, {"payload": {"task_id": task_id}})
+            await handle_task_failed(
+                session,
+                {
+                    "payload": {"task_id": task_id, "error_type": "ZeroDivisionError"},
+                    "correlation_id": "corr-failure",
+                },
+            )
+
+            async with sm() as db:
+                rows = (
+                    await db.execute(
+                        text(
+                            "SELECT attempt_number, worker_id, outcome, reason, correlation_id "
+                            "FROM task_attempts WHERE task_id = CAST(:id AS uuid)"
+                        ),
+                        {"id": task_id},
+                    )
+                ).mappings().all()
+
+            assert len(rows) == 1
+            assert rows[0]["outcome"] == FAILED
+            assert rows[0]["reason"] == "executor_error:ZeroDivisionError"
+            assert str(rows[0]["worker_id"]) == str(worker_id)
+            assert rows[0]["attempt_number"] == 0
+            assert rows[0]["correlation_id"] == "corr-failure"
+
+        return inner(sessionmaker)
+
+    run(_body)
+
+
+def test_a_failure_the_database_refuses_records_no_reason():
+    """A worker naming a task it does not hold gets no attempt row.
+
+    The insert is inside the `TRANSITIONED` branch, so a `NOT_OWNER` — the
+    §12 case, a worker reporting on somebody else's task — cannot write
+    history. Without that the recovery record would be worker-writable,
+    which is exactly what the fencing step spent itself preventing.
+    """
+
+    def _body(sessionmaker):
+        async def inner(sm):
+            worker_ids = await _reset(sm, workers=2)
+            await _fill(sm, count=1)
+            holder = make_session(worker_ids[0])
+            register_session(holder)
+            await assign_once()
+            task_id = holder.websocket.assignments()[0]["payload"]["task_id"]  # type: ignore[attr-defined]
+
+            impostor = make_session(worker_ids[1])
+            register_session(impostor)
+            await handle_task_failed(
+                impostor, {"payload": {"task_id": task_id, "error_type": "ValueError"}}
+            )
+
+            async with sm() as db:
+                count = (
+                    await db.execute(text("SELECT count(*) FROM task_attempts"))
+                ).scalar_one()
+            assert count == 0
 
         return inner(sessionmaker)
 

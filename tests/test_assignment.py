@@ -143,7 +143,7 @@ async def _reset(sessionmaker, workers: int = 1) -> list[uuid.UUID]:
     """
     ids = [uuid.uuid4() for _ in range(workers)]
     async with sessionmaker() as session:
-        await session.execute(text("TRUNCATE tasks"))
+        await session.execute(text("TRUNCATE tasks CASCADE"))
         for worker_id in ids:
             await session.execute(
                 text(
@@ -417,15 +417,19 @@ def test_a_task_reaches_an_eligible_worker_and_is_recorded_assigned():
                     await session_db.execute(
                         text(
                             "SELECT status, assigned_worker_id, assigned_at, "
-                            "lease_expires_at, attempt_count FROM tasks"
+                            "lease_expires_at, deadline_at, attempt_count FROM tasks"
                         )
                     )
                 ).mappings().one()
             assert row["status"] == "ASSIGNED"
             assert str(row["assigned_worker_id"]) == str(worker_id)
             assert row["assigned_at"] is not None
-            # Phase 2.1 reservation still holds — M2 writes neither.
-            assert row["lease_expires_at"] is None
+            # Phase 3.1: delivery is now leased. The task carries an
+            # acknowledgement expiry and an execution cap from the moment
+            # it is claimed, so "committed before send" no longer means
+            # "unrecoverable if the send never lands".
+            assert row["lease_expires_at"] is not None
+            assert row["deadline_at"] is not None
             assert row["attempt_count"] == 0
 
         return inner(sessionmaker)

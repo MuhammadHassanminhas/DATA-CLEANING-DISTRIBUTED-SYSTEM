@@ -155,7 +155,7 @@ async def _reset(sessionmaker, workers: int = 1) -> list[uuid.UUID]:
     assignment._local_sessions.clear()
     ids = [uuid.uuid4() for _ in range(workers)]
     async with sessionmaker() as session:
-        await session.execute(text("TRUNCATE tasks"))
+        await session.execute(text("TRUNCATE tasks CASCADE"))
         await session.execute(text("TRUNCATE task_results CASCADE"))
         for worker_id in ids:
             await session.execute(
@@ -369,13 +369,21 @@ def test_a_duplicate_submission_writes_nothing_the_second_time():
 
 def test_a_duplicate_is_acknowledged_as_accepted_so_the_worker_stops_retrying():
     """From the worker's side a duplicate *is* success — the task is
-    completed and there is nothing left to submit."""
+    completed and there is nothing left to submit.
+
+    **The same message object twice, and Phase 3.3 is why it has to be.** A
+    real retry re-sends the envelope it already built, idempotency token and
+    all; the worker mints that token once per task execution. Two calls to
+    `result_message` would be two *different* submissions for one task, which
+    3.3 answers `superseded` — see `tests/test_idempotency.py`.
+    """
 
     def _body(sessionmaker):
         async def inner(sm):
             session, task_id = await _assigned_and_running(sm)
-            await handle_task_result(session, result_message(task_id))
-            await handle_task_result(session, result_message(task_id))
+            retry = result_message(task_id)
+            await handle_task_result(session, retry)
+            await handle_task_result(session, retry)
 
             acks = session.websocket.acks()  # type: ignore[attr-defined]
             assert [a["payload"]["outcome"] for a in acks] == [TRANSITIONED, DUPLICATE]

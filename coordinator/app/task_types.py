@@ -91,6 +91,54 @@ TASK_TYPES: dict[str, type[_Params]] = {
 }
 
 
+# Phase 3.1. The hard execution cap per type, in seconds — how long a
+# worker may hold one task of this type before the coordinator takes it
+# back, no matter how diligently it renews its lease. It lives here rather
+# than in `config.py` because it is a property of the **workload**, not of
+# the deployment: `sleep(3600)` is legally an hour on any machine.
+#
+# This supersedes Decision #103 ("no execution timeout is added"), which
+# reasoned that duration is bounded by parameter validation. That is true
+# of a *legal* duration and says nothing about a hung executor — the
+# failure this cap exists for (gate §3.0.11).
+#
+# **Where each number comes from, and it is not the same answer for each
+# (§10):**
+#
+#   * `sleep` — 3900 is the type's own parameter ceiling (3600s, above)
+#     plus 300s of slack for delivery, start-up and the result round trip.
+#     Derived, not measured.
+#   * `hash_rounds` — the 10,000,000-round ceiling was **measured** at
+#     15.4s on one core (Step 2.9); 300 is ~20x that, so slow hardware is
+#     not punished.
+#   * `count_to_n` — **measured in this step**, because the gate flagged
+#     it as the one figure with no measurement behind it. The 100,000,000
+#     ceiling runs at a median of **4.801s** over three runs (4.771 /
+#     4.801 / 5.124) on the reference laptop, single core, through the
+#     executor's own chunked loop. 300 is ~62x that.
+#   * `opaque_payload` — a 64 KB echo, so 60s is already generous.
+#
+# Every one is a **default**, not a limit: a `task_policies` row overrides
+# it without a redeploy.
+DEFAULT_MAX_EXECUTION_SECONDS: dict[str, int] = {
+    "count_to_n": 300,
+    "hash_rounds": 300,
+    "sleep": 3900,
+    "opaque_payload": 60,
+}
+
+
+# Same discipline as `task_queue`'s transition check: a registry entry with
+# no execution cap would silently fall back to the global default and
+# nobody would notice for a phase. Not an `assert` — those vanish under
+# `python -O`.
+if set(DEFAULT_MAX_EXECUTION_SECONDS) != set(TASK_TYPES):
+    raise RuntimeError(
+        "every task type needs a DEFAULT_MAX_EXECUTION_SECONDS entry; missing: "
+        f"{sorted(set(TASK_TYPES) - set(DEFAULT_MAX_EXECUTION_SECONDS))}"
+    )
+
+
 class UnknownTaskType(ValueError):
     """Raised when a task type is not registered in `TASK_TYPES`."""
 

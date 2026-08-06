@@ -13,6 +13,15 @@ data:
   POSTGRES_DB: {{ .Values.config.postgresDb | quote }}
   REDIS_HOST: redis
   REDIS_PORT: "6379"
+  # Pinned, not defaulted in code: kubelet injects a service-link variable
+  # `<SERVICE>_PORT=tcp://<ip>:<port>` into every pod for every Service in
+  # the namespace, and there is a Service named `coordinator`. Step 3.5's
+  # entrypoint (`python -m app.serve`) is the first thing to read
+  # COORDINATOR_PORT, so without this the coordinator parses
+  # "tcp://10.0.x.x:8443" as an int and crashloops — in Kubernetes only.
+  # POSTGRES_PORT and REDIS_PORT above are pinned for the same reason.
+  COORDINATOR_HOST: "0.0.0.0"
+  COORDINATOR_PORT: "8443"
   LOG_LEVEL: {{ .Values.config.logLevel | quote }}
   COORDINATOR_URL: https://coordinator:8443
   RUN_MIGRATIONS_ON_STARTUP: "false"

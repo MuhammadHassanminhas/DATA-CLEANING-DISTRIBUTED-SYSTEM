@@ -34,18 +34,21 @@ from app.assignment import (
     LocalSession,
     assignment_loop,
     current_tasks_key,
+    lease_reclaim_loop,
     handle_capacity,
     handle_task_ack,
     handle_task_failed,
     handle_task_progress,
     handle_task_result,
     handle_task_started,
+    is_draining,
     log_unacknowledged,
     notification_listener,
     notify_work_available,
     parse_capabilities,
     parse_tasks_in_flight,
     register_session,
+    shorten_local_leases,
     unregister_session,
 )
 from app.config import (
@@ -88,6 +91,7 @@ from app.redis_client import redis_client
 from app.schemas import (
     DequeueTaskRequest,
     EnqueueTaskRequest,
+    TaskPolicyRequest,
     PushRequest,
     RegisterRequest,
     ReleaseRequest,
@@ -111,12 +115,25 @@ from app.task_queue import (
     cancel_queued_task,
     completions_per_minute,
     counts_by_status,
+    KNOWN_ATTEMPT_OUTCOMES,
     dequeue,
     enqueue_batch,
+    fenced_result_count,
     get_task,
     list_tasks,
     purge_expired_results,
     queue_depth,
+    recent_attempts,
+    renew_worker_leases,
+    task_attempts,
+    worker_failure_counts,
+)
+from app.task_policies import (
+    InvalidTaskPolicy,
+    clear_policy,
+    effective_policies,
+    set_policy,
+    validate_policy,
 )
 from app.task_states import UnknownTaskState
 from app.task_types import InvalidTaskParameters, UnknownTaskType
@@ -240,6 +257,13 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     # Step 2.5. Same shape as the two above and for the same reason: it holds
     # no state, and a replica without it still serves every request.
     retention_task = asyncio.create_task(_result_retention_loop())
+    # Step 3.1. The recovery engine, and the same shape again: every replica
+    # runs one, no leader is elected, and safety comes from
+    # `FOR UPDATE SKIP LOCKED` rather than from coordination (§3.9). A
+    # replica whose reclaimer is missing serves every request and simply
+    # contributes nothing to recovery; the others still reclaim its
+    # workers' tasks, because a lease is a row and not a socket.
+    reclaim_task = asyncio.create_task(lease_reclaim_loop())
     yield
     # No app-level connection drain here: uvicorn's own `Server.shutdown()`
     # calls `connection.shutdown()` on every live WebSocket (a proper
@@ -248,7 +272,13 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     # verified live (Decisions Log #21). By this point every `ws_connect`
     # handler has already run its own `finally` cleanup below, so there is
     # nothing left here to drain.
-    for background in (sweep_task, assignment_task, notification_task, retention_task):
+    for background in (
+        sweep_task,
+        assignment_task,
+        notification_task,
+        retention_task,
+        reclaim_task,
+    ):
         background.cancel()
         try:
             await background
@@ -321,6 +351,20 @@ async def ready(response: Response) -> dict[str, object]:
     Checks every external dependency directly rather than trusting
     cached state, since nothing authoritative is held in memory.
     """
+    # Phase 3.5. A draining replica is *healthy* and not *ready*, and the
+    # split is the point: `/health` keeps answering, so the liveness probe
+    # never restarts a pod that is deliberately shutting down, while
+    # `/ready` fails immediately so the Service and the ingress stop
+    # sending it new workers before its sockets close.
+    #
+    # Answered before the dependency checks rather than after, because the
+    # answer cannot change: no result from Postgres or Redis makes a
+    # draining replica ready again, and a shutdown should not be spending
+    # its window on queries whose outcome it will ignore.
+    if is_draining():
+        response.status_code = 503
+        return {"status": "draining", "checks": {}}
+
     checks: dict[str, str] = {}
     healthy = True
 
@@ -668,6 +712,58 @@ async def list_workers(response: Response, x_admin_secret: str = Header(default=
         items.append(item)
 
     return {"workers": items, "server_time": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/workers/failures")
+async def worker_failures(
+    request: Request, response: Response, x_admin_secret: str = Header(default="")
+) -> dict[str, object]:
+    """Per-worker failure counters (Phase 3.2 exit criterion).
+
+    One row per worker per outcome, counted from `task_attempts` — the same
+    rows `GET /tasks/{id}` shows on an individual task, aggregated the other
+    way. `REASSIGNED` means a worker lost a task that was tried again;
+    `FAILED` means it held the attempt that used the last one up.
+
+    **Derived, never accumulated.** A counter column on `workers` would be
+    a second write on the recovery path and a number that could disagree
+    with the history it summarises; this cannot drift, because it *is* the
+    history.
+
+    **A separate endpoint from `GET /workers` on purpose.** That one is the
+    dashboard's 2s poll (§6); this is a grouped scan over a table that
+    grows with every abnormal ending. The rare read must not be charged to
+    the frequent one — the same reasoning that keeps `counts_by_status` out
+    of `queue_depth`.
+
+    This is also the read Phase 4 consumes: "which workers fail most" is a
+    scheduling input, and it is **coordinator-observed** (§12) — every row
+    here was written by the reclaimer, never reported by a worker.
+
+    Declared before `/workers/{worker_id}/...` routes: FastAPI matches in
+    declaration order, and `failures` must not be read as a worker id.
+    """
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="worker_failures"
+    )
+    if rejection is not None:
+        return rejection
+
+    async with get_session() as session:
+        rows = await worker_failure_counts(session)
+
+    return {
+        "workers": [
+            {
+                "worker_id": str(row["worker_id"]),
+                "outcome": row["outcome"],
+                "failures": int(row["failures"]),
+                "last_failure_at": row["last_failure_at"].isoformat(),
+            }
+            for row in rows
+        ],
+        "count": len(rows),
+    }
 
 
 @app.post("/workers/token/refresh")
@@ -1045,6 +1141,48 @@ async def ws_connect(websocket: WebSocket) -> None:
     )
     register_session(local_session)
 
+    # Step 3.1: a reconnecting worker is still executing whatever it had, so
+    # renew the leases on its live tasks before the reclaimer's next tick.
+    # This is the whole of "coordinator restart and recovery" for the worker
+    # side of the problem, and it is why the gate could say Step 3.5 needs no
+    # startup scan (§3.0.13): a task's lease is renewed by the worker coming
+    # back, not by a coordinator sweeping its own tables on boot.
+    #
+    # **The task ids come from the database, never from the `hello`.** The
+    # worker is trusted for its identity — the access token proved that —
+    # and for nothing else (§12). It is asked which tasks it holds by
+    # querying `assigned_worker_id`, not by reading a list it supplied.
+    #
+    # Failure is logged and swallowed: without the renewal those tasks
+    # expire on their own clock and are reassigned, which is a worse outcome
+    # than a clean reconnect but is not a broken one. Refusing the
+    # connection would be.
+    try:
+        async with get_session() as db:
+            renewed = await renew_worker_leases(db, worker_id=worker_id)
+            if renewed:
+                await db.commit()
+        if renewed:
+            # Hand the session the ids the *database* just named. Without
+            # this the reconnecting session has no key for work it did not
+            # deliver, so every later progress message about that work would
+            # be skipped and the task reclaimed from a worker that was busy
+            # running it. See `LocalSession.recovered_tasks`.
+            local_session.recovered_tasks.update(renewed)
+            logger.info(
+                "task_leases_renewed_on_hello",
+                extra={
+                    "worker_id": worker_id,
+                    "tasks": len(renewed),
+                    "session_epoch": session_epoch,
+                },
+            )
+    except Exception as exc:  # noqa: BLE001 — a failed renewal costs a reassignment, not a session
+        logger.warning(
+            "task_lease_renew_on_hello_failed",
+            extra={"worker_id": worker_id, "detail": str(exc)},
+        )
+
     try:
         while True:
             try:
@@ -1126,7 +1264,7 @@ async def ws_connect(websocket: WebSocket) -> None:
         push_task.cancel()
         control_task.cancel()
         # Step 2.3 exit criterion: name every task this session was handed
-        # but never acknowledged. Detection only — Phase 3 owns recovery.
+        # but never acknowledged. Step 3.1 is what recovers them.
         log_unacknowledged(local_session, reason="worker_disconnected")
         unregister_session(worker_id, session_epoch)
         current = await redis_client.get(registry_key)
@@ -1138,6 +1276,32 @@ async def ws_connect(websocket: WebSocket) -> None:
             # progress that can no longer advance.
             await redis_client.delete(current_tasks_key(worker_id))
             await _transition_status(worker_uuid, "OFFLINE", "ws_disconnected")
+            # Step 3.1: this replica personally observed the socket close, so
+            # it cuts that worker's live leases to the disconnect grace.
+            # Nothing is reclaimed here — the reclaimer still does that, one
+            # tick later. The grace is longer than the worker's reconnect
+            # backoff on purpose, so a worker that drops and comes straight
+            # back renews its own leases on `hello` and loses no work.
+            #
+            # **Inside the epoch guard, and that placement is the whole
+            # correctness argument.** A superseded session's teardown runs
+            # *after* the winning session has registered and renewed
+            # (Step 1.7), so shortening from it would cut a lease that a
+            # live, working worker had just had extended — and with the
+            # shipped defaults the grace (30s) and the renewal interval
+            # (0.5 x 60s) are the same length, so there would be no margin
+            # to absorb it. The guard makes the superseded case skip
+            # entirely, exactly as it already does for the registry key.
+            #
+            # A residual interleaving remains and is recorded rather than
+            # claimed away: if the new session writes the registry between
+            # this read and the UPDATE, the shorten lands on the new
+            # session's lease. The cost is bounded at one unnecessary
+            # reassignment of a task that will be executed again — the
+            # at-least-once guarantee (§3.0.5) already covers it — and the
+            # window is the few milliseconds between two adjacent
+            # statements.
+            await shorten_local_leases(worker_id, reason="worker_disconnected")
 
 
 @app.post("/workers/{worker_id}/push")
@@ -1284,7 +1448,44 @@ def _task_summary(row: dict[str, Any]) -> dict[str, object]:
         "correlation_id": row["correlation_id"],
         "observed_duration_seconds": _observed_duration(assigned_at, completed_at),
         "has_result": row["result_id"] is not None,
+        # Phase 3.1. `lease_expires_at` is when the coordinator will take
+        # this task back if it hears nothing more; `deadline_at` is the cap
+        # no amount of worker renewal can push past. Both are NULL for a
+        # task that is queued or finished, which is the honest answer — a
+        # task nobody holds has no lease.
+        "lease_expires_at": (
+            row["lease_expires_at"].isoformat() if row["lease_expires_at"] else None
+        ),
+        "deadline_at": row["deadline_at"].isoformat() if row["deadline_at"] else None,
+        # Seconds of lease left, computed here rather than in the browser so
+        # the countdown is against the **coordinator's** clock. A dashboard
+        # subtracting from the viewer's clock would show a different number
+        # on every laptop in the room, which is exactly the failure mode
+        # `completions_per_minute` already avoids by bucketing in Postgres.
+        "lease_seconds_remaining": _seconds_until(row["lease_expires_at"]),
+        # Phase 3.2. Why a QUEUED task is sitting there: `not_before` is its
+        # retry backoff, `excluded_worker_id` is the worker that lost the
+        # previous attempt and may not immediately have it back. Both NULL
+        # for a task that has never been reclaimed, which is the common case.
+        "not_before": row["not_before"].isoformat() if row["not_before"] else None,
+        "retry_in_seconds": _seconds_until(row["not_before"]),
+        "excluded_worker_id": (
+            str(row["excluded_worker_id"]) if row["excluded_worker_id"] else None
+        ),
     }
+
+
+def _seconds_until(moment: datetime | None) -> float | None:
+    """Seconds from now until `moment`, negative once it has passed.
+
+    Negative rather than clamped to zero on purpose: a lease that is 8
+    seconds overdue and still sitting there is the visible signature of a
+    reclaimer that has stopped, and clamping would hide it behind a row of
+    zeroes.
+    """
+    if moment is None:
+        return None
+    return round((moment - datetime.now(timezone.utc)).total_seconds(), 1)
 
 
 def _observed_duration(assigned_at: datetime | None, completed_at: datetime | None) -> float | None:
@@ -1385,6 +1586,14 @@ async def task_queue_depth(
     grouped scan, not the cheap path; `depth` is the index range count.
     Both are recomputed from Postgres per call — nothing is cached here,
     so every replica answers identically (§3.9).
+
+    **Phase 3.4 adds `fenced_results`**, and it belongs here rather than on
+    an endpoint of its own for the reason `counts` does: this is the read
+    the task console already polls, so a fenced result becomes visible
+    without a second request and without an operator having to know which
+    task to open. It is strictly the cheaper of the two scans this handler
+    already performs — `task_attempts` holds one row per abnormal ending
+    where `tasks` holds every task there has ever been.
     """
     rejection = await _operator_guard(
         request, response, secret=x_admin_secret, event="task_depth"
@@ -1395,8 +1604,91 @@ async def task_queue_depth(
     async with get_session() as session:
         depth = await queue_depth(session)
         counts = await counts_by_status(session)
+        fenced = await fenced_result_count(session)
 
-    return {"depth": depth, "counts": counts}
+    return {"depth": depth, "counts": counts, "fenced_results": fenced}
+
+
+@app.get("/tasks/attempts")
+async def list_attempts(
+    request: Request,
+    response: Response,
+    outcome: list[str] | None = Query(default=None),
+    worker_id: str | None = None,
+    limit: int = Query(default=50, ge=1),
+    x_admin_secret: str = Header(default=""),
+) -> dict[str, object]:
+    """Abnormal endings across the fleet, newest first (Phase 3.7).
+
+    The recovery console's live feed. Steps 3.2 and 3.4 made every
+    reassignment, exhaustion and fence durable in `task_attempts`, but both
+    reads over it need to be told where to look — one task, or one worker.
+    Reassignment "visible in real time" is the case where nothing is known
+    in advance, so this is the read that was missing.
+
+    **Under `/tasks/` rather than at `/attempts`**, and declared before
+    `/tasks/{task_id}` so FastAPI's in-order matching does not read
+    `attempts` as a task id. The prefix is not cosmetic: the public ingress
+    routes `/tasks` to the coordinator (Step 1.5.5), so a top-level
+    `/attempts` would work in Docker Compose and 404 in staging — the exact
+    environment-dependent difference §3.5 exists to prevent, and the same
+    reasoning that put the dashboard's pages under `/ui/`.
+
+    `limit` is capped by `TASK_LIST_MAX_LIMIT`, the cap `GET /tasks` already
+    uses, rather than a second tunable that can disagree with it.
+
+    An unknown `outcome` is a **400, not an empty list** — on a console
+    whose whole job is to show that something went wrong, a typo answered
+    with "no events" reads as "nothing is going wrong".
+    """
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="task_attempts"
+    )
+    if rejection is not None:
+        return rejection
+
+    if outcome:
+        unknown = [value for value in outcome if value not in KNOWN_ATTEMPT_OUTCOMES]
+        if unknown:
+            response.status_code = 400
+            detail = (
+                f"unknown outcome {unknown[0]!r}: expected one of "
+                f"{', '.join(KNOWN_ATTEMPT_OUTCOMES)}"
+            )
+            logger.warning("task_attempts_rejected_invalid_filter", extra=_admin_log(detail=detail))
+            return {"detail": detail}
+
+    if worker_id is not None:
+        try:
+            uuid.UUID(worker_id)
+        except ValueError:
+            response.status_code = 400
+            return {"detail": "worker_id is not a valid UUID"}
+
+    capped = min(limit, task_list_max_limit())
+    async with get_session() as session:
+        rows = await recent_attempts(
+            session, limit=capped, outcomes=outcome, worker_id=worker_id
+        )
+
+    return {
+        "attempts": [
+            {
+                "attempt_id": str(row["id"]),
+                "task_id": str(row["task_id"]),
+                "attempt_number": row["attempt_number"],
+                "worker_id": str(row["worker_id"]) if row["worker_id"] else None,
+                "outcome": row["outcome"],
+                "reason": row["reason"],
+                "correlation_id": row["correlation_id"],
+                "recorded_at": row["recorded_at"].isoformat(),
+            }
+            for row in rows
+        ],
+        "count": len(rows),
+        "limit": capped,
+        "filters": {"outcome": outcome, "worker_id": worker_id},
+    }
 
 
 @app.get("/tasks/throughput")
@@ -1448,6 +1740,127 @@ async def task_throughput(
         "series": series,
         "completed_in_window": sum(int(point["completed"]) for point in series),
     }
+
+
+@app.get("/tasks/policies")
+async def list_task_policies(
+    request: Request, response: Response, x_admin_secret: str = Header(default="")
+) -> dict[str, object]:
+    """The timeouts the coordinator will actually apply, per task type.
+
+    Phase 3.1, and the read half of "configurable per task type **without
+    redeploy**". Every registered type appears whether or not it has an
+    override, because a policy surface that only lists what has been
+    changed cannot answer the question an operator actually has, which is
+    "what is in force right now".
+
+    Each value carries a `_source` of `default` or `policy`. That is not
+    decoration: §10 forbids blurring a recommended value with a configured
+    one, and a bare list of numbers does exactly that — 300 looks the same
+    whether it came from the code or from someone's change last Tuesday.
+    """
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="task_policy_list"
+    )
+    if rejection is not None:
+        return rejection
+
+    async with get_session() as session:
+        policies = await effective_policies(session)
+    return {"policies": policies, "count": len(policies)}
+
+
+@app.put("/tasks/policies/{task_type}")
+async def upsert_task_policy(
+    request: Request,
+    task_type: str,
+    body: TaskPolicyRequest,
+    response: Response,
+    x_admin_secret: str = Header(default=""),
+) -> dict[str, object]:
+    """Set one task type's timeout overrides (Phase 3.1).
+
+    **This is the endpoint the sixth exit criterion is about.** The change
+    is a row in Postgres, so it applies to the next task claimed by any
+    replica — no restart, no rollout, no ConfigMap reload, and no
+    invalidation message between replicas, because nothing cached it.
+
+    A partial body updates only the fields it names. To go back to the code
+    defaults, `DELETE` the policy rather than guessing at the numbers.
+
+    Bounds are enforced (`app.task_policies`) and a violation is a **400
+    naming the field**. An operator setting a lease TTL of 0 is not
+    attacking the system, they have made a typo — but the effect would be
+    every task reclaimed the instant it was assigned, which is the recovery
+    engine denying service to the system it protects.
+    """
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="task_policy_set"
+    )
+    if rejection is not None:
+        return rejection
+
+    try:
+        values = validate_policy(body.model_dump(exclude_unset=True))
+    except InvalidTaskPolicy as exc:
+        response.status_code = 400
+        logger.warning("task_policy_rejected", extra=_admin_log(detail=str(exc)))
+        return {"detail": str(exc)}
+
+    try:
+        async with get_session() as session:
+            await set_policy(session, task_type=task_type, values=values)
+            await session.commit()
+            policies = await effective_policies(session)
+    except UnknownTaskType as exc:
+        response.status_code = 400
+        logger.warning("task_policy_rejected", extra=_admin_log(detail=str(exc)))
+        return {"detail": str(exc)}
+
+    logger.info(
+        "task_policy_updated",
+        extra=_admin_log(task_type=task_type, fields=sorted(values)),
+    )
+    effective = next(entry for entry in policies if entry["task_type"] == task_type)
+    return {"task_type": task_type, "applied": values, "effective": effective}
+
+
+@app.delete("/tasks/policies/{task_type}")
+async def delete_task_policy(
+    request: Request,
+    task_type: str,
+    response: Response,
+    x_admin_secret: str = Header(default=""),
+) -> dict[str, object]:
+    """Drop a type's overrides so the code defaults apply again (Phase 3.1).
+
+    A delete of a type that has no override is **200, not 404**. The
+    operator's intent — "this type should be on the defaults" — is
+    satisfied either way, and this is the opposite case from
+    `POST /tasks/{id}/cancel`, where the second call is a question whose
+    honest answer is "no". Here it is an instruction, and it has been
+    carried out.
+    """
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="task_policy_clear"
+    )
+    if rejection is not None:
+        return rejection
+
+    try:
+        async with get_session() as session:
+            removed = await clear_policy(session, task_type=task_type)
+            if removed:
+                await session.commit()
+            policies = await effective_policies(session)
+    except UnknownTaskType as exc:
+        response.status_code = 400
+        logger.warning("task_policy_rejected", extra=_admin_log(detail=str(exc)))
+        return {"detail": str(exc)}
+
+    logger.info("task_policy_cleared", extra=_admin_log(task_type=task_type, removed=removed))
+    effective = next(entry for entry in policies if entry["task_type"] == task_type)
+    return {"task_type": task_type, "removed": removed, "effective": effective}
 
 
 @app.post("/tasks/dequeue")
@@ -1511,6 +1924,12 @@ async def dequeue_tasks(body: DequeueTaskRequest, response: Response) -> dict[st
                 "priority": task["priority"],
                 "correlation_id": task["correlation_id"],
                 "assigned_at": task["assigned_at"].isoformat(),
+                # Phase 3.1: the acknowledgement lease this claim carries.
+                # Reported because a caller of the raw queue primitive — the
+                # versioned `scripts/queue_harness.py`, and anything else
+                # driving it directly — now has a deadline it must beat, and
+                # a claim that does not say so would be a trap.
+                "lease_expires_at": task["lease_expires_at"].isoformat(),
             }
             for task in claimed
         ],
@@ -1607,6 +2026,10 @@ async def inspect_task(
 
     async with get_session() as session:
         task = await get_task(session, task_id)
+        # Phase 3.2. Read in the same session, and only for a single task —
+        # this is the inspection endpoint, not the listing (§3.0.7's reason
+        # for not putting attempt rows on the hot read path).
+        attempts = await task_attempts(session, task_id=task_id) if task else []
 
     if task is None:
         response.status_code = 404
@@ -1615,6 +2038,22 @@ async def inspect_task(
     return {
         **_task_summary(task),
         "timeline": _lifecycle(task),
+        # **What makes a FAILED task inspectable rather than merely
+        # visible** (Step 3.2 exit criterion, and gate §3.0.4 item 2): one
+        # row per attempt that ended abnormally, naming the worker that
+        # held it and which clock ran out. A task that has never been
+        # reclaimed has an empty list here, not a missing field.
+        "attempts": [
+            {
+                "attempt_number": attempt["attempt_number"],
+                "worker_id": str(attempt["worker_id"]) if attempt["worker_id"] else None,
+                "outcome": attempt["outcome"],
+                "reason": attempt["reason"],
+                "recorded_at": attempt["recorded_at"].isoformat(),
+                "correlation_id": attempt["correlation_id"],
+            }
+            for attempt in attempts
+        ],
         # None once the retention sweep has removed the body. The task row
         # survives as the audit trail — that is the documented behaviour of
         # `RESULT_RETENTION_DAYS`, not a lost result.

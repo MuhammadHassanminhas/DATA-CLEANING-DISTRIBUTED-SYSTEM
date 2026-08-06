@@ -69,16 +69,39 @@ kept and still handled, because a pre-2.5 worker sends nothing else and the
 coordinator must not be able to tell one worker generation from another
 (§3.5).
 
-**What still does not happen here.** Nothing writes `lease_expires_at` or
-`attempt_count`; those stay untouched through all of M2 (a Phase 2.1 exit
-criterion) — 2.5 *reads* `attempt_count` to put it on the wire, which is a
-different thing. Nothing times a task out (Decision #103) — duration is
-already bounded by Step 2.1's parameter validation. Nothing enforces the
-`idempotency_token` or the `session_epoch` a result carries: they are
-recorded from day one so Phase 3 needs no protocol change, and duplicate
-suppression in M2 comes from the task's own terminal state instead.
-Recovering a task whose worker vanished is Phase 3; this module only
-*detects* and logs it.
+**What Step 3.1 added here.** Lease renewal and the reclaimer loop.
+Every worker message this module already handled is now also a renewal
+opportunity: an ack, a start, a progress sample and a result attempt each
+push the task's lease out, because the *arrival* of a message about a
+task is the coordinator's only objective evidence that the worker is
+still working on it. What the message *says* remains an input to nothing
+— a worker reporting 99% progress forever renews no more than one
+reporting 1%, and neither can extend past the coordinator-set
+`deadline_at` (gate §3.0.6).
+
+**Renewal is lazy, and the laziness lives in this process.** Each session
+tracks when each of its tasks is next due for a renewal, on this
+replica's own monotonic clock. A message that arrives before its task is
+due costs **no database round trip at all** — not a no-op UPDATE, no
+statement. At the shipped defaults that turns a 10s progress cadence into
+roughly one write per running task per 30s, which is what keeps the lease
+engine off the throughput ceiling measured in #141.
+
+**What Step 3.2 added here.** The retry policy the reclaimer had none of.
+An expired task is now either requeued with a backoff and an exclusion, or
+— once its type's `max_attempts` is used up — moved to terminal `FAILED`,
+and the two branches are counted and logged as the different events they
+are. The worker that lost the task is also sent a best-effort
+`task_cancel` over the shipped push channel, because the replica that
+reclaimed it usually does not hold that worker's socket.
+
+**What still does not happen here.** Nothing enforces the
+`idempotency_token` or the `session_epoch` a result carries — the gate
+settled that `session_epoch` will never be a fencing input (#169), because
+Step 2.5 *measured* a legitimate result executed under epoch 4 and
+submitted on 5. Fencing itself is Step 3.4, so a late result from a
+superseded attempt is still accepted if the row happens to name that
+worker again.
 """
 
 from __future__ import annotations
@@ -87,6 +110,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -96,7 +120,12 @@ from fastapi import WebSocket
 from app.config import (
     assignment_poll_interval_seconds,
     heartbeat_offline_threshold_seconds,
+    lease_disconnect_grace_seconds,
+    lease_reclaim_batch,
+    lease_reclaim_interval_seconds,
     task_dequeue_max_batch,
+    task_lease_renew_fraction,
+    task_lease_ttl_seconds,
     task_result_max_bytes,
     worker_default_max_concurrent,
     worker_max_concurrent_ceiling,
@@ -106,13 +135,19 @@ from app.metrics import (
     ASSIGNMENT_PASSES,
     ASSIGNMENT_QUERIES,
     ASSIGNMENTS_IN_FLIGHT,
+    DRAINING,
+    LEASE_RECLAIM_SECONDS,
+    LEASE_RENEWALS,
+    LEASES_EXPIRED,
     RESULT_SIZE_BYTES,
     TASK_ACKS,
     TASK_PROGRESS_REPORTS,
     TASK_RESULTS,
     TASKS_ASSIGNED,
     TASKS_COMPLETED,
+    TASKS_EXHAUSTED,
     TASKS_FAILED,
+    TASKS_REASSIGNED,
     TASKS_STARTED,
 )
 from app.redis_client import redis_client
@@ -120,6 +155,7 @@ from app.results import MalformedResult
 from app.results import validate as validate_result
 from app.task_queue import (
     DUPLICATE,
+    FENCED,
     NOT_FOUND,
     NOT_OWNER,
     TRANSITIONED,
@@ -127,6 +163,10 @@ from app.task_queue import (
     dequeue,
     mark_status,
     queue_depth,
+    reclaim_expired_leases,
+    record_execution_failure,
+    renew_lease,
+    shorten_worker_leases,
 )
 from app.task_states import FAILED, RUNNING
 from app.task_types import TASK_TYPES
@@ -156,6 +196,42 @@ REFUSE_UNSUPPORTED_TYPE = "unsupported_task_type"
 # same reason: it is the dashboard's read, and a stale entry must expire on
 # its own if the replica holding the socket dies.
 CURRENT_TASKS_TTL_MULTIPLIER = 3
+
+# Phase 3.5. Set once, never cleared: a replica that has begun draining is
+# on its way out of the process table and has no route back to serving.
+# Making it one-way is what lets every reader treat it as a fact rather
+# than as a value that might change under them.
+_draining = False
+
+# How often `drain_local_sessions` re-checks. Short relative to any drain
+# window worth configuring, so the wait ends on the work finishing rather
+# than on the poll's own granularity.
+_DRAIN_POLL_SECONDS = 0.1
+
+
+def is_draining() -> bool:
+    """True once this replica has begun a graceful shutdown.
+
+    Read by `/ready` (which must start failing before the sockets close, so
+    Kubernetes takes this pod out of the Service while it can still finish
+    what it holds) and by `assign_once` (which must stop handing out work
+    it cannot see through).
+    """
+    return _draining
+
+
+def begin_drain() -> None:
+    """Stop taking new work. Idempotent, and deliberately one-way.
+
+    **This does not close anything and does not cancel anything.** Tasks
+    already running on this replica's workers keep running, results already
+    in flight are still accepted, and the reclaimer keeps reclaiming — a
+    draining replica is still a correct replica, it has simply stopped
+    adding to what it will have to abandon.
+    """
+    global _draining
+    _draining = True
+    DRAINING.set(1)
 
 
 @dataclass
@@ -205,6 +281,28 @@ class LocalSession:
     # Latest progress sample per running task, mirrored to Redis for the
     # dashboard. Telemetry only — nothing schedules on it.
     current_tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Phase 3.1. task_id -> the monotonic instant at which this task's lease
+    # is next worth writing. **This is what makes lazy renewal free rather
+    # than merely cheap**: a message about a task that is not yet due is
+    # dropped here, before any session is opened, so it costs no round trip
+    # at all. Losing this map on a reconnect is harmless — the first
+    # message on the new session finds no entry and renews immediately.
+    lease_renew_due: dict[str, float] = field(default_factory=dict)
+    # Phase 3.1. Tasks this worker was already holding when the session
+    # opened, **read from the database on `hello`, never from the worker**.
+    #
+    # It exists because `credited` cannot cover them: those tasks were
+    # delivered to a socket that no longer exists, so the reconnecting
+    # session has no key for them (Decision #101 — the worker declares a
+    # *count*, and a count cannot be keyed). Without this set, a worker
+    # that reconnected mid-execution would keep sending perfectly good
+    # progress for its running task, every one of those messages would be
+    # skipped as "not this session's", and the task would be reclaimed one
+    # lease later from a worker that was doing exactly what it should.
+    #
+    # Coordinator-observed, so it satisfies §12 on its own terms: the ids
+    # come from `assigned_worker_id`, not from anything the worker said.
+    recovered_tasks: set[str] = field(default_factory=set)
     saturated: bool = False
 
     @property
@@ -230,6 +328,80 @@ _work_available = asyncio.Event()
 
 def _refresh_in_flight_gauge() -> None:
     ASSIGNMENTS_IN_FLIGHT.set(sum(s.in_flight for s in _local_sessions.values()))
+
+
+def _lease_due(session: LocalSession, task_id: str) -> bool:
+    """Whether this task's lease is worth a write yet.
+
+    The renewal cadence is `TASK_LEASE_TTL_SECONDS * TASK_LEASE_RENEW_FRACTION`
+    — at the defaults, 30s of a 60s lease — and the clock is
+    `time.monotonic()` rather than the wall clock deliberately: a replica
+    whose system time is adjusted by NTP mid-session must not suddenly
+    believe every lease is due, or stop renewing for an hour.
+
+    An unknown task is always due. That covers the first message of a
+    task's life and the first message after a reconnect, both of which
+    should renew immediately rather than wait out a window measured from a
+    session that no longer exists.
+    """
+    due = session.lease_renew_due.get(task_id)
+    return due is None or time.monotonic() >= due
+
+
+def _mark_renewed(session: LocalSession, task_id: str) -> None:
+    session.lease_renew_due[task_id] = time.monotonic() + (
+        task_lease_ttl_seconds() * task_lease_renew_fraction()
+    )
+
+
+async def _renew_if_due(session: LocalSession, task_id: str) -> None:
+    """Renew one task's lease, if it is due and the task is this session's.
+
+    **Every renewal path funnels through here**, so the laziness rule and
+    the "only tasks this session is entitled to renew" rule are each
+    written once. A task id this session neither holds nor inherited is
+    ignored outright rather than sent to the database to be refused: a
+    worker inventing ids (§12) must not be able to make the coordinator
+    issue a statement per message.
+
+    "Entitled" is two sets, not one, and the second is why: `credited` is
+    what this session was handed, and `recovered_tasks` is what the
+    *database* said this worker was already running when it reconnected.
+    Checking only the first would leave a worker that reconnected
+    mid-execution unable to renew the task it is visibly still working on.
+
+    A failure is logged and swallowed. A renewal that does not happen costs
+    the task its lease, and losing a lease is a *recoverable* outcome the
+    reclaimer handles by design — whereas letting the exception out would
+    take down the read loop and every other task on the socket with it.
+    """
+    if task_id not in session.credited and task_id not in session.recovered_tasks:
+        return
+    if not _lease_due(session, task_id):
+        return
+    try:
+        async with get_session() as db:
+            if await renew_lease(db, task_id=task_id, worker_id=session.worker_id):
+                await db.commit()
+                LEASE_RENEWALS.labels("renewed").inc()
+            else:
+                # The row rejected the renewal — it is terminal, or it is no
+                # longer this worker's because the reclaimer took it. Under
+                # Step 3.2 that second case is how a worker learns its work
+                # was reassigned; in 3.1 it is recorded and nothing more.
+                LEASE_RENEWALS.labels("not_applied").inc()
+    except Exception as exc:  # noqa: BLE001 — a lost renewal is recoverable; a raise is not
+        LEASE_RENEWALS.labels("error").inc()
+        logger.warning(
+            "task_lease_renew_failed",
+            extra={
+                "task_id": task_id,
+                "worker_id": session.worker_id,
+                "detail": str(exc),
+            },
+        )
+        return
+    _mark_renewed(session, task_id)
 
 
 def parse_capabilities(payload: dict[str, Any] | None) -> tuple[int, tuple[str, ...]]:
@@ -343,11 +515,13 @@ def log_unacknowledged(session: LocalSession, reason: str) -> None:
     """Exit criterion: a worker that disconnects between assignment and
     acknowledgement is **logged**.
 
-    Detection only. Recovery — putting the task back in play — is Phase 3,
-    and deliberately not attempted here: `ASSIGNED -> QUEUED` is not a
-    legal move in `task_states`, and inventing it would pre-empt the
-    `REASSIGNED` transition Phase 3 owns. The tasks stay `ASSIGNED` and
-    are named here so nothing is lost silently.
+    Step 2.3 could only detect this. **Phase 3.1 recovers it**, and not
+    from here: the task already carries an acknowledgement lease from the
+    moment it was claimed, `shorten_local_leases` cuts that lease to the
+    disconnect grace, and the reclaimer requeues it. This function stays
+    exactly as it was — naming each stranded task with its own correlation
+    id — because the log line is still the thing that ties a disconnect to
+    the recovery that follows it (§11).
     """
     for task_id, correlation_id in session.pending_acks.items():
         logger.warning(
@@ -400,6 +574,11 @@ async def handle_task_ack(session: LocalSession, message: dict[str, Any]) -> Non
 
     if accepted:
         TASK_ACKS.labels("accepted").inc()
+        # Phase 3.1: the ack is the first coordinator-observed evidence that
+        # the task arrived, so it converts the short delivery lease into a
+        # full one. A worker that acks and then goes quiet still loses the
+        # task — one TTL later instead of one ack timeout later.
+        await _renew_if_due(session, task_id)
         logger.info(
             "task_acknowledged",
             extra={
@@ -512,6 +691,8 @@ async def handle_capacity(session: LocalSession, message: dict[str, Any]) -> Non
     task_id = str(payload.get("task_id") or "")
     _release_credit(session, task_id, freed)
     session.current_tasks.pop(task_id, None)
+    session.lease_renew_due.pop(task_id, None)
+    session.recovered_tasks.discard(task_id)
     session.saturated = False
 
     await _publish_current_tasks(session)
@@ -555,6 +736,11 @@ async def handle_task_started(session: LocalSession, message: dict[str, Any]) ->
 
     if outcome == TRANSITIONED:
         TASKS_STARTED.inc()
+        # `mark_status` has just written a full execution lease and the
+        # deadline inside its own UPDATE, so the next renewal is a TTL
+        # fraction away — recording that here is what stops the very next
+        # progress message from writing the same value again.
+        _mark_renewed(session, task_id)
         session.current_tasks[task_id] = {
             "task_id": task_id,
             "task_type": payload.get("task_type"),
@@ -597,9 +783,29 @@ async def handle_task_progress(session: LocalSession, message: dict[str, Any]) -
 
     Only tasks this session actually started are recorded, so a worker
     cannot inject a progress line for someone else's task.
+
+    **Phase 3.1 makes this message renew the task's lease**, and the
+    distinction that keeps Decision #94 intact is worth stating exactly:
+    what gets written is a lease timestamp, never the progress figure. A
+    progress sample's *arrival* is coordinator-observed evidence that the
+    worker is still there; its *contents* remain untrusted telemetry that
+    decides nothing. This is what lets a legitimate ten-minute task hold
+    its lease for ten minutes — and, because renewal is capped at
+    `deadline_at`, what still cannot keep a task past its type's execution
+    cap.
     """
     payload = message.get("payload") or {}
     task_id = str(payload.get("task_id") or "")
+
+    # **Renew before the telemetry check, not after.** A worker that
+    # reconnected mid-execution has no `current_tasks` entry for the task it
+    # is still running — the `task_started` that would have created one
+    # belongs to the session that died — so the check below returns early
+    # for exactly the case that most needs its lease renewed. `_renew_if_due`
+    # does its own entitlement check against `credited` and
+    # `recovered_tasks`, so moving it up widens nothing (§12).
+    await _renew_if_due(session, task_id)
+
     entry = session.current_tasks.get(task_id)
     if entry is None:
         TASK_PROGRESS_REPORTS.labels("unknown").inc()
@@ -654,18 +860,45 @@ async def handle_task_failed(session: LocalSession, message: dict[str, Any]) -> 
             db, task_id=task_id, worker_id=session.worker_id, new_status=FAILED
         )
         if outcome == TRANSITIONED:
+            # Phase 3.7. The attempt row that gives this failure a reason.
+            # In the same transaction as the transition, so a task is never
+            # terminal without the record of why — the ordering migration
+            # 0006's backfill chose, for the same reason.
+            await record_execution_failure(
+                db,
+                task_id=task_id,
+                worker_id=session.worker_id,
+                error_type=error_type,
+                correlation_id=correlation_id,
+            )
             await db.commit()
 
     # Release the credit unless the database says this task was never this
     # worker's. `ILLEGAL` (already terminal) and `NOOP` (already FAILED) both
     # still release: the worker *was* running it, so the slot genuinely is
     # free, and holding the credit would cost capacity for the life of the
-    # session. `NOT_OWNER` and `NOT_FOUND` release nothing — otherwise naming
-    # another worker's task id would be a way to draw down your own credits
-    # (§12).
-    if outcome not in (NOT_OWNER, NOT_FOUND):
+    # session.
+    #
+    # **Phase 3.1 adds the second half of that condition, and it is
+    # Decision #168 pulled forward from Step 3.4 because 3.1 is what makes
+    # the case reachable.** Before reassignment existed, the only way to
+    # reach `NOT_OWNER` was a worker naming a task that was not its own, so
+    # refusing to release was a §12 protection with no honest victim. A
+    # reclaimed task's row no longer names its original worker, so that
+    # worker's perfectly sincere late report now returns `NOT_OWNER` — and
+    # the shipped rule would hold its credit consumed for the rest of the
+    # session. A worker that lost three tasks to reassignment would quietly
+    # stop being able to accept work, and it would present as "the fleet
+    # mysteriously slows down during recovery".
+    #
+    # The fix needs no new concept: release when *this session actually
+    # delivered that task id*. A guessed id is not in `credited`, so the
+    # §12 protection is untouched; a genuine one is, so the slot is freed.
+    if outcome not in (NOT_OWNER, NOT_FOUND) or task_id in session.credited:
         _release_credit(session, task_id)
     session.current_tasks.pop(task_id, None)
+    session.lease_renew_due.pop(task_id, None)
+    session.recovered_tasks.discard(task_id)
     session.saturated = False
     await _publish_current_tasks(session)
     _refresh_in_flight_gauge()
@@ -741,6 +974,24 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
 
     A task left `RUNNING` by a rejection stays visible for Phase 3, exactly
     like a task stranded `ASSIGNED` by a refusal.
+
+    **Phase 3.3 adds one outcome to answer for, `SUPERSEDED`** — this
+    worker's result lost to another attempt, or arrived for a task that had
+    already been failed or cancelled. It is acknowledged definitively like
+    every other outcome, `accepted: false` because nothing was stored, and
+    **it releases the credit**: unlike `NOT_OWNER` it is not a worker
+    naming something that was never its own, it is a worker whose slot
+    genuinely is free. Holding the credit here would make losing a race
+    cost the worker capacity for the life of the session, which is the
+    defect Decision #168 fixed on the neighbouring path.
+
+    **Phase 3.4 adds a second, `FENCED`** — a result for a task that is
+    still live but whose current attempt is not this one. It behaves like
+    `SUPERSEDED` in every way the worker can see (definitive ack,
+    `accepted: false`, credit released), and differs in one way the
+    coordinator can: it commits, because the `task_attempts` row recording
+    the fence is what makes the rejection inspectable afterwards. The rule
+    itself lives in `task_queue.complete_task` and nowhere else.
     """
     payload = message.get("payload") or {}
     correlation_id = str(message.get("correlation_id") or "")
@@ -760,9 +1011,18 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
         # of a message the coordinator has just rejected as not being a result
         # (§12). Same discipline as `NOT_OWNER`/`NOT_FOUND` on the failure path:
         # if the report cannot identify a slot, it releases none.
+        # Phase 3.1: renew before the credit is released, while the id is
+        # still one this session holds. A rejected result leaves the task
+        # `RUNNING`, so the worker has just proved it is alive and working
+        # on it — and one more lease period is what gives a worker whose
+        # *next* attempt is well-formed somewhere to land. The task still
+        # expires and retries if nothing better ever arrives.
+        await _renew_if_due(session, raw_task_id)
         if raw_task_id and raw_task_id in session.credited:
             _release_credit(session, raw_task_id)
         session.current_tasks.pop(raw_task_id, None)
+        session.lease_renew_due.pop(raw_task_id, None)
+        session.recovered_tasks.discard(raw_task_id)
         session.saturated = False
         await _publish_current_tasks(session)
         _refresh_in_flight_gauge()
@@ -799,12 +1059,32 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
     task_id = envelope["task_id"]
     async with get_session() as db:
         outcome = await complete_task(db, envelope=envelope, worker_id=session.worker_id)
-        if outcome == TRANSITIONED:
+        # `FENCED` commits too, and it is the one outcome that writes
+        # without transitioning: the result is refused, but the
+        # `task_attempts` row recording that it was refused is the durable
+        # half of "rejections are visible, not buried in logs". Rolling it
+        # back with the rest of the no-op would leave the fence provable
+        # only from a log line on one replica.
+        if outcome in (TRANSITIONED, FENCED):
             await db.commit()
 
-    if outcome not in (NOT_OWNER, NOT_FOUND):
+    # The same Decision #168 condition as `handle_task_failed`, and for the
+    # same reason: after Step 3.1 a `NOT_OWNER` can mean "your task was
+    # reassigned while you were finishing it", which is a sincere report
+    # from a worker whose slot really is free.
+    #
+    # **Phase 3.4 puts `FENCED` in the same guarded set, not outside it.**
+    # A fenced worker's slot genuinely is free, so the credit must come
+    # back — but the outcome is reachable by naming a task id, and
+    # releasing unconditionally would hand any worker a way to free a slot
+    # of a task that is still running by naming an id (§12). Keyed on
+    # `credited`, a genuine id releases and a guessed one does not, which is
+    # exactly the discipline the neighbouring paths already apply.
+    if outcome not in (NOT_OWNER, NOT_FOUND, FENCED) or task_id in session.credited:
         _release_credit(session, task_id)
         session.current_tasks.pop(task_id, None)
+        session.lease_renew_due.pop(task_id, None)
+        session.recovered_tasks.discard(task_id)
         session.saturated = False
         await _publish_current_tasks(session)
         _refresh_in_flight_gauge()
@@ -830,12 +1110,22 @@ async def handle_task_result(session: LocalSession, message: dict[str, Any]) -> 
         )
     else:
         logger.warning(
-            "task_result_not_applied",
+            # Phase 3.4 gives the fence its own event name rather than
+            # folding it into the generic one. "A result was fenced" is the
+            # thing an operator greps for during a recovery, and it should
+            # not require knowing that `outcome` is a field on a line whose
+            # name says only that something was not applied.
+            "task_result_fenced" if outcome == FENCED else "task_result_not_applied",
             extra={
                 "task_id": task_id,
                 "worker_id": session.worker_id,
                 "correlation_id": correlation_id,
                 "outcome": outcome,
+                # Which attempt the worker believed it was submitting. On a
+                # fence this is the whole diagnosis, and it is worker-
+                # reported — recorded, never trusted (§12).
+                "attempt_number": envelope["attempt_number"],
+                "session_epoch": envelope["session_epoch"],
             },
         )
 
@@ -963,6 +1253,15 @@ async def assign_once() -> int:
     story: with an empty queue this costs one query regardless of whether
     the replica holds one socket or a hundred.
     """
+    # Phase 3.5, and it is checked before the pass is even counted: a
+    # draining replica must not claim a row. `dequeue` moves a task to
+    # ASSIGNED durably, so claiming here and dying a second later strands
+    # that task for a full `TASK_ACK_TIMEOUT_SECONDS` before the reclaimer
+    # can have it back — work thrown away by the shutdown itself, on a
+    # queue another live replica was ready to serve.
+    if _draining:
+        return 0
+
     ASSIGNMENT_PASSES.inc()
 
     candidates = [
@@ -999,6 +1298,313 @@ async def assign_once() -> int:
     if delivered:
         _refresh_in_flight_gauge()
     return delivered
+
+
+async def drain_local_sessions(timeout: float) -> dict[str, Any]:
+    """Wait for work this replica has handed out to be acknowledged.
+
+    **"In-flight work" here means deliveries, not executions**, and the
+    distinction is the whole design. Waiting for the *tasks* to finish is
+    not an option a shutdown can offer: a `sleep` task may legitimately run
+    for the better part of an hour (`TASK_MAX_EXECUTION_SECONDS`), and no
+    termination grace period is going to cover that. Those tasks do not
+    need waiting for — they survive this process, because a lease is a row
+    and not a socket, and the worker renews them on `hello` against
+    whichever replica it lands on next (§3.0.13).
+
+    What genuinely dies with this process is the frame in the socket buffer
+    that has not been answered yet. A task delivered and not acked is
+    durably `ASSIGNED` with nobody visibly executing it, and recovering it
+    costs a full ack timeout — 30s by default, spent on a task a worker
+    would have picked up in milliseconds. That is the loss a drain can
+    actually prevent, and it usually takes a fraction of a second.
+
+    Returns what it observed rather than a verdict, so the caller can log
+    the honest number including the case where the window ran out.
+    """
+    started = time.monotonic()
+
+    def outstanding() -> int:
+        return sum(len(s.pending_acks) for s in _local_sessions.values())
+
+    at_start = outstanding()
+    while outstanding() and time.monotonic() - started < timeout:
+        await asyncio.sleep(_DRAIN_POLL_SECONDS)
+
+    return {
+        "sessions": len(_local_sessions),
+        "pending_acks_at_start": at_start,
+        "pending_acks_at_end": outstanding(),
+        "waited_seconds": round(time.monotonic() - started, 3),
+        "timed_out": bool(outstanding()),
+    }
+
+
+async def shorten_local_leases(worker_id: str, reason: str) -> int:
+    """A socket this replica held has closed — accelerate its tasks' leases.
+
+    **This is not a second recovery trigger and it must not become one.**
+    Nothing is reclaimed here: the leases are cut to
+    `LEASE_DISCONNECT_GRACE_SECONDS`, and the reclaimer does what it always
+    does, one tick later. The gate's reasoning (§3.0.2) is that a system
+    with two recovery paths has to keep them agreeing forever, whereas a
+    close that merely shortens a clock cannot disagree with anything.
+
+    It is safe to run from a replica because of *what it is scoped to*: a
+    socket this process personally observed closing, and only that
+    worker's rows. Contrast the rejected design, reclaiming on `OFFLINE` —
+    that status comes from a missing Redis key, so a Redis flush would
+    have declared the whole fleet dead and reassigned every task in
+    flight at once.
+
+    Returns how many leases were shortened. A failure is logged and
+    swallowed: without it the tasks still expire on the full TTL, which is
+    slower recovery, not lost recovery.
+    """
+    grace = lease_disconnect_grace_seconds()
+    try:
+        async with get_session() as db:
+            shortened = await shorten_worker_leases(
+                db, worker_id=worker_id, grace_seconds=grace
+            )
+            if shortened:
+                await db.commit()
+    except Exception as exc:  # noqa: BLE001 — slower recovery beats a raised disconnect path
+        logger.warning(
+            "task_lease_shorten_failed",
+            extra={"worker_id": worker_id, "reason": reason, "detail": str(exc)},
+        )
+        return 0
+
+    if shortened:
+        logger.info(
+            "task_leases_shortened_on_disconnect",
+            extra={
+                "worker_id": worker_id,
+                "tasks": shortened,
+                "grace_seconds": grace,
+                "reason": reason,
+            },
+        )
+    return shortened
+
+
+async def cancel_on_worker(worker_id: str, task_id: str, correlation_id: str) -> None:
+    """Ask the worker that lost a task to stop burning CPU on it (Phase 3.2).
+
+    **Best-effort by design, and nothing depends on it arriving** (gate
+    §3.0.6). The task was reclaimed precisely because that worker stopped
+    answering, so the most likely outcome is that this message reaches
+    nobody. When it does land it saves the CPU of an execution whose result
+    can no longer be accepted, and it does not save anything else — the
+    reassignment already happened, in the database, before this was sent.
+
+    It goes over the shipped `worker:{id}:push` Redis channel rather than
+    over a socket, because **the reclaimer usually runs on a replica that
+    does not hold that worker's socket** — a lease is a row, not a
+    connection, so any replica's tick may reclaim any worker's task. The
+    channel `POST /workers/{id}/push` and `_push_listener` already
+    implement is exactly the "reach a socket someone else is holding"
+    mechanism, so this adds no fan-out of its own.
+
+    No protocol version bump: the worker's dispatch falls through unknown
+    message types to a log line, so a worker built before this step ignores
+    it and keeps computing, which is the same outcome as the message being
+    lost.
+    """
+    envelope = Envelope(
+        message_type="task_cancel",
+        worker_id=worker_id,
+        correlation_id=correlation_id,
+        payload={"task_id": task_id, "reason": "lease_expired"},
+    )
+    try:
+        await redis_client.publish(
+            f"worker:{worker_id}:push", json.dumps(envelope.to_dict())
+        )
+    except Exception as exc:  # noqa: BLE001 — a cancel that is not delivered costs CPU, nothing else
+        logger.warning(
+            "task_cancel_publish_failed",
+            extra={"task_id": task_id, "worker_id": worker_id, "detail": str(exc)},
+        )
+
+
+async def reclaim_once() -> int:
+    """One reclaim pass. Returns how many tasks were returned to the queue.
+
+    Every replica runs this and **no leader is elected**, which is the same
+    call the retention sweep and the assignment engine already make (§3.9).
+    Two replicas reclaiming at once is safe for precisely the reason two
+    replicas dequeuing at once is safe: `FOR UPDATE SKIP LOCKED` means the
+    second one steps over the locked row, and by the time the lock lifts
+    that row is `QUEUED` and no longer matches the predicate. This inherits
+    Step 2.2's measured proof — 10,000 claims, 0 duplicates, three pods —
+    rather than introducing a new mechanism that would need its own.
+
+    The doorbell is rung only when something was actually reclaimed, so an
+    idle fleet's reclaim loop costs one indexed count query per tick and
+    wakes nothing.
+    """
+    start = time.perf_counter()
+    async with get_session() as db:
+        reclaimed = await reclaim_expired_leases(db, batch=lease_reclaim_batch())
+        if reclaimed:
+            await db.commit()
+    LEASE_RECLAIM_SECONDS.observe(time.perf_counter() - start)
+
+    for row in reclaimed:
+        LEASES_EXPIRED.inc()
+        exhausted = row["status"] == FAILED
+        if exhausted:
+            TASKS_EXHAUSTED.inc()
+        else:
+            TASKS_REASSIGNED.inc()
+        logger.warning(
+            # Phase 3.2 splits the event name by branch rather than adding a
+            # field to one line: "this task will be tried again" and "this
+            # task is over" are different operational facts, and a log query
+            # for the second must not have to filter the first out.
+            "task_attempts_exhausted" if exhausted else "task_lease_expired",
+            extra={
+                "task_id": str(row["id"]),
+                "task_type": row["task_type"],
+                # The worker that lost the task, read from the row before it
+                # was cleared — without it the recovery timeline cannot say
+                # who stopped answering.
+                "worker_id": (
+                    str(row["previous_worker_id"]) if row["previous_worker_id"] else None
+                ),
+                "previous_status": row["previous_status"],
+                # How overdue the lease was when this pass caught it. This is
+                # the coordinator-observed detection lag, and it is what the
+                # step's ≤35s / ≤65s bounds are verified against — measured,
+                # not asserted.
+                "overdue_seconds": round(
+                    (
+                        datetime.now(timezone.utc) - row["expired_at"]
+                    ).total_seconds(),
+                    3,
+                ),
+                "attempt": row["attempt_count"],
+                # Phase 3.2: when this task becomes claimable again, and by
+                # whom it will not be claimed. NULL on the exhausted branch,
+                # which is how a reader tells the two apart without parsing
+                # the event name.
+                "not_before": (
+                    row["not_before"].isoformat() if row["not_before"] else None
+                ),
+                "excluded_worker_id": (
+                    None
+                    if exhausted or not row["previous_worker_id"]
+                    else str(row["previous_worker_id"])
+                ),
+                "reason": (
+                    "execution_deadline_exceeded"
+                    if row["deadline_exceeded"]
+                    else "lease_expired"
+                ),
+                "correlation_id": row["correlation_id"],
+            },
+        )
+
+        # Best-effort, after the requeue is committed: the worker that lost
+        # the task may still be executing it, and a cancel it never receives
+        # changes nothing that has already been decided.
+        if row["previous_worker_id"]:
+            await cancel_on_worker(
+                str(row["previous_worker_id"]), str(row["id"]), row["correlation_id"]
+            )
+
+    if reclaimed:
+        # Local first so this replica reacts without a Redis round trip,
+        # then the fan-out so replicas holding other sockets do too.
+        notify_local()
+        await notify_work_available()
+        # **Phase 3.2: ring it again when the backoff actually elapses.**
+        # Found reviewing this step rather than by a test: the doorbell above
+        # now wakes an engine that will find nothing, because every task it
+        # just requeued is held by `not_before`. Without a second wake the
+        # retry waits for the safety-net poll — up to
+        # `ASSIGNMENT_POLL_INTERVAL_SECONDS` (30s by default) *on top of* a
+        # backoff measured in seconds, which is a recovery that looks stalled
+        # to anyone watching the console.
+        _schedule_retry_wake(reclaimed)
+    return len(reclaimed)
+
+
+# Sleeping wake-ups this replica has scheduled, kept only so they are not
+# garbage-collected mid-sleep (asyncio holds no strong reference to a task).
+_retry_wakes: set[asyncio.Task] = set()
+
+
+def _schedule_retry_wake(reclaimed: list[dict[str, Any]]) -> None:
+    """Ring the doorbell once, when the earliest requeued task is eligible.
+
+    **One wake-up per reclaim pass, not per task**, and only for the
+    earliest `not_before` in it: a later task's own pass, or the safety-net
+    poll, covers the rest. It costs no query and no timer thread — an
+    `asyncio.sleep` and one Redis publish.
+
+    Deliberately not a scheduler. The database remains the authority on
+    when a task may be claimed (`not_before` is in the dequeue predicate),
+    so a wake that never happens — this replica dying mid-sleep, the
+    publish failing — costs latency and nothing else. That is why it is
+    fire-and-forget and why nothing waits on it.
+    """
+    moments = [row["not_before"] for row in reclaimed if row["not_before"] is not None]
+    if not moments:
+        return
+    delay = (min(moments) - datetime.now(timezone.utc)).total_seconds()
+    if delay <= 0:
+        return  # already eligible; the doorbell just rung is enough
+
+    async def _wake() -> None:
+        try:
+            await asyncio.sleep(delay)
+            notify_local()
+            await notify_work_available()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a missed wake costs latency, nothing more
+            logger.warning("retry_wake_failed", extra={"detail": str(exc)})
+
+    task = asyncio.create_task(_wake())
+    _retry_wakes.add(task)
+    task.add_done_callback(_retry_wakes.discard)
+
+
+async def lease_reclaim_loop() -> None:
+    """The recovery engine. One per replica, started from the lifespan.
+
+    A fixed tick rather than an event: there is no event to subscribe to.
+    A lease does not *fire*, it simply stops being in the future, and the
+    only way to notice is to look. That is why the detection bound this
+    step publishes is a lease window **plus** one reclaim interval.
+
+    A pass that raises is logged and the loop continues, matching the
+    retention sweep: an unreachable database must not kill recovery for the
+    life of the process — and note that a database outage takes the
+    reclaimer out on its own, which is the designed behaviour in gate row
+    13. The reclaimer needs the same database it has lost, so a Postgres
+    outage cannot produce a reassignment storm.
+    """
+    interval = lease_reclaim_interval_seconds()
+    logger.info(
+        "lease_reclaimer_started",
+        extra={"interval_seconds": interval, "batch": lease_reclaim_batch()},
+    )
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            # Drain: after a large outage there may be more expired leases
+            # than one batch holds, and waiting a full interval per batch
+            # would turn a 100-task backlog into a five-second stagger.
+            while await reclaim_once() >= lease_reclaim_batch():
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a bad pass must not kill recovery
+            logger.warning("lease_reclaim_pass_error", extra={"detail": str(exc)})
 
 
 def notify_local() -> None:

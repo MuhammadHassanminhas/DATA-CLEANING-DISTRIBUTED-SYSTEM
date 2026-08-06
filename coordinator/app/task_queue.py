@@ -23,13 +23,43 @@ tested rather than assumed):
     that no task is handed out twice, no task is lost, and no eligible
     task is skipped once the lock that hid it is gone (no starvation).
 
-Nothing here writes `lease_expires_at` or `attempt_count`. Those columns
-stay untouched through all of M2 — a Phase 2.1 exit criterion, and the
-lease engine that owns them is Phase 3.
+**Phase 3.1 adds the lease engine to this module**, and it is deliberately
+here rather than in a module of its own: a lease is a column on the queue
+row, written by the same statements that already move the row, so putting
+it elsewhere would mean two modules writing `tasks` and a second place to
+look when a task is in the wrong state.
 
-There is no requeue primitive, for the same reason: `ASSIGNED -> QUEUED`
-is not a legal move in `task_states`. Returning a claimed task to the
-queue is the Phase 3 `REASSIGNED` transition and is not invented here.
+    dequeue          -> lease_expires_at = now() + ack timeout
+    mark_status(RUNNING)
+                     -> deadline_at = now() + execution cap
+                        lease_expires_at = LEAST(now() + ttl, deadline_at)
+    renew_lease      -> lease_expires_at = LEAST(now() + ttl, deadline_at)
+    shorten_worker_leases (socket close)
+                     -> lease_expires_at = LEAST(it, now() + grace)
+    renew_worker_leases (hello)
+                     -> every non-terminal row this worker holds
+    terminal state   -> lease_expires_at = NULL, deadline_at = NULL
+    reclaim_expired_leases
+                     -> ASSIGNED/RUNNING -> QUEUED, attempt_count + 1,
+                        excluded_worker_id + not_before (Phase 3.2 retry),
+                        or -> FAILED once the attempts are exhausted
+
+**One recovery trigger: an expired lease in Postgres.** No other signal
+reclaims a task — not a closed socket, not `OFFLINE`, not a missed
+heartbeat, not a stalled progress figure. A close is *coordinator-
+observed*, so it shortens the lease, which accelerates the one mechanism
+instead of adding a second one that could disagree with it. The reasoning
+is in the Phase 3.0 gate (§3.0.2) and it is worth restating in one line:
+`_sweep_heartbeats` declares a worker `OFFLINE` when its Redis key is
+missing, so an `OFFLINE`-driven reclaim would reassign the entire
+in-flight fleet on a Redis blip — the recovery system causing the outage.
+
+**The requeue transition is real, and it is `-> QUEUED`, not
+`-> REASSIGNED`.** This module's pre-M3 docstring said otherwise, and the
+gate named the contradiction rather than resolving it quietly: the queue
+is `WHERE status = 'QUEUED'`, so a recovered task must actually be
+`QUEUED` to be claimable. `REASSIGNED` is an *attempt* outcome. See
+`app.task_states`.
 """
 
 from __future__ import annotations
@@ -41,17 +71,31 @@ from typing import Any
 from sqlalchemy import bindparam, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import (
+    task_ack_timeout_seconds,
+    task_lease_ttl_seconds,
+    task_max_attempts,
+    task_max_execution_seconds_default,
+    task_retry_backoff_base_seconds,
+    task_retry_backoff_factor,
+    task_retry_backoff_max_seconds,
+    task_retry_exclusion_seconds,
+)
 from app.models import Task
+from app.task_policies import max_attempts, max_execution_seconds, policy_seconds
 from app.task_states import (
     ASSIGNED,
     CANCELLED,
     COMPLETED,
+    FAILED,
     QUEUED,
+    REASSIGNED,
     RUNNING,
     TASK_STATES,
     InvalidTaskTransition,
     UnknownTaskState,
     check_transition,
+    is_terminal,
 )
 from app.task_types import TASK_TYPES, UnknownTaskType, validate_parameters
 
@@ -82,6 +126,19 @@ if not check_transition(QUEUED, ASSIGNED):
     raise RuntimeError(
         f"task_queue performs {QUEUED} -> {ASSIGNED}, which task_states no longer allows"
     )
+# Phase 3.1's reclaim, checked the same way and for the same reason. The
+# reclaimer expresses both moves in one SQL statement, where
+# `check_transition` cannot run per row.
+for _reclaim_from in (ASSIGNED, RUNNING):
+    for _reclaim_to in (QUEUED, FAILED):
+        # `-> FAILED` is Phase 3.2's exhaustion branch: the same statement
+        # that requeues a retryable task ends a task that has no attempt
+        # left, so both targets are checked here.
+        if not check_transition(_reclaim_from, _reclaim_to):
+            raise RuntimeError(
+                f"the lease reclaimer performs {_reclaim_from} -> {_reclaim_to}, "
+                "which task_states no longer allows"
+            )
 
 
 def _validated_row(
@@ -186,12 +243,62 @@ async def enqueue_batch(
 #
 # `updated_at` is set explicitly because the model's `onupdate=func.now()`
 # is a SQLAlchemy ORM-level hook and does not fire for raw SQL.
+#
+# **Phase 3.1 adds the acknowledgement lease to this same statement.** A
+# task is durably `ASSIGNED` *with an expiry* before a byte reaches the
+# worker, which is what closes the gap Step 2.3's commit-before-send
+# deliberately left open: a task recorded as ASSIGNED whose delivery never
+# arrived was visible and unrecoverable, and now it simply expires.
+#
+# The timeout is resolved per row against `task_policies` rather than being
+# a single bound parameter, because one dequeue claims several task types
+# at once — a per-type policy that only worked when a worker supported one
+# type would be a policy in name only. See `app.task_policies` for why the
+# lookup is in SQL and not in a process-side cache.
+#
+# **`deadline_at` is set here as well as at `task_started`, and that is a
+# Step 3.1 decision the gate's lifecycle table did not call for.** It was
+# found by a live run, not by review. The shipped worker ignores a
+# re-delivery of a task id it is already executing
+# (`task_assign_duplicate_ignored`, an M2 behaviour), so after a reclaim
+# hands a task back to the same worker there is no second `task_started` —
+# and with the deadline set only there, that task's lease could be renewed
+# forever by progress messages from an execution that may be hung. The
+# uncapped renewal is precisely what `deadline_at` exists to prevent, so
+# the cap now starts at delivery and `task_started` re-stamps it from the
+# real start. Setting it twice costs nothing: both statements were already
+# writing this row.
+#
+# The cost of the earlier stamp is that the cap includes the delivery and
+# acknowledgement round trip, which is bounded by the ack timeout — so the
+# effective execution budget is the type's cap minus at most ~30s, and it
+# is re-stamped in full the moment the task genuinely starts.
+#
+# **Phase 3.2 adds the two retry-eligibility conditions.** A task that has
+# just been reclaimed is `QUEUED` but not yet claimable: `not_before`
+# holds it for its backoff, and `excluded_worker_id` keeps it away from
+# the worker that just lost it. Both live in the same predicate as the
+# status test so they are applied inside the one ordered index walk — the
+# same cost note as the 2.3 type filter, and for the same reason.
+#
+# The exclusion **expires**, and that is the gate's decision rather than an
+# oversight (§3.0.6): a permanent one starves the task to death on a
+# single-worker fleet, which is exactly the shape of a laptop demo and of
+# one Internet worker on a hotspot. Retrying eventually on the same worker
+# beats never retrying at all.
+_ELIGIBLE = """
+          AND (not_before IS NULL OR not_before <= now())
+          AND (excluded_worker_id IS NULL
+               OR excluded_worker_id <> CAST(:worker_id AS uuid)
+               OR not_before + make_interval(secs => :exclusion_window) <= now())"""
+
+
 def _dequeue_sql(type_filter: str) -> str:
     return f"""
     WITH claimed AS (
         SELECT id
         FROM tasks
-        WHERE status = 'QUEUED'{type_filter}
+        WHERE status = 'QUEUED'{type_filter}{_ELIGIBLE}
         ORDER BY priority, created_at
         LIMIT :limit
         FOR UPDATE SKIP LOCKED
@@ -200,11 +307,14 @@ def _dequeue_sql(type_filter: str) -> str:
     SET status = 'ASSIGNED',
         assigned_worker_id = CAST(:worker_id AS uuid),
         assigned_at = now(),
+        lease_expires_at = now() + make_interval(
+            secs => {policy_seconds("ack_timeout_seconds", "ack_timeout")}),
+        deadline_at = now() + make_interval(secs => {max_execution_seconds()}),
         updated_at = now()
     FROM claimed
     WHERE t.id = claimed.id
     RETURNING t.id, t.task_type, t.parameters, t.payload, t.priority,
-              t.correlation_id, t.assigned_at, t.attempt_count
+              t.correlation_id, t.assigned_at, t.attempt_count, t.lease_expires_at
     """
 
 
@@ -267,7 +377,15 @@ async def dequeue(
     if limit > max_batch:
         raise QueueLimitExceeded(f"limit {limit} exceeds the {max_batch}-task dequeue cap")
 
-    params: dict[str, Any] = {"limit": limit, "worker_id": str(worker_id)}
+    params: dict[str, Any] = {
+        "limit": limit,
+        "worker_id": str(worker_id),
+        "ack_timeout": task_ack_timeout_seconds(),
+        "max_execution_fallback": task_max_execution_seconds_default(),
+        # Phase 3.2. How long the worker that lost a task stays ineligible
+        # for it, measured from `not_before`.
+        "exclusion_window": task_retry_exclusion_seconds(),
+    }
     if task_types is None:
         statement = _DEQUEUE_SQL
     else:
@@ -294,6 +412,40 @@ ILLEGAL = "illegal"
 # worker's point of view — the task is completed, so the worker should stop
 # retrying — whereas NOOP is a state report that changed nothing.
 DUPLICATE = "duplicate"
+# Phase 3.3. A result for a task that is **already terminal and whose stored
+# result is somebody else's** — the losing side of the in-flight-versus-
+# reassignment race, and the honest answer to a late result for a task that
+# was failed or cancelled while it was still being computed.
+#
+# Distinct from `DUPLICATE` because the two say opposite things about the
+# submitter's own work: a duplicate means "your result is the one that is
+# stored, stop retrying", a superseded means "your result was not stored and
+# never will be, stop retrying". Collapsing them would make the ack claim a
+# result landed when another attempt's did, which is exactly the kind of
+# blurring §10 forbids — and the metric label is what makes a fleet losing
+# races visible without reading logs.
+#
+# Distinct from `NOT_OWNER` because nothing about it is suspicious: the
+# sender held this task, executed it honestly, and lost a race that the
+# design says it may lose (gate §3.0.5 — at-least-once execution).
+SUPERSEDED = "superseded"
+# Phase 3.4. A submission from an attempt that is no longer the task's
+# current one — a stale result from an earlier attempt of a task this worker
+# holds again, or a result from a worker the task has since been reassigned
+# away from while it is still being worked on.
+#
+# **Distinct from `SUPERSEDED` because the task is still live.** Superseded
+# answers a submission for a task some other attempt has already finished;
+# fenced answers one for a task nobody has finished yet. Both tell the
+# worker to stop retrying, and both write no result — but only one of them
+# means the work is done, and an operator watching a recovery needs to know
+# which.
+#
+# **Distinct from `NOT_OWNER` because the sender genuinely held this task.**
+# `NOT_OWNER` keeps its §12 meaning — "you are naming something that was
+# never yours" — which is the signal an impostor produces. A worker that
+# lost a race the design says it may lose must not be recorded as one.
+FENCED = "fenced"
 # Phase 2.6. The task exists but is past the point where a coordinator-side
 # write alone can cancel it — see `cancel_queued_task`. Distinct from
 # ILLEGAL because nothing was attempted: this is a refusal, not a rejected
@@ -326,12 +478,23 @@ async def mark_status(
 
     Writes `status` and `updated_at`, plus `started_at` on the move to
     `RUNNING` (Phase 2.6 — inside this same statement, so the hot path gains
-    no extra round trip). In particular it does not touch
-    `lease_expires_at` or `attempt_count` — a Phase 2.1 exit criterion holds
-    those untouched through all of M2 — and it does not stamp
-    `completed_at`, even on `FAILED`: that column belongs to Step 2.5's
-    completion path, and `updated_at` already records when the transition
-    happened.
+    no extra round trip). It does not stamp `completed_at`, even on
+    `FAILED`: that column belongs to Step 2.5's completion path, and
+    `updated_at` already records when the transition happened.
+
+    **Phase 3.1 folds the lease into the same statement**, in both
+    directions and with no extra round trip either way:
+
+    * `-> RUNNING` sets `deadline_at` — the coordinator-set execution cap
+      no worker renewal can push past — and the first execution lease,
+      `LEAST(now() + ttl, deadline_at)`. The ack lease written at dequeue
+      is replaced here rather than extended, because the two measure
+      different things: one bounds delivery, the other bounds execution.
+    * a **terminal** state clears both columns. Strictly this is belt and
+      braces — the reclaimer's `WHERE status IN ('ASSIGNED','RUNNING')`
+      already cannot match a terminal row — but leaving a stale expiry on
+      a finished task means every later reader has to know that, and it
+      keeps the partial index off rows that will never be reclaimed.
     """
     try:
         parsed = uuid.UUID(str(task_id))
@@ -359,20 +522,171 @@ async def mark_status(
     if not should_write:
         return NOOP
 
-    # Phase 2.6: the RUNNING transition also stamps when it happened. Set
-    # unconditionally rather than with COALESCE — a task can only reach this
-    # branch from ASSIGNED (a same-state report is the NOOP above), and when
-    # Phase 3 makes a second attempt possible, the start of *this* attempt is
-    # the useful answer.
-    started = ", started_at = now()" if new_status == RUNNING else ""
+    params: dict[str, Any] = {"status": new_status, "id": str(parsed)}
+    if new_status == RUNNING:
+        # Phase 2.6: the RUNNING transition also stamps when it happened. Set
+        # unconditionally rather than with COALESCE — a task can only reach
+        # this branch from ASSIGNED (a same-state report is the NOOP above),
+        # and now that Phase 3 makes a second attempt possible, the start of
+        # *this* attempt is the useful answer.
+        deadline = (
+            "now() + make_interval(secs => "
+            f"{max_execution_seconds(table_alias='tasks')})"
+        )
+        ttl = (
+            "now() + make_interval(secs => "
+            f"{policy_seconds('lease_ttl_seconds', 'lease_ttl', table_alias='tasks')})"
+        )
+        # Re-stamped from the real start, replacing the conservative
+        # delivery-time stamp the claim wrote (see `_dequeue_sql`).
+        extra = (
+            f", started_at = now(), deadline_at = {deadline}, "
+            f"lease_expires_at = LEAST({ttl}, {deadline})"
+        )
+        params["lease_ttl"] = task_lease_ttl_seconds()
+        params["max_execution_fallback"] = task_max_execution_seconds_default()
+    elif is_terminal(new_status):
+        # Phase 3.2 clears the retry columns here too, for the reason the
+        # lease columns are cleared: a finished task that still names an
+        # excluded worker and a retry instant is a row every later reader
+        # has to know to ignore — and the task console would render "retry
+        # after ..." on a task that is never going to be retried.
+        extra = (
+            ", lease_expires_at = NULL, deadline_at = NULL, "
+            "not_before = NULL, excluded_worker_id = NULL"
+        )
+    else:
+        extra = ""
+
     await session.execute(
         text(
-            f"UPDATE tasks SET status = :status, updated_at = now(){started} "
+            f"UPDATE tasks SET status = :status, updated_at = now(){extra} "
             "WHERE id = CAST(:id AS uuid)"
         ),
-        {"status": new_status, "id": str(parsed)},
+        params,
     )
     return TRANSITIONED
+
+
+async def _terminal_result_outcome(
+    session: AsyncSession, *, result_id: uuid.UUID | None, token: str | None
+) -> str:
+    """Answer a result submitted for a task that is already terminal (3.3).
+
+    The whole dedup mechanism is these few lines plus the `FOR UPDATE` the
+    caller already holds: **no store, nothing to expire, nothing to size.**
+    The stored result is the record of who won, and its token is read from
+    the row that record already lives in.
+
+    A terminal task with no stored result — `FAILED`, `CANCELLED`, or a
+    `COMPLETED` task whose body retention has purged — cannot match any
+    token, so it answers `SUPERSEDED`. That is the correct answer in every
+    one of those cases: nothing of this submission was kept.
+    """
+    if result_id is None or token is None:
+        return SUPERSEDED
+    stored = (
+        await session.execute(
+            text("SELECT payload ->> 'idempotency_token' AS token FROM task_results WHERE id = :id"),
+            {"id": str(result_id)},
+        )
+    ).scalar_one_or_none()
+    return DUPLICATE if stored is not None and stored == token else SUPERSEDED
+
+
+# Phase 3.4. The third way an attempt can end abnormally, beside being
+# reassigned and being given up on: its result arrived after the attempt had
+# stopped being the current one. `models.py` reserved the string when the
+# table was created.
+FENCED_OUTCOME = "FENCED"
+# Which of the two fencing inputs failed, kept apart because they describe
+# different situations to whoever reads the row: the attempt number moved on
+# under a worker that still holds the task, versus the task moving to
+# somebody else entirely.
+REASON_STALE_ATTEMPT = "stale_attempt"
+REASON_TASK_REASSIGNED = "task_reassigned"
+
+# Written under the caller's `FOR UPDATE` lock on the task row, so the
+# `NOT EXISTS` cannot race another submission for the same task.
+#
+# **The guard is not tidiness, it is a bound.** `attempt_number` is
+# worker-reported and therefore untrusted (§12), and a worker that holds one
+# task legitimately could otherwise resubmit the same stale result forever
+# and write one row per submission. With it, a (task, worker) pair can write
+# at most one row per attempt number, and the attempt number itself is
+# bounded by the caller to `<= attempt_count`.
+_RECORD_FENCE_SQL = text(
+    """
+    INSERT INTO task_attempts
+        (id, task_id, attempt_number, worker_id, outcome, reason, correlation_id)
+    SELECT gen_random_uuid(), CAST(:task_id AS uuid), :attempt_number,
+           CAST(:worker_id AS uuid), CAST(:outcome AS text), :reason,
+           :correlation_id
+    WHERE NOT EXISTS (
+        SELECT 1 FROM task_attempts
+        WHERE task_id = CAST(:task_id AS uuid)
+          AND worker_id = CAST(:worker_id AS uuid)
+          AND attempt_number = :attempt_number
+          AND outcome = CAST(:outcome AS text)
+    )
+    """
+)
+
+
+def _count_fence(reason: str) -> None:
+    """Increment `coordinator_results_fenced_total{reason}` (gate §3.0.9).
+
+    Counted here rather than by the caller, which is the opposite of what
+    the reassignment counters do, for one reason: **only this module knows
+    which of the two fencing inputs failed.** Handing the reason back would
+    mean widening a return type that every caller and three test modules
+    compare against a plain string, to move one line.
+
+    `app.metrics` imports *this* module for its queue-depth gauges, so the
+    import has to be inside the function or it is a cycle at start-up. It
+    costs a `sys.modules` lookup, on the branch that has already decided to
+    refuse a submission.
+    """
+    from app.metrics import RESULTS_FENCED
+
+    RESULTS_FENCED.labels(reason).inc()
+
+
+async def _ever_held(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    worker_id: uuid.UUID | str,
+    assigned_worker_id: Any,
+) -> bool:
+    """Did this worker ever actually hold this task? (Phase 3.4)
+
+    This is what keeps `NOT_OWNER` meaning what §12 needs it to mean. Once
+    fencing exists, "the row does not name you" covers two completely
+    different senders: a worker whose task was reassigned out from under it
+    mid-execution, and a worker naming a task that was never its own. They
+    deserve opposite answers, and the row alone cannot tell them apart.
+
+    It can be told apart cheaply, because Step 3.2 already writes the
+    evidence: **every reassignment records a `task_attempts` row naming the
+    worker that lost the task.** So a genuine loser has a row here and an
+    impostor has none, read from `ix_task_attempts_task`, on the rare branch
+    only — the accepting path never runs this query.
+
+    The current assignee short-circuits it entirely, which is the case that
+    matters for throughput: a worker submitting a stale attempt number for a
+    task it still holds needs no lookup at all.
+    """
+    if assigned_worker_id is not None and str(assigned_worker_id) == str(worker_id):
+        return True
+    found = await session.execute(
+        text(
+            "SELECT 1 FROM task_attempts WHERE task_id = CAST(:task_id AS uuid) "
+            "AND worker_id = CAST(:worker_id AS uuid) LIMIT 1"
+        ),
+        {"task_id": str(task_id), "worker_id": str(worker_id)},
+    )
+    return found.scalar_one_or_none() is not None
 
 
 async def complete_task(
@@ -397,10 +711,79 @@ async def complete_task(
     `DUPLICATE` having written nothing at all — not a second result row, not
     a re-stamped `completed_at`. Two coordinator replicas processing the
     same retried submission serialise on that lock, so the second one sees
-    `COMPLETED` and stops. The `idempotency_token` in the envelope is
-    therefore **recorded, not enforced** in M2: the task's own terminal
-    state is what makes a duplicate a no-op, and the token is what lets
-    Phase 3 tell a retry apart from a genuinely second attempt.
+    `COMPLETED` and stops. **There is no dedup store** — no Redis set, no
+    seen-token table, nothing with a retention window to tune or a size to
+    watch (gate §3.0.12, Decision #170). The suppression is a state read on
+    a row that had to be locked anyway.
+
+    **Phase 3.3 is where the `idempotency_token` stops being merely
+    recorded.** The terminal-state check answers *whether* to write; the
+    token answers *whose* result is stored, which is the question the
+    reassignment race asks:
+
+    * task terminal, stored token equals the submitted one → `DUPLICATE`.
+      This submission's own result is the stored one, so from the worker's
+      side it is a success.
+    * task terminal, stored token differs — or there is no stored result at
+      all, because the task was failed or cancelled → `SUPERSEDED`. Nothing
+      was written and nothing ever will be for this attempt.
+
+    The token is minted once per task execution on the worker
+    (`worker.py`'s `Task.idempotency_token`) and reused by every retry of
+    that submission, which is what makes equality mean "the same
+    submission" rather than "the same worker".
+
+    **The winner rule, stated once and implemented here** (gate §3.0.6):
+    the first submission to find the task non-terminal *while holding it*
+    completes it; every later submission for that task writes nothing. The
+    lock is what makes "first" well defined across replicas, and the order
+    the guards run in is what makes the rule honest — the terminal check
+    comes **before** the ownership check, because a task reassigned to
+    another worker and completed there is no longer owned by the submitter,
+    and answering `NOT_OWNER` to a worker whose only mistake was being slow
+    would report an honest loser as an impostor.
+
+    **One consequence, named rather than left to be discovered:** a result
+    body purged by retention takes its token with it (`result_id` is
+    `ON DELETE SET NULL`), so a duplicate arriving after the retention
+    window cannot be told from a superseded one and is answered
+    `SUPERSEDED`. Both mean "stop retrying, nothing is owed", and a
+    submission pending for seven days does not exist — the worker's pending
+    buffer is in memory and dies with the process.
+
+    **Phase 3.4 adds the fencing rule, and it is the completion of the
+    sentence 3.3 left unfinished.** A result is accepted **if and only if
+    the sender is the current `assigned_worker_id` and its
+    `attempt_number` equals `tasks.attempt_count`** (gate §3.0.6). Anything
+    else on a live task is `FENCED`: nothing written, the task's state
+    untouched, one `task_attempts` row recording the attempt that was
+    fenced.
+
+    Two things are fenced and they are different situations, which is why
+    the attempt row carries a reason:
+
+    * the sender still holds the task but names an **earlier attempt** —
+      `stale_attempt`. This is the case 3.3 explicitly left accepted, and
+      it is reachable exactly when a reclaimed task comes back to the same
+      worker after its exclusion window (Step 3.2).
+    * the sender no longer holds the task at all because it has been
+      **reassigned** while still live — `task_reassigned`. Before 3.4 this
+      was `NOT_OWNER`, which accuses an honest worker of naming somebody
+      else's task.
+
+    **`NOT_OWNER` is not retired, it is narrowed to what §12 meant by it.**
+    A sender the task has no record of ever holding still gets it — see
+    `_ever_held`. That distinction is what stops fencing from becoming a
+    way for a worker to make the coordinator write rows about tasks it has
+    never been given.
+
+    **`session_epoch` is deliberately not an input** (gate §3.0.12,
+    Decision #169). Step 2.5 measured a legitimate result executed under
+    epoch 4 and submitted on 5 after a reconnect; rejecting on a stale
+    epoch would break the coordinator-outage criterion a shipped step
+    proved. The epoch is recorded and logged, and session conflicts are
+    arbitrated by the Step 1.7 epoch check, which is a different question
+    from result validity.
 
     **A missing `RUNNING` is walked through, not widened.** A result can
     arrive for a task still `ASSIGNED` — the `task_started` report is a
@@ -420,24 +803,82 @@ async def complete_task(
     row = (
         await session.execute(
             text(
-                "SELECT status, assigned_worker_id FROM tasks "
-                "WHERE id = CAST(:id AS uuid) FOR UPDATE"
+                # `result_id` joins the read (Phase 3.3) so the duplicate
+                # branch can compare tokens without a second lookup of the
+                # task row. The hot path pays one more column on a row it
+                # was already locking; the token itself is only fetched when
+                # the task is terminal, which is the rare branch.
+                #
+                # `attempt_count` and `correlation_id` join it for Phase
+                # 3.4, and for the same reason: the fencing comparison and
+                # the attempt row it writes both need them, and neither is
+                # worth a second lookup of a row already held under lock.
+                "SELECT status, assigned_worker_id, result_id, attempt_count, "
+                "correlation_id FROM tasks WHERE id = CAST(:id AS uuid) FOR UPDATE"
             ),
             {"id": str(parsed)},
         )
     ).mappings().one_or_none()
     if row is None:
         return NOT_FOUND
-    if str(row["assigned_worker_id"]) != str(worker_id):
-        return NOT_OWNER
 
     current = row["status"]
-    if current == COMPLETED:
-        return DUPLICATE
+    # Phase 3.3, and the order matters — see the docstring. A terminal task
+    # is answered on its own terms whoever is asking, because after Step 3.2
+    # the submitter of a late result is usually *not* the current assignee
+    # and calling that `NOT_OWNER` would accuse an honest worker.
+    if is_terminal(current):
+        return await _terminal_result_outcome(
+            session, result_id=row["result_id"], token=envelope.get("idempotency_token")
+        )
+
+    # Phase 3.4, the fencing rule. Both halves of it are checked here and
+    # nowhere else, so there is exactly one place that decides whether a
+    # submission is the current attempt's — see the docstring.
+    current_attempt = int(row["attempt_count"])
+    submitted_attempt = envelope.get("attempt_number")
+    is_assignee = (
+        row["assigned_worker_id"] is not None
+        and str(row["assigned_worker_id"]) == str(worker_id)
+    )
+    if not is_assignee or submitted_attempt != current_attempt:
+        if not await _ever_held(
+            session,
+            task_id=str(parsed),
+            worker_id=worker_id,
+            assigned_worker_id=row["assigned_worker_id"],
+        ):
+            return NOT_OWNER
+        reason = REASON_STALE_ATTEMPT if is_assignee else REASON_TASK_REASSIGNED
+        _count_fence(reason)
+        # An attempt number the task has never reached is not a history
+        # this coordinator will fabricate a row for — it is fenced, acked
+        # and logged like any other, but nothing durable records an attempt
+        # that did not happen. This is also what bounds the table against a
+        # worker naming arbitrary attempt numbers (§12).
+        if isinstance(submitted_attempt, int) and 0 <= submitted_attempt <= current_attempt:
+            await session.execute(
+                _RECORD_FENCE_SQL,
+                {
+                    "task_id": str(parsed),
+                    "attempt_number": submitted_attempt,
+                    "worker_id": str(worker_id),
+                    "outcome": FENCED_OUTCOME,
+                    "reason": reason,
+                    # The task's own correlation id, not a fresh one, so the
+                    # fence is traceable in the same end-to-end thread as
+                    # the assignment that produced it (§11).
+                    "correlation_id": row["correlation_id"],
+                },
+            )
+        return FENCED
 
     # ASSIGNED needs the RUNNING hop; RUNNING goes straight through. Every
-    # step is checked, so an already-terminal task (FAILED, CANCELLED) is
-    # refused here rather than silently overwritten.
+    # step is checked. A terminal task never reaches here — Phase 3.3
+    # answers it above — so `ILLEGAL` now means only "a live state this
+    # module does not know how to complete from", which is unreachable
+    # today and kept because the state machine, not this function, is the
+    # authority on that.
     path = [RUNNING, COMPLETED] if current == ASSIGNED else [COMPLETED]
     state = current
     try:
@@ -468,15 +909,626 @@ async def complete_task(
     # nothing stamped it, so now is the closest true answer available. When
     # the report did arrive, the real start time is already there and must not
     # be overwritten with the completion time.
+    #
+    # Phase 3.1 clears the lease and the deadline here, in the statement
+    # that was already completing the task. A completed task cannot be
+    # reclaimed regardless — the reclaimer only looks at `ASSIGNED` and
+    # `RUNNING` — so this is about leaving the row honest rather than about
+    # safety: a finished task with a future expiry on it is a fact nobody
+    # should have to interpret.
     await session.execute(
         text(
             "UPDATE tasks SET status = :status, result_id = CAST(:result_id AS uuid), "
             "completed_at = now(), updated_at = now(), "
+            # Phase 3.1 cleared the lease pair here; Phase 3.2 clears the
+            # retry pair with it, so a completed task carries no state about
+            # an attempt that will never happen.
+            "lease_expires_at = NULL, deadline_at = NULL, "
+            "not_before = NULL, excluded_worker_id = NULL, "
             "started_at = COALESCE(started_at, now()) WHERE id = CAST(:id AS uuid)"
         ),
         {"status": COMPLETED, "result_id": str(result_id), "id": str(parsed)},
     )
     return TRANSITIONED
+
+
+# ---------------------------------------------------------------------------
+# Lease engine (Phase 3.1)
+# ---------------------------------------------------------------------------
+
+# Every statement below caps its renewal at `deadline_at`, expressed as
+# `LEAST(now() + ttl, COALESCE(deadline_at, 'infinity'))`. The COALESCE is
+# what makes a task that has been delivered but has not yet reported
+# `task_started` renewable — it has no deadline yet, because the execution
+# clock has not begun.
+_RENEWAL_TARGET = (
+    "LEAST(now() + make_interval(secs => :lease_ttl), "
+    "COALESCE(deadline_at, 'infinity'::timestamptz))"
+)
+
+_LIVE = "status IN ('ASSIGNED', 'RUNNING')"
+
+
+async def renew_lease(
+    session: AsyncSession, *, task_id: str, worker_id: uuid.UUID | str
+) -> bool:
+    """Push one task's lease out by a TTL. Returns whether a row was written.
+
+    Called when the coordinator observes **any** message naming the task —
+    an ack, a start, a progress sample, a result attempt. Note what the
+    input is and is not: the *arrival* of a message renews the lease, and
+    its *contents* decide nothing. A worker reporting 99% progress forever
+    renews exactly as much as one reporting 1%, and no more (gate §3.0.6).
+
+    Three guards, and each is load-bearing (§12 — a worker is untrusted
+    input):
+
+    * `assigned_worker_id` must be the sender, so a worker cannot extend
+      another worker's lease and keep its task alive;
+    * the task must still be live, so a message about a finished task
+      cannot resurrect an expiry;
+    * the new value is capped at `deadline_at`, so renewal can postpone a
+      reclaim but can never prevent one. That cap is what makes it safe
+      for the renewal trigger to be worker-driven at all.
+
+    **When to call it is decided by the caller, not here.** The replica
+    holding the socket tracks when each of its tasks is next due and skips
+    the call entirely otherwise, so an undue renewal costs no database
+    round trip — not merely no write. See `assignment._lease_due`.
+    """
+    try:
+        parsed = uuid.UUID(str(task_id))
+    except (ValueError, AttributeError):
+        return False
+
+    result = await session.execute(
+        text(
+            f"UPDATE tasks SET lease_expires_at = {_RENEWAL_TARGET}, updated_at = now() "
+            f"WHERE id = CAST(:id AS uuid) AND assigned_worker_id = CAST(:worker_id AS uuid) "
+            f"AND {_LIVE}"
+        ),
+        {
+            "id": str(parsed),
+            "worker_id": str(worker_id),
+            "lease_ttl": task_lease_ttl_seconds(),
+        },
+    )
+    return bool(result.rowcount)
+
+
+async def renew_worker_leases(
+    session: AsyncSession, *, worker_id: uuid.UUID | str
+) -> list[str]:
+    """Renew every live lease held by one worker. Returns the task ids.
+
+    This is the reconnect path (gate §3.0.3 row 10). A worker whose socket
+    died and came back is still executing the work it had; renewing on
+    `hello` is what makes a clean reconnect inside the disconnect grace
+    lose nothing at all.
+
+    **The task ids come from the database, never from the worker.** The
+    `hello` message says "I am worker X" and nothing more is believed: the
+    coordinator asks its own tables which tasks X holds. A worker that
+    declared a list of task ids here could keep another worker's task
+    alive, or claim work it was never given.
+
+    They are **returned** rather than merely counted because the caller
+    needs them: the reconnecting session was not the one these tasks were
+    delivered to, so it holds no credit key for any of them, and without
+    this list every subsequent progress message about them would be
+    discarded as "not this session's" — leaving a healthy worker's running
+    task to be reclaimed one lease later. This is the only place those ids
+    can come from that is not the worker's own word for it.
+    """
+    result = await session.execute(
+        text(
+            f"UPDATE tasks SET lease_expires_at = {_RENEWAL_TARGET}, updated_at = now() "
+            f"WHERE assigned_worker_id = CAST(:worker_id AS uuid) AND {_LIVE} "
+            "RETURNING id"
+        ),
+        {"worker_id": str(worker_id), "lease_ttl": task_lease_ttl_seconds()},
+    )
+    return [str(row[0]) for row in result.all()]
+
+
+async def shorten_worker_leases(
+    session: AsyncSession, *, worker_id: uuid.UUID | str, grace_seconds: int
+) -> int:
+    """Cut every live lease this worker holds to at most `grace_seconds`.
+
+    Called by the replica that **personally observed** the socket close.
+    That distinction is the whole reason this is safe: it can only affect
+    tasks belonging to a worker whose connection this process was holding,
+    so it cannot storm the way an `OFFLINE`-driven reclaim could.
+
+    It **shortens and never extends** — `LEAST` against the current value —
+    so a task already inside the grace window keeps its earlier expiry. A
+    close observed twice therefore changes nothing the second time.
+
+    This is an accelerator, not a second recovery trigger: the reclaimer
+    still does the reclaiming, and a close that is never observed (a power
+    cut, a severed link) simply falls back to the full lease TTL.
+    """
+    result = await session.execute(
+        text(
+            "UPDATE tasks SET lease_expires_at = LEAST("
+            "  COALESCE(lease_expires_at, 'infinity'::timestamptz), "
+            "  now() + make_interval(secs => :grace)), updated_at = now() "
+            f"WHERE assigned_worker_id = CAST(:worker_id AS uuid) AND {_LIVE}"
+        ),
+        {"worker_id": str(worker_id), "grace": grace_seconds},
+    )
+    return int(result.rowcount or 0)
+
+
+# The reclaimer. One loop per replica, no leader election — the same shape
+# as the shipped retention sweep and the assignment engine, for the same
+# §3.9 reason.
+#
+# **Double-reclaim is impossible for exactly the reason double-assignment
+# is**, and this is deliberately the same primitive rather than a new one
+# to be proven from scratch: a second replica's `SKIP LOCKED` steps over
+# the row the first has locked, and by the time that lock lifts the row is
+# `QUEUED` and no longer matches. Step 2.2 measured that at 10,000 claims
+# with 0 duplicates across three AKS pods.
+#
+# `previous_worker_id` and `expired_at` come out of the CTE rather than the
+# UPDATE's `RETURNING`, because `RETURNING` reports the **new** row: by
+# then the worker is NULL and the lease is cleared. Reading them from the
+# subquery is what lets the log line name who lost the task and by how
+# much the lease was overdue.
+#
+# **Phase 3.2 adds the retry policy to this same statement**, deliberately
+# rather than as a second pass over the rows it just wrote. Whether a task
+# is retried or given up on is a function of one number the statement is
+# already reading (`attempt_count`) and one row-level lookup it can do in
+# the same walk (the type's `max_attempts`), so splitting it would mean two
+# statements, a second lock acquisition and a window in which a task is
+# requeued but not yet backed off — visible to a dequeue.
+#
+# `t.attempt_count` inside `SET` is the **old** value; the incremented one
+# is what `RETURNING` reports. So the exhaustion test is written
+# `t.attempt_count + 1 >= max_attempts`, and `attempt_count` is zero-based
+# (a first delivery is `attempt: 0`), which makes `max_attempts = 3` mean
+# executions 0, 1, 2.
+#
+# The backoff is **full jitter** — `random() * min(max, base * factor^n)` —
+# computed here rather than in Python for the same reason the policy lookup
+# is: one statement, one clock, and every replica agreeing without
+# coordination. Postgres evaluates `random()` per row, so a hundred tasks
+# reclaimed together get a hundred different delays, which is the whole
+# point of jitter.
+_RETRY_BACKOFF = (
+    "random() * LEAST(:backoff_max, "
+    ":backoff_base * power(:backoff_factor, t.attempt_count))"
+)
+
+
+def _reclaim_sql() -> str:
+    exhausted = f"t.attempt_count + 1 >= {max_attempts()}"
+    return f"""
+    WITH expired AS (
+        SELECT id, assigned_worker_id AS previous_worker_id,
+               lease_expires_at AS expired_at, attempt_count AS previous_attempt,
+               status AS previous_status,
+               -- Which clock ran out. A lease that was capped by the
+               -- execution deadline is the gate's taxonomy row 7 (a worker
+               -- slower than its type's cap), not row 1 (a worker that
+               -- stopped answering), and the attempt row has to be able to
+               -- say which. Evaluated against Postgres's clock, in the same
+               -- statement that reads the column, so no coordinator's clock
+               -- skew can relabel it.
+               (deadline_at IS NOT NULL AND deadline_at <= now()) AS deadline_exceeded
+        FROM tasks
+        WHERE status IN ('ASSIGNED', 'RUNNING')
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at < now()
+        ORDER BY lease_expires_at
+        LIMIT :batch
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE tasks AS t
+    SET status = CASE WHEN {exhausted} THEN 'FAILED' ELSE 'QUEUED' END,
+        assigned_worker_id = NULL,
+        assigned_at = NULL,
+        started_at = NULL,
+        lease_expires_at = NULL,
+        deadline_at = NULL,
+        attempt_count = t.attempt_count + 1,
+        -- Both retry columns are cleared on the terminal branch: a FAILED
+        -- task is never claimed again, so a backoff or an exclusion left on
+        -- it would be a fact about a task that no longer has a future.
+        excluded_worker_id = CASE
+            WHEN {exhausted} THEN NULL ELSE expired.previous_worker_id END,
+        not_before = CASE
+            WHEN {exhausted} THEN NULL
+            ELSE now() + make_interval(secs => {_RETRY_BACKOFF}) END,
+        updated_at = now()
+    FROM expired
+    WHERE t.id = expired.id
+    RETURNING t.id, t.task_type, t.correlation_id, t.attempt_count, t.status,
+              t.not_before, expired.previous_worker_id, expired.previous_status,
+              expired.expired_at, expired.deadline_exceeded
+    """
+
+
+_RECORD_EXPIRY_SQL = text(
+    """
+    INSERT INTO task_attempts
+        (id, task_id, attempt_number, worker_id, outcome, reason, correlation_id)
+    VALUES (gen_random_uuid(), CAST(:task_id AS uuid), :attempt_number,
+            CAST(:worker_id AS uuid), :outcome, :reason, :correlation_id)
+    """
+)
+
+# What an attempt row's `outcome` says, and what its `reason` says, kept
+# apart on purpose: **`outcome` is what happened to the task, `reason` is
+# why this attempt ended.** A task given up on after its execution cap was
+# exceeded is `FAILED` / `execution_deadline_exceeded`, and nothing has to
+# encode both facts in one string. "Exhausted" is not a reason code either
+# — it is `attempt_count = max_attempts` on the task, which is derivable
+# and does not go stale if the policy changes.
+#
+# Both outcomes come from `task_states` rather than being spelled here:
+# `REASSIGNED` is the constant that module reserved for exactly this — an
+# attempt that was superseded, never a task status — and `FAILED` is the
+# state the task actually reached.
+REASSIGNED_OUTCOME = REASSIGNED
+EXHAUSTED_OUTCOME = FAILED
+REASON_LEASE_EXPIRED = "lease_expired"
+REASON_DEADLINE_EXCEEDED = "execution_deadline_exceeded"
+
+
+async def reclaim_expired_leases(
+    session: AsyncSession, *, batch: int
+) -> list[dict[str, Any]]:
+    """Return every task whose lease has run out to the queue. Does not commit.
+
+    Returns one entry per reclaimed task, so the caller can log and count
+    each individually — "42 tasks were reclaimed" is not a recovery
+    timeline, and §11 asks for every task to be traceable by its own
+    correlation id.
+
+    **Phase 3.2 makes this the retry engine as well.** Each expired task
+    takes one of two branches, decided by its type's `max_attempts`:
+
+    * **retry** — `QUEUED`, `attempt_count + 1`, the worker that lost it in
+      `excluded_worker_id`, and `not_before` set to a full-jitter backoff.
+      The task is visible in the queue immediately and claimable once the
+      backoff has passed.
+    * **exhausted** — terminal `FAILED`, both retry columns cleared. Never
+      retried again and never silently dropped (gate §3.0.4 item 2): the
+      row stays, its result-less history stays, and the attempt rows that
+      explain it stay.
+
+    Either way one `task_attempts` row is written recording who lost the
+    task, which attempt it was, and which clock ran out. `status` on the
+    returned row is the branch that was taken, so a caller can log,
+    count and cancel without asking again.
+
+    `assigned_at` and `started_at` are cleared with the lease. Leaving them
+    would put a `QUEUED` row in the database claiming to have started
+    running at a particular time, which is not a small untidiness: it is
+    what `GET /tasks/{id}`'s timeline is reconstructed from, so the task
+    would report a start that belongs to an attempt that no longer exists.
+    The superseded attempt is preserved in `task_attempts` instead.
+    """
+    if batch < 1:
+        raise QueueLimitExceeded("batch must be at least 1")
+
+    reclaimed = [
+        dict(row)
+        for row in (
+            await session.execute(
+                text(_reclaim_sql()),
+                {
+                    "batch": batch,
+                    "max_attempts": task_max_attempts(),
+                    "backoff_base": task_retry_backoff_base_seconds(),
+                    "backoff_factor": task_retry_backoff_factor(),
+                    "backoff_max": task_retry_backoff_max_seconds(),
+                },
+            )
+        )
+        .mappings()
+        .all()
+    ]
+    for row in reclaimed:
+        await session.execute(
+            _RECORD_EXPIRY_SQL,
+            {
+                "task_id": str(row["id"]),
+                # The attempt that ended, not the one about to start:
+                # `attempt_count` in the RETURNING is already incremented.
+                "attempt_number": int(row["attempt_count"]) - 1,
+                "worker_id": (
+                    str(row["previous_worker_id"]) if row["previous_worker_id"] else None
+                ),
+                "outcome": (
+                    EXHAUSTED_OUTCOME if row["status"] == FAILED else REASSIGNED_OUTCOME
+                ),
+                "reason": (
+                    REASON_DEADLINE_EXCEEDED
+                    if row["deadline_exceeded"]
+                    else REASON_LEASE_EXPIRED
+                ),
+                "correlation_id": row["correlation_id"],
+            },
+        )
+    return reclaimed
+
+
+async def expired_lease_count(session: AsyncSession) -> int:
+    """How many tasks are overdue for reclaim right now.
+
+    The backlog figure the gate's third alert watches — a reclaimer that
+    has died shows up as this number climbing and never draining, which is
+    the failure the other two alerts cannot see. Answered from the partial
+    index `ix_tasks_lease_expiry`, so it costs the number of *overdue*
+    rows rather than the size of the table.
+    """
+    result = await session.execute(
+        text(
+            "SELECT count(*) FROM tasks "
+            f"WHERE {_LIVE} AND lease_expires_at IS NOT NULL AND lease_expires_at < now()"
+        )
+    )
+    return int(result.scalar_one())
+
+
+async def awaiting_retry_count(session: AsyncSession) -> int:
+    """How many queued tasks are waiting out a retry backoff right now.
+
+    Separate from `queue_depth` on purpose: those tasks *are* queued, so
+    they are in the depth figure, but none of them is claimable yet. A
+    queue that reads 40 deep with nothing being assigned looks like a stuck
+    scheduler until this number says otherwise, which is precisely the
+    question an operator asks during a recovery.
+    """
+    result = await session.execute(
+        text(
+            "SELECT count(*) FROM tasks "
+            "WHERE status = 'QUEUED' AND not_before IS NOT NULL AND not_before > now()"
+        )
+    )
+    return int(result.scalar_one())
+
+
+async def fenced_result_count(session: AsyncSession) -> int:
+    """How many result submissions have been fenced (Phase 3.4).
+
+    The figure behind the task console's fenced tile, which is what makes
+    "rejections are visible on the dashboard, not buried in logs" true of an
+    operator who does not already know which task to open.
+
+    **Counted from `task_attempts`, not from the Prometheus counter**, and
+    that is the point: the counter resets with the process and is per
+    replica, so a fleet of three would show three different numbers and all
+    of them would go to zero on a rollout. This is the durable record, and
+    every replica answers identically from it (§3.9).
+
+    No index and none needed. `task_attempts` holds one row per **abnormal**
+    ending, so it is small by construction where `tasks` is not — and the
+    endpoint this serves already runs a grouped scan of `tasks`, which is
+    the larger table by orders of magnitude. Adding an index here would cost
+    a migration to make the cheaper of the two queries cheaper still.
+    """
+    result = await session.execute(
+        text("SELECT count(*) FROM task_attempts WHERE outcome = :outcome"),
+        {"outcome": FENCED_OUTCOME},
+    )
+    return int(result.scalar_one())
+
+
+async def task_attempts(
+    session: AsyncSession, *, task_id: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    """The abnormal endings recorded for one task, oldest first (Phase 3.2).
+
+    This is what makes "failed tasks are inspectable, never silently
+    dropped" checkable rather than asserted: a task that reached `FAILED`
+    by exhausting its attempts has one row here per attempt, each naming
+    the worker that held it and which clock ran out.
+
+    Bounded, because `attempt_number` is bounded by policy but the table is
+    not: `max_attempts` can be raised, and a caller must not be able to ask
+    for an unbounded list by naming a task. Read from
+    `ix_task_attempts_task`, the index this table was created with.
+    """
+    try:
+        parsed = uuid.UUID(str(task_id))
+    except (ValueError, AttributeError):
+        return []
+
+    result = await session.execute(
+        text(
+            "SELECT attempt_number, worker_id, outcome, reason, correlation_id, recorded_at "
+            "FROM task_attempts WHERE task_id = CAST(:id AS uuid) "
+            "ORDER BY recorded_at, attempt_number LIMIT :limit"
+        ),
+        {"id": str(parsed), "limit": limit},
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+async def worker_failure_counts(session: AsyncSession) -> list[dict[str, Any]]:
+    """Abnormal attempt endings per worker, by outcome (Phase 3.2).
+
+    The per-worker failure counters the gate promised, and the reason they
+    are **counted from `task_attempts` rather than accumulated in a
+    column**: a counter on `workers` would be a second write on the
+    recovery path and, worse, an in-memory-style number that no longer
+    agrees with the rows once anything is deleted. This is derived, so it
+    cannot drift from the history it describes.
+
+    Deliberately **not** merged into `GET /workers`, which every open
+    dashboard polls every 2s (§6): this is a grouped scan over a table that
+    grows with every abnormal ending, and putting it on the live fleet read
+    would make the common case pay for the rare one.
+
+    Rows whose worker has since been deleted are excluded — their
+    `worker_id` is `NULL` by `ON DELETE SET NULL`, and "failures belonging
+    to nobody" is not a per-worker counter.
+    """
+    result = await session.execute(
+        text(
+            "SELECT worker_id, outcome, count(*) AS failures, max(recorded_at) AS last_failure_at "
+            "FROM task_attempts WHERE worker_id IS NOT NULL "
+            "GROUP BY worker_id, outcome ORDER BY failures DESC"
+        )
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+# Phase 3.7. Every `outcome` string the table has ever been written with:
+# `EXPIRED` by migration 0006's backfill, the other three by Steps 3.2 and
+# 3.4. Listed here so the fleet-wide feed can reject an unknown filter with
+# a 400 rather than answering "no events", which on a recovery console reads
+# as "nothing is going wrong" — the same call `GET /tasks` makes for an
+# unknown status.
+KNOWN_ATTEMPT_OUTCOMES = ("EXPIRED", REASSIGNED_OUTCOME, FENCED_OUTCOME, EXHAUSTED_OUTCOME)
+
+
+async def recent_attempts(
+    session: AsyncSession,
+    *,
+    limit: int = 50,
+    outcomes: list[str] | None = None,
+    worker_id: uuid.UUID | str | None = None,
+) -> list[dict[str, Any]]:
+    """Abnormal endings across the whole fleet, newest first (Phase 3.7).
+
+    The read `task_attempts` did not have. Step 3.2 gave it a per-task view
+    (`task_attempts`) and a per-worker aggregate (`worker_failure_counts`),
+    and both answer a question you can only ask once you already know which
+    task or which worker to ask about. Watching a reassignment happen is the
+    opposite: nothing is known in advance, and the event is the thing that
+    tells you where to look.
+
+    **No index and no migration, deliberately.** This orders by
+    `recorded_at` where the table's two indexes lead with `task_id` and
+    `worker_id`, so an unfiltered call is a scan and a top-N sort. That is
+    the same trade `fenced_result_count` already takes and for the same
+    reason: `task_attempts` holds one row per *abnormal* ending, so it is
+    small by construction where `tasks` is not. **The trigger for revisiting
+    it is named rather than left to taste** — an index belongs here when the
+    table passes ~10^6 rows or this query shows up in the slow log, and Step
+    3.8's chaos harness is what will produce the first honest measurement of
+    either.
+
+    The filters are built rather than parameterised into one statement:
+    binding a NULL array to `= ANY(:outcomes)` is exactly the shape that
+    produced asyncpg's `AmbiguousParameterError` in Step 3.4. Every value is
+    still bound, never interpolated — the outcome names are whitelisted by
+    the caller and the placeholders below are generated, not the values.
+    """
+    clauses: list[str] = []
+    params: dict[str, Any] = {"limit": limit}
+
+    if outcomes:
+        names = [f"outcome_{index}" for index in range(len(outcomes))]
+        clauses.append("outcome IN (" + ", ".join(f":{name}" for name in names) + ")")
+        params.update(dict(zip(names, outcomes, strict=True)))
+
+    if worker_id is not None:
+        try:
+            params["worker_id"] = str(uuid.UUID(str(worker_id)))
+        except (ValueError, AttributeError):
+            return []
+        clauses.append("worker_id = CAST(:worker_id AS uuid)")
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    result = await session.execute(
+        text(
+            "SELECT id, task_id, attempt_number, worker_id, outcome, reason, "
+            "correlation_id, recorded_at "
+            f"FROM task_attempts {where} "
+            # `id` breaks the tie because a reclaim writes several rows in
+            # one statement and they share `recorded_at` to the microsecond.
+            # Without it the feed's order is unstable between two polls that
+            # see the same rows, which reads on screen as events shuffling.
+            "ORDER BY recorded_at DESC, id DESC LIMIT :limit"
+        ),
+        params,
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+# Phase 3.7. The reason a worker-reported failure never had. Until this step
+# `handle_task_failed` logged the exception type and stored nothing, so a
+# task that reached `FAILED` because its executor raised was inspectable in
+# the GUI as the word "failed" and nothing else — while a task that failed by
+# exhausting its attempts carried a full attempt row. The exit criterion
+# "failed tasks are inspectable with a reason" is false for half of the ways
+# a task can fail without this.
+#
+# `executor_error:<type>` rather than the bare type: `reason` is read
+# alongside `lease_expired` and `execution_deadline_exceeded`, and the prefix
+# is what says which of those two families a row belongs to — something the
+# coordinator observed, or something a worker reported.
+REASON_EXECUTOR_ERROR = "executor_error"
+# The exception **type** only, which is all `handle_task_failed` accepts and
+# all it has ever logged. Never a message and never a traceback: both can
+# carry payload data, and payload data must not reach a log or a row (§12).
+_REASON_MAX_LENGTH = 120
+
+_RECORD_EXECUTION_FAILURE_SQL = text(
+    """
+    INSERT INTO task_attempts
+        (id, task_id, attempt_number, worker_id, outcome, reason, correlation_id)
+    SELECT gen_random_uuid(), t.id, t.attempt_count, CAST(:worker_id AS uuid),
+           CAST(:outcome AS text), :reason, :correlation_id
+    FROM tasks AS t
+    WHERE t.id = CAST(:task_id AS uuid)
+      AND NOT EXISTS (
+          SELECT 1 FROM task_attempts
+          WHERE task_id = t.id
+            AND worker_id = CAST(:worker_id AS uuid)
+            AND attempt_number = t.attempt_count
+            AND outcome = CAST(:outcome AS text)
+      )
+    """
+)
+
+
+async def record_execution_failure(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    worker_id: uuid.UUID | str,
+    error_type: str,
+    correlation_id: str | None = None,
+) -> None:
+    """Record why a worker-reported failure happened. Does not commit.
+
+    Written from the task row rather than from anything the worker sent:
+    `attempt_number` is `tasks.attempt_count` read in the same statement, so
+    a worker cannot name an attempt the task never reached (§12) — the same
+    property Step 3.4 had to enforce with an explicit bound, obtained here
+    for free because the value never leaves the database.
+
+    The `NOT EXISTS` makes a repeat submission a no-op (§3.7 invariant). The
+    caller only reaches this on a genuine `ASSIGNED|RUNNING -> FAILED`
+    transition, which happens once, so the guard is for the case where that
+    stops being true rather than for one that exists today.
+    """
+    try:
+        parsed_task = uuid.UUID(str(task_id))
+        parsed_worker = uuid.UUID(str(worker_id))
+    except (ValueError, AttributeError):
+        return
+
+    reason = f"{REASON_EXECUTOR_ERROR}:{error_type}"[:_REASON_MAX_LENGTH]
+    await session.execute(
+        _RECORD_EXECUTION_FAILURE_SQL,
+        {
+            "task_id": str(parsed_task),
+            "worker_id": str(parsed_worker),
+            "outcome": EXHAUSTED_OUTCOME,
+            "reason": reason,
+            "correlation_id": correlation_id or None,
+        },
+    )
 
 
 async def get_task(session: AsyncSession, task_id: str) -> dict[str, Any] | None:
@@ -498,6 +1550,12 @@ async def get_task(session: AsyncSession, task_id: str) -> dict[str, Any] | None
                 "SELECT t.id, t.task_type, t.status, t.priority, t.assigned_worker_id, "
                 "t.assigned_at, t.started_at, t.completed_at, t.created_at, t.updated_at, "
                 "t.attempt_count, t.correlation_id, t.result_id, "
+                # Phase 3.1: the lease is what an operator watching a
+                # recovery actually needs to see — how long this attempt
+                # has left before the coordinator takes the task back.
+                "t.lease_expires_at, t.deadline_at, "
+                # Phase 3.2: why a queued task is not being picked up.
+                "t.not_before, t.excluded_worker_id, "
                 "r.payload AS result_payload, r.size_bytes AS result_size_bytes, "
                 "r.submitted_at AS result_submitted_at "
                 "FROM tasks t LEFT JOIN task_results r ON r.id = t.result_id "
@@ -568,6 +1626,16 @@ async def list_tasks(
         Task.attempt_count,
         Task.correlation_id,
         Task.result_id,
+        # Phase 3.1. Two more columns off the same row the listing already
+        # reads — no join, no second query, and it is what makes a
+        # reassignment watchable in the task console (§6).
+        Task.lease_expires_at,
+        Task.deadline_at,
+        # Phase 3.2. Same row again, no join: a queued task that is waiting
+        # out a retry backoff is otherwise indistinguishable on a listing
+        # from one nobody is eligible for.
+        Task.not_before,
+        Task.excluded_worker_id,
     )
 
     if statuses:
