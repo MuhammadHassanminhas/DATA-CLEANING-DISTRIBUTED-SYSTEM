@@ -1,0 +1,145 @@
+name: Chaos suite
+
+# Step 3.8 — the chaos harness on a schedule.
+#
+# Deliberately NOT a required check on `main`, for a different reason than
+# the load test's. The load test is excluded because it is a timing
+# measurement; this one is excluded because it deliberately breaks things
+# and then waits for lease windows to expire, so it takes minutes rather
+# than seconds. What it asserts is not timing at all — zero task loss, zero
+# double completion, convergence to no task in flight — and those are
+# pass/fail properties that hold at any speed.
+#
+# Every check the harness reports is a gate here: `scripts/chaos.py` exits
+# 1 on any violation and names it, so this job goes red without needing a
+# threshold of its own.
+
+on:
+  schedule:
+    # 05:23 UTC every Monday, an hour after the load test and off the hour
+    # for the same reason: they must not contend for a runner, and the top
+    # of the hour is when everything else on the platform starts.
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: Simulated workers
+        default: "10"
+      tasks:
+        description: Tasks
+        default: "500"
+      faults:
+        description: Comma-separated faults (kill,freeze,duplicate,stale)
+        default: "kill,freeze,duplicate,stale"
+
+concurrency:
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      WORKERS: ${{ inputs.workers || '10' }}
+      TASKS: ${{ inputs.tasks || '500' }}
+      FAULTS: ${{ inputs.faults || 'kill,freeze,duplicate,stale' }}
+      COMPOSE_PROJECT: chaos
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install harness dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt
+
+      - name: Generate the dev CA and service certificates
+        run: bash infra/dev-ca/generate-dev-ca.sh
+
+      # Throwaway credentials, generated here and never leaving the runner.
+      - name: Write a throwaway environment file
+        run: |
+          {
+            echo "LOG_LEVEL=WARNING"
+            echo "POSTGRES_USER=coordinator"
+            echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
+            echo "POSTGRES_DB=coordinator"
+            echo "COORDINATOR_PORT=8443"
+            echo "DASHBOARD_PORT=8444"
+            echo "ENROLLMENT_SECRET=$(openssl rand -hex 24)"
+            echo "CREDENTIAL_PEPPER=$(openssl rand -hex 24)"
+            echo "ADMIN_SECRET=$(openssl rand -hex 24)"
+            # A fleet arriving from one source address is exactly what the
+            # registration limiter refuses (§12), and a harness is that
+            # shape by construction. Raised for this run only.
+            echo "REGISTER_RATE_LIMIT_PER_MINUTE=10000"
+            echo "TASK_API_RATE_LIMIT_PER_MINUTE=3000"
+            echo "ASSIGNMENT_POLL_INTERVAL_SECONDS=5"
+            # **Shortened lease windows, and this run's numbers are
+            # therefore not measurements of the shipped defaults.** The
+            # invariants are what this job asserts, and they do not depend
+            # on the window; waiting out a 60s TTL plus a 30s disconnect
+            # grace after every fault would turn a two-minute job into a
+            # twenty-minute one for no extra coverage.
+            echo "TASK_LEASE_TTL_SECONDS=20"
+            echo "LEASE_DISCONNECT_GRACE_SECONDS=5"
+            echo "LEASE_RECLAIM_INTERVAL_SECONDS=2"
+            echo "TASK_RETRY_BACKOFF_BASE_SECONDS=2"
+            echo "TASK_RETRY_BACKOFF_MAX_SECONDS=10"
+            echo "TASK_RETRY_EXCLUSION_SECONDS=10"
+          } > chaos.env
+
+      - name: Start the stack
+        run: |
+          docker compose -p "$COMPOSE_PROJECT" --env-file chaos.env \
+            up -d --build postgres redis coordinator
+          for _ in $(seq 1 60); do
+            if curl -sk --max-time 5 https://localhost:8443/health | grep -q healthy; then
+              echo "coordinator healthy"; exit 0
+            fi
+            sleep 2
+          done
+          echo "coordinator never became healthy"; docker compose -p "$COMPOSE_PROJECT" logs coordinator; exit 1
+
+      - name: Run the chaos suite
+        run: |
+          set -a; . ./chaos.env; set +a
+          export COORDINATOR_URL=https://localhost:8443
+          python scripts/chaos.py \
+            --workers "$WORKERS" --tasks "$TASKS" \
+            --faults "$FAULTS" --fault-interval 4 --freeze-seconds 30 \
+            --insecure --timeout 900 --converge-timeout 300 \
+            --json-out chaos-report.json
+
+      - name: Summarise the run
+        if: always()
+        run: |
+          if [ -f chaos-report.json ]; then
+            {
+              echo '### Chaos suite'
+              echo '```json'
+              python -c "import json;d=json.load(open('chaos-report.json'));d.get('chaos',{}).pop('events',None);print(json.dumps({k:v for k,v in d.items() if k not in ('coordinator','latency','recovery')},indent=2))"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-${{ github.run_id }}
+          path: chaos-report.json
+          if-no-files-found: warn
+
+      - name: Coordinator logs on failure
+        if: failure()
+        run: docker compose -p "$COMPOSE_PROJECT" logs --tail 300 coordinator
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p "$COMPOSE_PROJECT" down -v
