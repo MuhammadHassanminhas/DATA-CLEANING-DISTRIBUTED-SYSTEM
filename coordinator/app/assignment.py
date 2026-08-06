@@ -164,6 +164,7 @@ from app.task_queue import (
     mark_status,
     queue_depth,
     reclaim_expired_leases,
+    record_execution_failure,
     renew_lease,
     shorten_worker_leases,
 )
@@ -859,6 +860,17 @@ async def handle_task_failed(session: LocalSession, message: dict[str, Any]) -> 
             db, task_id=task_id, worker_id=session.worker_id, new_status=FAILED
         )
         if outcome == TRANSITIONED:
+            # Phase 3.7. The attempt row that gives this failure a reason.
+            # In the same transaction as the transition, so a task is never
+            # terminal without the record of why — the ordering migration
+            # 0006's backfill chose, for the same reason.
+            await record_execution_failure(
+                db,
+                task_id=task_id,
+                worker_id=session.worker_id,
+                error_type=error_type,
+                correlation_id=correlation_id,
+            )
             await db.commit()
 
     # Release the credit unless the database says this task was never this
