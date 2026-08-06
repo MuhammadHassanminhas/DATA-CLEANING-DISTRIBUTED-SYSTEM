@@ -24,22 +24,37 @@ for the approval, full record in `docs/phase-3-fault-tolerance.md`
 
 ### ⇒ START HERE NEXT SESSION
 
-0. **Merge PR #62** — `docs/approve-3.7`, this entry and Decision #212.
-   **14 of 14 checks, `MERGEABLE` / `CLEAN`** at session close. It cannot
-   record its own merge, so until it lands `main` does not know Step 3.7
-   was approved (§14). **⚠ Merging triggers CD, so the cluster must be up
-   or CD fails on its cluster-up guard.**
+0. **Merge the small PR carrying this paragraph** (`docs/session-28-close`)
+   once CI is green. It cannot be inside PR #62 — it records that PR's own
+   merge and deploy. Same call sessions 9, 10, 12, 17, 20, 22 and 27 made.
+   **Until it lands, `main`'s copy of this entry stops at "merge PR #62"
+   and does not know #62 was merged** (§14).
+
+   **PR #62 IS MERGED AND DEPLOYED.** `main` at **`406e340`**, CI
+   **462 passed**, CD run `31089330070` **`success` on BOTH `staging /
+   deploy` and `production / deploy`** — the production reviewer gate was
+   parked for a while and then cleared. Public staging `/health` returns
+   `406e34031df932eeb5cf7a962256fc2aa9b59bca` with a validated
+   certificate, `/ready` reports database and redis ok. **Nothing is
+   parked now, so `az aks stop` is safe.**
+
+   One thing worth keeping about that verification: **the first request to
+   public staging after an idle gap came back empty and the retry answered
+   200.** Seen before this deploy and after it, so it is not attributed to
+   the deploy — the same behaviour session 27 noted. Still not diagnosed
+   and still not investigated.
 1. **Step 3.7 is APPROVED (Decision #212), merged and deployed. Nothing
    about the step itself is owing.** **Steps 3.8–3.9 are NOT STARTED and
    must not begin without an explicit go-ahead (§9).** Step 3.8 is the
    chaos harness, and it is what Step 3.7's sixth criterion is waiting on
    — re-check the recovery console's readability against a real chaos run
    when 3.8 has one.
-2. **PRs #60 and #61 are MERGED and DEPLOYED.** `main` went `8a8d5f6` →
-   **`9c9c9fe`** (#60, Step 3.6's rescue, CI **441 passed**) →
-   **`7c3c962`** (#61, Step 3.7, CI **462 passed**). Both CD runs report
-   `success` on **staging and production**, and public staging serves
-   `7c3c962` with a validated certificate.
+2. **PRs #60, #61 and #62 are all MERGED and DEPLOYED.** `main` went
+   `8a8d5f6` → **`9c9c9fe`** (#60, Step 3.6's rescue, CI **441 passed**) →
+   **`7c3c962`** (#61, Step 3.7, CI **462 passed**) → **`406e340`** (#62,
+   the approval record). **All three CD runs report `success` on staging
+   and production**, and public staging serves `406e340` with a validated
+   certificate.
    **⚠ The AKS cluster is RUNNING and BILLING.** Both CD runs have
    finished, so a stop interrupts nothing:
    ```powershell
@@ -170,13 +185,15 @@ was false for half the ways a task can fail.
 
 ### State at close
 
-- **`main` at `7c3c962`**, both environments deployed and verified on it.
-- **PR #62 open and green** (14 of 14, `MERGEABLE` / `CLEAN`) — this entry
-  and Decision #212. **PRs #59 and #50 also open**, both stale docs
-  branches, and **#59 will conflict** with what #60, #61 and #62 rewrote
-  in `PHASE_STATE.md` and this file; keeping both sides is the resolution.
-- **The AKS cluster is UP and BILLING.** No deploy gate is parked, so a
-  stop is safe — but merging #62 needs it up.
+- **`main` at `406e340`**, both environments deployed and verified on it.
+- **Three PRs merged this session: #60, #61, #62.** The only open one that
+  belongs to this session is the small `docs/session-28-close` PR carrying
+  item 0. **PRs #59 and #50 are also open**, both stale docs branches from
+  earlier sessions, and **#59 will conflict** with what #60, #61 and #62
+  rewrote in `PHASE_STATE.md` and this file; keeping both sides is the
+  resolution, as it was in #60.
+- **The AKS cluster is UP and BILLING, and nothing is parked** — every CD
+  run has finished, so a stop interrupts nothing.
 - **Nothing runs locally.** See item 4.
 - Suite **462 passed** in CI on `main`; `ruff` clean.
 
