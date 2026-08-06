@@ -1804,11 +1804,15 @@ SELECT attempt_number, worker_id, outcome, reason
 - [x] Restart with 100 workers and 1,000 queued tasks converges cleanly —
       timed. **Drain 30.9s after the restart; fleet back at p50 17.5s,
       max 18.5s** (§3.5.3).
-- [ ] **Rolling Kubernetes upgrade completes with no task loss — NOT
-      VERIFIED.** The chart change it needs is made and renders
-      (`terminationGracePeriodSeconds: 45`), but no rollout was performed:
-      the AKS cluster was not started this step. Named, not waived —
-      §3.5.5 carries the exact command.
+- [x] **Rolling Kubernetes upgrade completes with no task loss — VERIFIED
+      2026-08-06 against staging over the public Internet** (§3.5.7).
+      `kubectl -n staging rollout restart deploy/coordinator` replaced all
+      **three** replicas while **20 tasks were in flight and 0 had
+      completed**; the rollout returned 0 in **37.535s** and **all eight
+      harness checks passed — 400 enqueued, 400 read back, 400
+      `COMPLETED`, 400 distinct rows, 400 results, 5 workers back across 12
+      sessions on 5 registrations**. Closing it needed a defect fixed
+      first: see §3.5.7.
 - [x] Reconnect storm does not overwhelm the coordinator — measured.
       **276 reconnect attempts from 100 workers, spread over 15.8–18.5s,
       coordinator at 28.8% of one core, 0 rate-limited retries** (§3.5.3).
@@ -2003,10 +2007,9 @@ inviting the coordinator to over-credit it. Now `received - completed`.
 
 ## 3.5.5 What Step 3.5 deliberately does NOT do
 
-- **No rolling Kubernetes upgrade was performed.** The cluster was not
-  started. The chart carries `terminationGracePeriodSeconds: 45` and
-  renders, and the drain is environment-independent by construction
-  (#195), but **neither of those is the criterion**. To close it:
+- ~~**No rolling Kubernetes upgrade was performed.**~~ **DONE 2026-08-06 —
+  see §3.5.7.** The command sequence below is the one that was run, kept
+  because it is reproducible:
   ```bash
   az aks start -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
   kubectl -n staging rollout restart deploy/coordinator
@@ -2105,6 +2108,124 @@ python scripts/loadtest.py restart \
 It prints `PASS` or names the failing checks. It refuses to run without
 `--restart-command`, because a restart scenario that restarts nothing is a
 burst with extra words and would report green.
+
+## 3.5.7 The rolling upgrade, closed — and the defect it found
+
+**The sixth exit criterion is closed 2026-08-06.** It is worth recording
+why it stayed open for a day, because the answer is the argument for the
+criterion existing at all.
+
+### Closing it required fixing a defect that only Kubernetes could show
+
+Steps 3.4 and 3.5 merged to `main` as `31e3cba` and **the deploy failed**.
+CD run `31009413604` reported `Updated: 1/3 — context deadline exceeded`;
+the new pod was in `CrashLoopBackOff` from its first second:
+
+```
+File "/app/coordinator/app/serve.py", line 126, in build_config
+    port=int(os.environ.get("COORDINATOR_PORT", "8443")),
+ValueError: invalid literal for int() with base 10: 'tcp://10.0.67.120:8443'
+```
+
+kubelet injects a Docker-link variable `<SERVICE>_PORT=tcp://<ip>:<port>`
+into every pod for every Service in the namespace. The chart ships a
+Service named `coordinator`, and **Step 3.5's own entrypoint change —
+`uvicorn app.main:app` to `python -m app.serve` — is the first thing in
+the project's history to read `COORDINATOR_PORT` from the environment.**
+
+**Nothing local could have caught it.** Compose injects no service links,
+so every demo, every failure demo and all 438 tests passed. The step that
+introduced it is the step whose one unverified criterion was the rollout.
+
+The mechanism was confirmed on the running pod rather than reasoned about:
+
+| Variable | Resolved in-pod | Pinned in the ConfigMap? |
+|---|---|---|
+| `COORDINATOR_PORT` | `tcp://10.0.67.120:8443` | **no** — the crash input |
+| `POSTGRES_PORT` | `5432` | yes — the pinned value **wins** |
+| `REDIS_PORT` | `6379` | yes — wins |
+| `DASHBOARD_PORT` | `tcp://10.0.226.138:8444` | no — latent, nothing reads it |
+
+`POSTGRES_PORT` and `REDIS_PORT` have carried the identical collision
+since M1.5 and have never broken, precisely because `configmap.yaml` pins
+them. The fix pins the coordinator's own host and port the same way —
+chosen over `enableServiceLinks: false`, which would kill the whole class
+in one line but changes pod-wide behaviour to fix a two-variable problem
+and diverges from how the chart already solves it.
+`tests/test_chart_env.py` fails if any env var the coordinator reads is
+left for kubelet to inject; mutation-checked by deleting the pin.
+
+### A second defect: the failure rollback rolled forward onto the break
+
+`helm rollback` with no revision means "the one before latest". After
+`--atomic` had already rolled the failed upgrade back, the latest
+revision *was* that rollback, so its predecessor was the failed upgrade.
+Staging rev **61 "Rollback to 59"** (correct) became rev **62 "Rollback
+to 60"**, leaving the release reading `deployed` while pointing at the
+crashlooping image. `_deploy-env.yml`'s rollback step is now gated on
+`failure() && steps.helm.outcome == 'success'` — the one case `--atomic`
+does not cover, a clean upgrade whose smoke test rejects the version.
+
+Both fixes shipped as PR #57, `main` at **`3c55314`**.
+
+### The criterion, measured
+
+Run against **public staging over the real Internet** with a validated
+certificate — no `-k`, no `--insecure`:
+
+```bash
+python scripts/loadtest.py restart \
+  --url https://dcds-staging.centralindia.cloudapp.azure.com \
+  --workers 5 --max-concurrent 4 --tasks 400 \
+  --task-type hash_rounds --parameters '{"rounds": 1000000}' \
+  --restart-after 15 \
+  --restart-command "kubectl -n staging rollout restart deploy/coordinator"
+```
+
+**All eight checks passed.**
+
+| Measurement | Value |
+|---|---|
+| Tasks enqueued / read back / `COMPLETED` | **400 / 400 / 400** |
+| Distinct task rows / stored results | **400 / 400** |
+| In flight at the restart | **20 received, 0 completed** |
+| Rollout | returncode **0**, **37.535s**, all **3** replicas replaced |
+| Fleet | 5 workers back, **12 sessions on 5 registrations** — no re-enrollment |
+| Reconnect | 7 attempts, **0 errors after first connect** |
+| Queue depth | max **354**, final **0** |
+| Rate-limited retries | **0** |
+
+`work_was_in_flight_at_restart` is the check that stops this being a
+burst with a restart bolted on: the rollout began while twenty tasks were
+live and none had finished.
+
+**One redelivery out of 217 deliveries (216 distinct), reported rather
+than tidied away.** Step 3.5's local single-restart run measured zero. A
+*rolling* upgrade is a harder case — three replicas drain in sequence, so
+a delivery in flight across a rollover can be reclaimed and re-sent. It
+produced **no duplicate row and no second result**, which is Steps 3.3
+and 3.4 doing exactly what they were built for. Zero redeliveries was
+never the criterion; no task loss was.
+
+Fleet size is **5, not 100**, and that is a deliberate constraint rather
+than a flattering choice: `REGISTER_RATE_LIMIT_PER_MINUTE` defaults to 5
+per source IP and staging runs the shipped default. It was **left as
+deployed rather than weakened for the test** — the same call Decision
+#142 made for Step 2.8. So this run proves the path and the property, not
+a ceiling. Throughput of **1.2 tasks/s** is a statement about five
+laptop-simulated workers chewing `hash_rounds`, not about the
+coordinator; `coordinator_cpu_percent_of_one_core` is `null` because the
+harness samples container stats locally and the target is a remote
+cluster.
+
+### What this still does not claim
+
+- **The demo was agent-run, not user-run** (§15 items 3–4), unchanged
+  from every other M3 step.
+- **Production was not rolling-upgraded under load.** Staging only.
+- The public endpoint intermittently timed out on the first request after
+  an idle gap, then answered 200 on retry. Seen before and after this
+  work, so it is **not** attributed to the rollout — noted, not diagnosed.
 
 ---
 
