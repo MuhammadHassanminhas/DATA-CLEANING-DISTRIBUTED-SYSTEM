@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Recovery — Coordinator Console</title>
+<link rel="stylesheet" href="/static/console.css" />
+<style>
+  /* Page-specific only. Colour tokens, tiles, tables, chips and the banner
+     all come from console.css, so this page cannot drift from the other two
+     views of the same fleet. */
+
+  .layout { display: grid; grid-template-columns: 1fr; gap: 18px; align-items: start; }
+
+  @media (min-width: 1180px) {
+    .layout { grid-template-columns: minmax(0, 1fr) 400px; }
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+
+  .panel + .panel { margin-top: 18px; }
+
+  .panel h2 {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin: 0 0 4px;
+    font-weight: 600;
+  }
+
+  .panel .sub {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--text-faint);
+    margin: 0 0 12px;
+  }
+
+  /* The feed and the failed-task list are both allowed to grow, and both
+     are capped in height instead. A chaos run must not push the reliability
+     panel off the bottom of a screen that was readable a minute earlier. */
+  .scroll { max-height: 46vh; overflow: auto; }
+  .scroll.short { max-height: 30vh; }
+
+  .tid, .wid-link {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    cursor: pointer;
+    background: none;
+    border: none;
+    padding: 0;
+    text-align: left;
+  }
+
+  .tid:hover, .wid-link:hover { color: var(--accent); }
+
+  .outcome {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  .outcome .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--dot-color);
+    box-shadow: 0 0 6px var(--dot-color);
+    flex: none;
+  }
+
+  .reason { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); word-break: break-all; }
+
+  /* Five columns in a 380px panel. Without this the table is wider than
+     the panel and `last` sits behind a horizontal scrollbar — which is a
+     counter nobody scrolls to find, so it may as well not be there. */
+  #reliability-table th, #reliability-table td { padding: 5px 7px; font-size: 10.5px; }
+
+  .hold {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .hold input { accent-color: var(--accent); }
+  .hold.on { color: var(--suspect); }
+
+  /* ---------- detail drawer: the same shape the task console uses ---------- */
+
+  .drawer-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 40; }
+  .drawer-backdrop.show { display: block; }
+
+  .drawer {
+    position: fixed;
+    top: 0; right: 0; bottom: 0;
+    width: min(560px, 100%);
+    background: var(--panel);
+    border-left: 1px solid var(--border-bright);
+    padding: 20px 22px 40px;
+    overflow: auto;
+    z-index: 41;
+  }
+
+  .drawer h2 { margin-top: 0; }
+
+  .drawer .close {
+    position: absolute;
+    top: 14px; right: 16px;
+    background: none; border: none;
+    color: var(--text-dim);
+    font-size: 20px; cursor: pointer; line-height: 1;
+  }
+
+  .kv { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 4px 12px; font-size: 12.5px; }
+  .kv dt { font-family: var(--mono); color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .kv dd { margin: 0; font-family: var(--mono); word-break: break-all; }
+
+  .timeline { list-style: none; margin: 0; padding: 0 0 0 14px; border-left: 1px solid var(--border-bright); }
+  .timeline li { position: relative; padding: 0 0 14px 16px; font-family: var(--mono); font-size: 12px; }
+
+  .timeline li::before {
+    content: "";
+    position: absolute;
+    left: -20px; top: 4px;
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: var(--dot-color, var(--text-faint));
+    box-shadow: 0 0 6px var(--dot-color, transparent);
+  }
+
+  .timeline .at { color: var(--text-dim); display: block; font-size: 11px; }
+  .timeline .src { color: var(--text-faint); font-size: 10.5px; display: block; }
+
+  .section { margin-top: 22px; }
+  .section-title {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="topbar">
+    <svg class="hub" viewBox="0 0 46 46" aria-hidden="true">
+      <circle cx="23" cy="23" r="21" fill="none" stroke="var(--border)" stroke-width="1"/>
+      <circle cx="23" cy="23" r="14" fill="none" stroke="var(--border-bright)" stroke-width="1"/>
+      <g class="sweep">
+        <path d="M23 23 L23 2 A21 21 0 0 1 41.2 12.5 Z" fill="var(--accent)" opacity="0.16"/>
+        <line x1="23" y1="23" x2="23" y2="2" stroke="var(--accent)" stroke-width="1.5" opacity="0.85"/>
+      </g>
+      <circle cx="23" cy="23" r="4" fill="var(--bg)" stroke="var(--accent)" stroke-width="1.5"/>
+      <circle cx="23" cy="23" r="1.6" fill="var(--accent)"/>
+    </svg>
+    <div class="wordmark">
+      <span class="line1">star topology · coordinator</span>
+      <span class="line2">recovery <span class="fleet-count" id="event-count">—</span></span>
+    </div>
+    <div class="topbar-spacer"></div>
+    <nav class="nav">
+      <a href="/">fleet</a>
+      <a href="/ui/tasks">tasks</a>
+      <a href="/ui/recovery" aria-current="page">recovery</a>
+    </nav>
+    <div class="clock" id="clock">
+      <span class="dot"></span><span id="clock-text">connecting…</span>
+    </div>
+  </header>
+
+  <div class="banner" id="banner">
+    ⚠ coordinator unreachable — retrying every 3s, view will resume automatically
+  </div>
+
+  <div class="summary" id="summary"><!-- recovery tiles injected --></div>
+
+  <div class="layout">
+    <div>
+      <div class="controls">
+        <input class="search" id="search" type="text" placeholder="filter feed by task or worker id…" autocomplete="off" />
+        <div class="chips" id="chips">
+          <span class="chip active" data-outcome="all">all</span>
+          <span class="chip" data-outcome="REASSIGNED">reassigned</span>
+          <span class="chip" data-outcome="FAILED">failed</span>
+          <span class="chip" data-outcome="FENCED">fenced</span>
+          <span class="chip" data-outcome="EXPIRED">expired</span>
+        </div>
+        <div class="controls-spacer"></div>
+        <label class="hold" id="hold-label" title="stop redrawing so a row can be read while the fleet is churning — polling continues, nothing is lost">
+          <input type="checkbox" id="hold" /> hold
+        </label>
+        <div class="poll-note" id="poll-note">polling · 3s</div>
+      </div>
+
+      <div class="table-wrap scroll">
+        <table id="feed-table" aria-live="polite">
+          <thead>
+            <tr>
+              <th>event</th>
+              <th>when</th>
+              <th>task</th>
+              <th class="num">attempt</th>
+              <th>worker</th>
+              <th>reason</th>
+            </tr>
+          </thead>
+          <tbody id="feed-body">
+            <tr><td colspan="6" class="loading-state">loading recovery events…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel" style="margin-top: 18px;">
+        <h2>failed tasks</h2>
+        <p class="sub">terminal · every one is inspectable, none is silently dropped</p>
+        <div class="table-wrap scroll short">
+          <table id="failed-table">
+            <thead>
+              <tr>
+                <th>task</th>
+                <th>type</th>
+                <th class="num">endings</th>
+                <th>reason</th>
+                <th>when</th>
+              </tr>
+            </thead>
+            <tbody id="failed-body">
+              <tr><td colspan="5" class="loading-state">loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>failed workers</h2>
+        <p class="sub">not online now — status is coordinator-observed</p>
+        <div id="failed-workers"><p class="idle">loading…</p></div>
+      </div>
+
+      <div class="panel">
+        <h2>worker reliability</h2>
+        <p class="sub">counted from the recovery record · refreshed every 15s</p>
+        <div class="table-wrap">
+          <table id="reliability-table">
+            <thead>
+              <tr>
+                <th>worker</th>
+                <th class="num">reassigned</th>
+                <th class="num">failed</th>
+                <th class="num">fenced</th>
+                <th>last</th>
+              </tr>
+            </thead>
+            <tbody id="reliability-body">
+              <tr><td colspan="5" class="loading-state">loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer>Phase 3.7 · recovery console · fleet state on the <a class="task-link" href="/">fleet</a> view, task lifecycle on the <a class="task-link" href="/ui/tasks">tasks</a> console</footer>
+</div>
+
+<div class="drawer-backdrop" id="backdrop"></div>
+<aside class="drawer" id="drawer" style="display: none;" aria-label="task recovery timeline">
+  <button class="close" id="drawer-close" aria-label="close">×</button>
+  <div id="drawer-body"></div>
+</aside>
+
+<script>
+(function () {
+  "use strict";
+
+  // Phase 1.8's polling decision, unchanged: a short poll already reads as
+  // real-time, and "the view recovers if the browser connection drops" is
+  // then just "the next poll succeeds".
+  //
+  // 3s rather than the other pages' 2s. Nothing here is a countdown — an
+  // attempt row is written once and never changes — and this page issues
+  // three reads where the fleet view issues one. The reclaimer's own sweep
+  // interval is the floor on how fast an event can appear anyway.
+  const POLL_MS = 3000;
+  // The reliability table is a **grouped scan** over `task_attempts`
+  // (`GET /workers/failures`). The coordinator's own docstring for it says
+  // it must not be charged to a 2s poll, and putting it on this page's
+  // fast loop would do exactly that. Counters that move on a 15s beat are
+  // still counters an operator can watch move.
+  const RELIABILITY_POLL_MS = 15000;
+  const FEED_LIMIT = 100;
+  const FAILED_LIMIT = 25;
+
+  // One colour vocabulary with the rest of the console: the two outcomes
+  // that mean "the coordinator took the task away" are the fleet's warning
+  // colour, and the two that mean "work was thrown away" are its failure
+  // colour.
+  const OUTCOME_COLOR = {
+    REASSIGNED: "var(--suspect)",
+    EXPIRED: "var(--suspect)",
+    FAILED: "var(--offline)",
+    FENCED: "var(--offline)",
+  };
+
+  const OUTCOME_NOTE = {
+    REASSIGNED: "the attempt lost the task and it was queued again",
+    EXPIRED: "closed by migration 0006 — stranded before the lease engine existed",
+    FAILED: "the attempt that used the last one up, or an executor that raised",
+    FENCED: "a result arrived after this attempt had been superseded — refused, nothing written",
+  };
+
+  const WORKER_COLOR = {
+    ONLINE: "var(--online)",
+    SUSPECT: "var(--suspect)",
+    OFFLINE: "var(--offline)",
+    QUARANTINED: "var(--quarantined)",
+    CONNECTING: "var(--connecting)",
+    REGISTERED: "var(--registered)",
+  };
+
+  const STATE_COLOR = {
+    QUEUED: "var(--registered)",
+    ASSIGNED: "var(--connecting)",
+    RUNNING: "var(--suspect)",
+    COMPLETED: "var(--online)",
+    FAILED: "var(--offline)",
+    CANCELLED: "var(--quarantined)",
+  };
+
+  let outcomeFilter = "all";
+  let searchTerm = "";
+  let held = false;
+  let consecutiveFailures = 0;
+  let openTaskId = null;
+  // Which attempt ids this browser has already drawn. A row it has not seen
+  // before flashes once — that flash is what "visible as it happens" means
+  // on a table that is otherwise identical from one poll to the next.
+  let seenAttempts = new Set();
+  let firstFeedRender = true;
+  let lastFeed = [];
+
+  const el = {
+    feedBody: document.getElementById("feed-body"),
+    failedBody: document.getElementById("failed-body"),
+    reliabilityBody: document.getElementById("reliability-body"),
+    failedWorkers: document.getElementById("failed-workers"),
+    summary: document.getElementById("summary"),
+    eventCount: document.getElementById("event-count"),
+    clock: document.getElementById("clock"),
+    clockText: document.getElementById("clock-text"),
+    banner: document.getElementById("banner"),
+    search: document.getElementById("search"),
+    chips: document.getElementById("chips"),
+    hold: document.getElementById("hold"),
+    holdLabel: document.getElementById("hold-label"),
+    drawer: document.getElementById("drawer"),
+    drawerBody: document.getElementById("drawer-body"),
+    backdrop: document.getElementById("backdrop"),
+    drawerClose: document.getElementById("drawer-close"),
+  };
+
+  // ---------- helpers ----------
+
+  function esc(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+  }
+
+  function shortId(id) {
+    return id ? `${id.slice(0, 8)}…${id.slice(-4)}` : "—";
+  }
+
+  function timeAgo(iso) {
+    if (!iso) return "—";
+    const seconds = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (seconds < 60) return seconds.toFixed(0) + "s ago";
+    if (seconds < 3600) return (seconds / 60).toFixed(0) + "m ago";
+    return (seconds / 3600).toFixed(1) + "h ago";
+  }
+
+  async function api(path) {
+    const resp = await fetch(path, { cache: "no-store" });
+    const data = await resp.json().catch(() => ({}));
+    return { ok: resp.ok, status: resp.status, data };
+  }
+
+  // ---------- tiles ----------
+
+  function renderSummary(feed, depth, workers) {
+    const counts = { REASSIGNED: 0, FAILED: 0, FENCED: 0, EXPIRED: 0 };
+    feed.forEach((event) => {
+      if (counts[event.outcome] !== undefined) counts[event.outcome]++;
+    });
+    const notOnline = workers.filter((w) => w.status !== "ONLINE").length;
+    el.eventCount.textContent = feed.length;
+
+    // `fenced results` and `failed tasks` are **totals** read from
+    // `/tasks/depth`; the reassignment tile counts what is in the loaded
+    // window and says so, because there is no total for it and inventing
+    // one would be a number this page cannot stand behind.
+    const tiles = [
+      tile("var(--suspect)", counts.REASSIGNED, `reassigned · last ${feed.length}`,
+           "reassignments among the events currently loaded — not an all-time total"),
+      tile("var(--offline)", (depth.counts || {}).FAILED || 0, "failed tasks",
+           "tasks that are terminally FAILED — every one has an attempt row explaining why"),
+      tile("var(--offline)", depth.fenced_results || 0, "fenced results",
+           "results refused because the attempt that produced them had been superseded"),
+      tile("var(--quarantined)", notOnline, "workers not online",
+           "registered workers whose coordinator-observed status is not ONLINE"),
+    ];
+    el.summary.innerHTML = tiles.join("");
+  }
+
+  function tile(color, value, label, title) {
+    return `<div class="tile" style="--tile-color: ${color}" title="${esc(title)}">` +
+           `<div class="n">${esc(value)}</div><div class="l">${esc(label)}</div></div>`;
+  }
+
+  // ---------- the feed ----------
+
+  function feedRows(feed) {
+    let rows = feed;
+    if (outcomeFilter !== "all") rows = rows.filter((e) => e.outcome === outcomeFilter);
+    if (searchTerm) {
+      rows = rows.filter((e) =>
+        (e.task_id || "").toLowerCase().includes(searchTerm) ||
+        (e.worker_id || "").toLowerCase().includes(searchTerm) ||
+        (e.correlation_id || "").toLowerCase().includes(searchTerm));
+    }
+    return rows;
+  }
+
+  function renderFeed(feed) {
+    const rows = feedRows(feed);
+    if (rows.length === 0) {
+      el.feedBody.innerHTML = `<tr><td colspan="6" class="empty-state"><div class="big">no recovery events</div>nothing has ended abnormally${outcomeFilter === "all" && !searchTerm ? " — this table records endings, so empty is a fact about the fleet, not a gap" : ", or the filter excludes them"}</td></tr>`;
+      return;
+    }
+
+    el.feedBody.innerHTML = rows.map((event) => {
+      const fresh = !firstFeedRender && !seenAttempts.has(event.attempt_id);
+      const color = OUTCOME_COLOR[event.outcome] || "var(--text-faint)";
+      return `<tr class="${fresh ? "flash" : ""}">
+        <td><span class="outcome" style="--dot-color: ${color}" title="${esc(OUTCOME_NOTE[event.outcome] || "")}"><span class="dot"></span>${esc(event.outcome.toLowerCase())}</span></td>
+        <td title="${esc(event.recorded_at)}">${esc(timeAgo(event.recorded_at))}</td>
+        <td><button class="tid" data-task="${esc(event.task_id)}" title="${esc(event.task_id)}">${esc(shortId(event.task_id))}</button></td>
+        <td class="num">${esc((event.attempt_number || 0) + 1)}</td>
+        <td class="wid" title="${esc(event.worker_id || "worker row deleted")}">${esc(shortId(event.worker_id))}</td>
+        <td class="reason">${esc(event.reason || "—")}</td>
+      </tr>`;
+    }).join("");
+
+    feed.forEach((event) => seenAttempts.add(event.attempt_id));
+    firstFeedRender = false;
+    // The set is bounded by the window it is drawn from plus a little slack,
+    // so a page left open through a chaos run does not grow without limit.
+    if (seenAttempts.size > FEED_LIMIT * 8) {
+      seenAttempts = new Set(feed.map((event) => event.attempt_id));
+    }
+  }
+
+  // ---------- failed tasks ----------
+
+  // The reason shown here comes from the task's own recovery record, not
+  // from a second source: the newest attempt row this page has loaded for
+  // that task. A failed task whose rows are older than the feed window
+  // says so rather than showing a blank cell, and opening it fetches the
+  // full record.
+  function reasonFor(taskId, feed) {
+    const row = feed.find((event) => event.task_id === taskId && event.outcome === "FAILED")
+             || feed.find((event) => event.task_id === taskId);
+    return row ? row.reason || row.outcome.toLowerCase() : "open to read the record";
+  }
+
+  function renderFailedTasks(tasks, feed) {
+    if (tasks.length === 0) {
+      el.failedBody.innerHTML = `<tr><td colspan="5" class="empty-state"><div class="big">no failed tasks</div>nothing has exhausted its attempts or raised in an executor</td></tr>`;
+      return;
+    }
+    // `attempt_count` raw — see `attemptDetail`. Every one of these tasks
+    // is terminal, so there is no attempt to number, and the column says
+    // what the counter says rather than a derived total that would be
+    // right for one kind of failure and wrong for the other.
+    el.failedBody.innerHTML = tasks.map((task) => `
+      <tr>
+        <td><button class="tid" data-task="${esc(task.task_id)}" title="${esc(task.task_id)}">${esc(shortId(task.task_id))}</button></td>
+        <td>${esc(task.task_type)}</td>
+        <td class="num" title="attempts of this task that ended abnormally">${esc(task.attempt_count || 0)}</td>
+        <td class="reason">${esc(reasonFor(task.task_id, feed))}</td>
+        <td title="${esc(task.updated_at || "")}">${esc(timeAgo(task.updated_at))}</td>
+      </tr>`).join("");
+  }
+
+  // ---------- workers ----------
+
+  function renderFailedWorkers(workers) {
+    const down = workers.filter((w) => w.status !== "ONLINE");
+    if (down.length === 0) {
+      el.failedWorkers.innerHTML = `<p class="idle">every registered worker is online</p>`;
+      return;
+    }
+    el.failedWorkers.innerHTML = down.map((w) => `
+      <div style="display:flex; align-items:center; gap:10px; padding:6px 0; border-bottom:1px solid var(--border);">
+        <span class="outcome" style="--dot-color: ${WORKER_COLOR[w.status] || "var(--text-faint)"}"><span class="dot"></span>${esc(w.status.toLowerCase())}</span>
+        <span class="wid" title="${esc(w.worker_id)}">${esc(shortId(w.worker_id))}</span>
+        <span class="controls-spacer" style="flex:1"></span>
+        <span class="reason">${esc(timeAgo(w.last_heartbeat_at))}${w.revoked ? " · revoked" : ""}</span>
+      </div>`).join("");
+  }
+
+  function renderReliability(rows) {
+    // `/workers/failures` returns one row per (worker, outcome). Pivoted
+    // here rather than in the coordinator, which returns the grouping it
+    // measured rather than a shape one page happens to want.
+    const byWorker = new Map();
+    rows.forEach((row) => {
+      const entry = byWorker.get(row.worker_id) || { worker_id: row.worker_id, REASSIGNED: 0, FAILED: 0, FENCED: 0, EXPIRED: 0, last: null };
+      entry[row.outcome] = (entry[row.outcome] || 0) + row.failures;
+      if (!entry.last || row.last_failure_at > entry.last) entry.last = row.last_failure_at;
+      byWorker.set(row.worker_id, entry);
+    });
+
+    const workers = [...byWorker.values()].sort((a, b) =>
+      (b.REASSIGNED + b.FAILED + b.FENCED + b.EXPIRED) - (a.REASSIGNED + a.FAILED + a.FENCED + a.EXPIRED));
+
+    if (workers.length === 0) {
+      el.reliabilityBody.innerHTML = `<tr><td colspan="5" class="empty-state"><div class="big">no failures recorded</div>no worker has lost a task, failed one, or had a result fenced</td></tr>`;
+      return;
+    }
+
+    el.reliabilityBody.innerHTML = workers.map((w) => `
+      <tr>
+        <td class="wid" title="${esc(w.worker_id)}">${esc(shortId(w.worker_id))}</td>
+        <td class="num">${esc(w.REASSIGNED + w.EXPIRED)}</td>
+        <td class="num">${esc(w.FAILED)}</td>
+        <td class="num">${esc(w.FENCED)}</td>
+        <td title="${esc(w.last || "")}">${esc(timeAgo(w.last))}</td>
+      </tr>`).join("");
+  }
+
+  // ---------- the recovery timeline ----------
+
+  // The exit criterion is "a task's **full** recovery timeline is
+  // viewable", and until this page the two halves lived in separate lists:
+  // the lifecycle the task moved through, and the attempts that ended
+  // abnormally. Interleaved by time they are one story — assigned, running,
+  // lease expired, queued again, assigned elsewhere, completed — and read
+  // apart they are two, with the operator doing the merge in their head.
+  //
+  // Each entry still names where it came from, so the merge adds no
+  // authority it does not have: a lifecycle entry names the column that
+  // recorded it, an attempt entry names its outcome and reason.
+  function mergedTimeline(task) {
+    const entries = [];
+    (task.timeline || []).forEach((entry) => entries.push({
+      at: entry.at,
+      color: STATE_COLOR[entry.state] || "var(--text-faint)",
+      label: entry.state.toLowerCase(),
+      note: `lifecycle · from ${entry.source}`,
+    }));
+    (task.attempts || []).forEach((attempt) => entries.push({
+      at: attempt.recorded_at,
+      color: OUTCOME_COLOR[attempt.outcome] || "var(--text-faint)",
+      label: `attempt ${(attempt.attempt_number || 0) + 1} — ${attempt.outcome.toLowerCase()}`,
+      note: `${attempt.reason || "no reason recorded"}${attempt.worker_id ? " · worker " + shortId(attempt.worker_id) : ""}`,
+      extra: OUTCOME_NOTE[attempt.outcome] || "",
+    }));
+
+    entries.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+    if (entries.length === 0) return `<p class="idle">no timeline recorded</p>`;
+
+    return `<ul class="timeline">${entries.map((entry) => `
+      <li style="--dot-color: ${entry.color}">
+        ${esc(entry.label)}
+        <span class="at">${esc(entry.at)}</span>
+        <span class="src">${esc(entry.note)}</span>
+        ${entry.extra ? `<span class="src">${esc(entry.extra)}</span>` : ""}
+      </li>`).join("")}</ul>`;
+  }
+
+  // `attempt_count` counts **endings**, not attempts made, and the two are
+  // not the same number: an exhaustion counts its own last attempt (the
+  // reclaimer increments on the way to FAILED) while an executor error does
+  // not, so "attempts made" would need a different sum for each way a task
+  // can end and would be wrong the first time a third way is added.
+  //
+  // So neither view computes it. The one thing the column certainly means
+  // is reported instead — how many attempts ended abnormally — and the
+  // attempt *number* is shown only while there is a live attempt to number.
+  const TERMINAL = ["COMPLETED", "FAILED", "CANCELLED"];
+
+  function attemptDetail(task) {
+    const count = task.attempt_count || 0;
+    const endings = `${esc(count)} recorded ending${count === 1 ? "" : "s"}`;
+    return TERMINAL.includes(task.status) ? endings : `on attempt ${esc(count + 1)} (${endings})`;
+  }
+
+  let lastDetailJson = "";
+
+  function renderDetail(task, force) {
+    const fingerprint = JSON.stringify(task);
+    if (!force && fingerprint === lastDetailJson) return;
+    lastDetailJson = fingerprint;
+
+    el.drawerBody.innerHTML = `
+      <h2>recovery · task ${esc(shortId(task.task_id))}</h2>
+      <dl class="kv">
+        <dt>task id</dt><dd>${esc(task.task_id)}</dd>
+        <dt>state</dt><dd><span class="outcome" style="--dot-color: ${STATE_COLOR[task.status] || "var(--text-faint)"}"><span class="dot"></span>${esc(task.status.toLowerCase())}</span></dd>
+        <dt>type</dt><dd>${esc(task.task_type)}</dd>
+        <dt>attempts</dt><dd>${attemptDetail(task)}</dd>
+        <dt>worker</dt><dd>${esc(task.assigned_worker_id || "— (no worker holds it)")}</dd>
+        <dt>excluded worker</dt><dd>${task.excluded_worker_id ? esc(task.excluded_worker_id) + " (not eligible for the immediate retry)" : "—"}</dd>
+        <dt>correlation id</dt><dd>${esc(task.correlation_id || "—")}</dd>
+      </dl>
+
+      <div class="section">
+        <div class="section-title">recovery timeline · lifecycle and endings, interleaved</div>
+        ${mergedTimeline(task)}
+      </div>
+
+      <div class="section">
+        <div class="section-title">result</div>
+        ${task.result
+          ? `<pre class="reason">${esc(JSON.stringify(task.result, null, 2))}</pre>`
+          : `<p class="idle">${task.has_result ? "result body expired under the retention policy — the task row is the audit trail" : "no result — this task produced none"}</p>`}
+      </div>
+
+      <div class="section">
+        <a class="task-link" href="/ui/tasks#/task/${encodeURIComponent(task.task_id)}">open on the task console →</a>
+      </div>`;
+  }
+
+  async function loadDetail(taskId, quiet) {
+    const resp = await api(`/api/tasks/${encodeURIComponent(taskId)}`);
+    if (!resp.ok) {
+      if (!quiet) el.drawerBody.innerHTML = `<h2>task not found</h2><p class="idle">${esc(resp.data.detail || "the coordinator did not return this task")}</p>`;
+      return;
+    }
+    renderDetail(resp.data, !quiet);
+  }
+
+  function openDrawer(taskId) {
+    openTaskId = taskId;
+    lastDetailJson = "";
+    el.drawer.style.display = "block";
+    el.backdrop.classList.add("show");
+    el.drawerBody.innerHTML = `<h2>loading…</h2>`;
+    loadDetail(taskId, false);
+  }
+
+  function closeDrawer() {
+    openTaskId = null;
+    el.drawer.style.display = "none";
+    el.backdrop.classList.remove("show");
+  }
+
+  // ---------- events ----------
+
+  document.addEventListener("click", (e) => {
+    const button = e.target.closest(".tid");
+    if (button && button.dataset.task) openDrawer(button.dataset.task);
+  });
+
+  el.drawerClose.addEventListener("click", closeDrawer);
+  el.backdrop.addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
+
+  el.search.addEventListener("input", () => {
+    searchTerm = el.search.value.trim().toLowerCase();
+    renderFeed(lastFeed);
+  });
+
+  el.chips.addEventListener("click", (e) => {
+    const chip = e.target.closest(".chip");
+    if (!chip) return;
+    outcomeFilter = chip.dataset.outcome;
+    [...el.chips.children].forEach((c) => c.classList.toggle("active", c === chip));
+    renderFeed(lastFeed);
+  });
+
+  // "Panels stay readable during a chaos run" is an exit criterion, and a
+  // table that redraws under the cursor every three seconds is not readable
+  // however well it is laid out. Hold stops the **redraw**, not the
+  // polling: nothing is missed, and releasing it shows the current state
+  // rather than a replay.
+  el.hold.addEventListener("change", () => {
+    held = el.hold.checked;
+    el.holdLabel.classList.toggle("on", held);
+    if (!held) {
+      renderFeed(lastFeed);
+      if (openTaskId) loadDetail(openTaskId, true);
+    }
+  });
+
+  // ---------- polling ----------
+
+  async function poll() {
+    try {
+      const [feed, depth, workers, failed] = await Promise.all([
+        api(`/api/tasks/attempts?limit=${FEED_LIMIT}`),
+        api("/api/tasks/depth"),
+        api("/api/workers"),
+        api(`/api/tasks?status=FAILED&limit=${FAILED_LIMIT}`),
+      ]);
+      if (!feed.ok || !depth.ok || !workers.ok || !failed.ok) throw new Error("request failed");
+
+      consecutiveFailures = 0;
+      el.banner.classList.remove("show");
+      el.clock.classList.remove("stale");
+      el.clockText.textContent = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
+
+      lastFeed = feed.data.attempts || [];
+      if (held) return;
+
+      renderSummary(lastFeed, depth.data, workers.data.workers || []);
+      renderFeed(lastFeed);
+      renderFailedTasks(failed.data.tasks || [], lastFeed);
+      renderFailedWorkers(workers.data.workers || []);
+
+      // An open drawer must keep up with the task it is showing, or a
+      // reassignment that happens while it is open is invisible in the one
+      // view that exists to show it.
+      if (openTaskId) loadDetail(openTaskId, true);
+    } catch (err) {
+      consecutiveFailures++;
+      if (consecutiveFailures >= 2) {
+        el.banner.classList.add("show");
+        el.clock.classList.add("stale");
+        el.clockText.textContent = "disconnected";
+      }
+    }
+  }
+
+  async function pollReliability() {
+    if (held) return;
+    const resp = await api("/api/workers/failures");
+    if (!resp.ok) return;
+    renderReliability(resp.data.workers || []);
+  }
+
+  poll();
+  pollReliability();
+  setInterval(poll, POLL_MS);
+  setInterval(pollReliability, RELIABILITY_POLL_MS);
+})();
+</script>
+</body>
+</html>

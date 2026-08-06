@@ -2239,11 +2239,435 @@ building checkpointing machinery nobody needs. Document what would
 change for real SQL workloads later, without building it.
 
 **Exit criteria**
-- [ ] Policy stated with alternatives and reasoning.
-- [ ] If checkpointing is deferred, deferral is explicit and justified.
-- [ ] Re-execution safety established — dummy tasks verified pure.
-- [ ] Repeated re-execution produces identical results — verified.
-- [ ] Forward path for future stateful workloads noted, not built.
+- [x] Policy stated with alternatives and reasoning — §3.6.1, Decision
+      **#200**, three alternatives compared.
+- [x] Checkpointing deferral explicit and justified — §3.6.3, with the
+      three things that would have to be built and what each would cost.
+- [x] Re-execution safety established — dummy tasks verified pure.
+      Enforced by `tests/test_reexecution.py`, at runtime (`open` and
+      `socket.socket` denied during execution) and statically (an import
+      allowlist over `worker/executors.py`), and **both checks were
+      confirmed to fail against a deliberately impure executor** (§3.6.5).
+- [x] Repeated re-execution produces identical results — verified on the
+      running system. **Seven executions of one workload across two
+      workers, one digest**, matching a value computed outside the
+      repository. `sleep` is the stated exception and is duration-valued
+      (Decision **#201**, §3.6.4).
+- [x] Forward path for future stateful workloads noted, not built —
+      §3.6.7.
+
+---
+
+# Step 3.6 — the decided policy (2026-08-05)
+
+**Status: BUILT and VERIFIED, AWAITING APPROVAL.** Decisions
+**#200–#203**. Suite **438 passed** (was 426 at 3.5). **No production
+code was changed: the twelve new tests and this document are the whole
+step**, and `git diff --stat` against `phase-3.5-restart-recovery` shows
+nothing under `coordinator/`, `worker/`, `dashboard/`, `protocol/`,
+`infra/` or `alembic/`.
+
+That is the honest outcome rather than a thin one, and this step's own
+brief predicted it: *"For V1 dummy workloads, full re-execution is likely
+correct — the tasks are pure and side-effect free. If so, say so and
+justify it rather than building checkpointing machinery nobody needs."*
+The work of the step was to establish whether the premise is true, and
+that turned out to be less obvious than it reads (§3.6.5).
+
+## 3.6.1 The policy
+
+**An interrupted attempt is discarded in full. The task is re-executed
+from the beginning by whoever gets it next. Nothing of the abandoned
+attempt is kept, resumed, credited or merged.**
+
+Written out against the mechanisms that already exist:
+
+| Question | The policy's answer | Where it is already enforced |
+|---|---|---|
+| What happens to a partial execution when the lease expires? | It is abandoned. The worker is told to stop (`task_cancel`) purely to save CPU, and nothing waits for that message. | `assignment.cancel_on_worker`, gate §3.0.6 |
+| What does the next attempt start from? | The original parameters, unchanged. | `_deliver` sends `task["parameters"]`, not any accumulated state |
+| Where would partial state be stored? | Nowhere. No column, no Redis key, no message type carries it. | schema §3.0.7 — `tasks` has `attempt_count`, never a checkpoint |
+| What if the abandoned attempt finishes anyway and reports? | Refused — `fenced` while the task is live (3.4), `superseded` once another attempt has completed it (3.3). | `results.complete_task` |
+| What is lost? | CPU, and only CPU. **Measured: 28.799 seconds of it** in §3.6.4. | — |
+| What is the guarantee? | Unchanged from the gate: **at-least-once delivery with idempotent completion**. Re-execution is what "at-least-once" *means* here. | §3.0.5 |
+
+The policy is therefore not new behaviour. It is the name for behaviour
+Steps 3.1–3.4 already produce, made explicit and — this is the part that
+needed work — **verified rather than assumed**.
+
+## 3.6.2 Four decisions this step made
+
+**#200 — Discard and re-execute in full. No checkpointing, no partial
+result accumulation.**
+Alternatives: (a) executor-level checkpoint and resume, with the
+coordinator storing the partial state a worker sends up; (b) split a task
+into idempotent segments the coordinator tracks individually, so a
+reassignment resumes at a segment boundary; (c) discard and re-execute.
+Chose (c). (a) needs a place to put partial state (a column or a new
+table), a message type to carry it, a size cap and a retention rule for
+partial state that no attempt ever comes back for, and — worst — it makes
+the coordinator trust worker-supplied state as *input to the next
+execution*, which §12 forbids and which fencing exists precisely to avoid.
+(b) is a bigger version of the same thing and additionally requires every
+workload to be decomposable, which is a property of real SQL work and not
+of `count_to_n`. Both would add a **second recovery path**, and gate
+§3.0.2 rejected having two on the ground that the one that runs rarely is
+the one that is broken. (c) costs the CPU of the abandoned attempt, and on
+V1 workloads that is the whole bill.
+
+**#201 — `sleep` is duration-valued, and the criterion is stated against
+that rather than the criterion being made to look met.**
+`run_sleep` returns *measured* elapsed time, so two executions of
+`sleep(0.3)` do not return the same float, and the exit criterion's words
+("repeated re-execution produces identical results") are false for it as
+written. Alternatives: (a) change `run_sleep` to return the requested
+duration, making all four types bit-identical; (b) exclude `sleep` from
+the claim and say why. Chose (b). (a) would be editing the system so a
+document could make a cleaner claim — it would delete a genuine
+measurement (the docstring in `executors.py` argues for it explicitly:
+"the result reflects what happened rather than what was asked"), it would
+touch `worker/` in a step that needs to touch nothing, and it would buy
+nothing operationally: **the coordinator stores the result body and
+compares it against nothing**, so a duration that differs between attempts
+has no consumer. What *is* asserted for `sleep`, and is the property the
+policy actually needs, is that a re-execution sleeps the **whole**
+requested duration rather than the remainder (§3.6.4).
+
+**#202 — Purity is enforced by tests, not by convention.**
+Alternatives: (a) document that executors must stay pure and rely on
+review; (b) enforce it mechanically. Chose (b), two ways, because they
+fail at different times: a runtime check that makes `open` and
+`socket.socket` raise for the duration of an execution catches an
+executor that *does* something, and a static import allowlist over
+`worker/executors.py` catches an import that is added now and used two
+phases later. The allowlist is eight modules
+(`base64 binascii hashlib json threading time typing __future__`);
+adding `os`, `random`, `pathlib`, `socket` or `requests` fails CI, which
+makes widening it a deliberate act with a reviewer attached.
+
+**#203 — Re-execution safety is evidenced by the WORK DONE, not by the
+result value.**
+This one was forced by a mutation check rather than chosen up front, and
+§3.6.5 tells it as it happened. For a pure workload a resumed execution
+and a restarted one return **the same answer**, so an assertion on the
+result cannot distinguish them: a mutant that saved the partial digest and
+continued from it passed a known-answer assertion cleanly. The tests
+therefore count chunk boundaries — a full re-execution of 100,000 in
+chunks of 1,000 reports 100 progress fractions starting at 0.01, a resumed
+one would report fewer and start higher — and the same reasoning is what
+makes the live measurement in §3.6.4 meaningful.
+
+## 3.6.3 Checkpointing: deferred, and what deferring it costs
+
+**Deferred deliberately, not overlooked.** Three things would have to
+exist before a checkpoint could be honoured, and none of them is cheap:
+
+1. **A place to put partial state.** Either a column on `tasks` — which
+   is the queue's hot path under Decision #79, so widening its rows costs
+   throughput on every claim — or a new table with its own retention
+   sweep for partial state belonging to attempts that never return.
+2. **A protocol message to carry it**, with a size cap of its own. The
+   result envelope already has one (`TASK_RESULT_MAX_BYTES`) because a
+   worker is untrusted; a checkpoint would need the same treatment plus a
+   frequency limit, since checkpoints arrive *during* execution rather
+   than once at the end.
+3. **A trust decision this project has already made the other way.**
+   Resuming from a checkpoint means feeding worker-supplied state back
+   into an execution as input. §12 says every worker is untrusted, and
+   Steps 3.3 and 3.4 exist entirely to stop worker-supplied state being
+   accepted when it should not be. Checkpointing would introduce a
+   worker-supplied input with no equivalent of the fence to guard it.
+
+**What the deferral costs today, stated as a number rather than as a
+shrug: one abandoned attempt's CPU per reassignment.** In §3.6.4 that is
+**28.799 seconds** of hashing thrown away — the whole of an attempt whose
+result arrived and was refused. On a fleet where reassignment is rare that
+is the correct trade; on one where it is common the fix is to find out why
+leases are expiring, not to build resume.
+
+**The condition that would reverse this decision** is stated so a later
+phase can test for it rather than re-argue it: a workload where
+re-execution is *not* free — because it is long enough that redoing it
+misses a deadline, or because it has side effects that must not happen
+twice. Neither is reachable in V1: CLAUDE.md §2 permits four pure dummy
+workloads and nothing else, and every one is bounded by
+`DEFAULT_MAX_EXECUTION_SECONDS`.
+
+## 3.6.4 Measurements
+
+**Environment, declared before the numbers (§10).** One 4-core laptop,
+Docker Compose project `dcds36`, **two** workers (`worker-1` and a second
+container `worker-b` with its own identity volume), and a **deliberately
+tuned** coordinator: `TASK_LEASE_TTL_SECONDS=10`,
+`LEASE_DISCONNECT_GRACE_SECONDS=3`, `LEASE_RECLAIM_INTERVAL_SECONDS=2`,
+`TASK_RETRY_EXCLUSION_SECONDS=5`, `TASK_RETRY_BACKOFF_BASE_SECONDS=1`,
+`WORKER_MAX_CONCURRENT=2`. Those are **not** the shipped defaults — they
+shorten a reassignment demo from minutes to seconds. **Nothing below is a
+measurement of the shipped configuration's timings**; what is being
+measured here is which *values* come out, and those are configuration
+independent.
+
+**The workload is `hash_rounds` with `rounds: 10000000, algorithm:
+sha256`**, chosen because its answer is a known quantity: iterated SHA-256
+from a 32-zero-byte seed.
+
+**Independently computed, outside the repository, with a plain
+`hashlib` loop rather than the executor's chunked one:**
+
+```
+6b4ab10d92373474a97d10639e667f6b734af012f9be29997f1befd1c7166199
+```
+
+### The reassignment: one task, three executions, one answer
+
+Task `941b3aad`, submitted at 13:08:29 UTC. The holding worker's container
+was **disconnected from the Docker network 4 seconds in**, while it was
+executing — `docker pause` is not enough, because Step 3.4 found a paused
+worker reads the cancel on unpause and stops.
+
+| t | What happened | Evidence |
+|---|---|---|
+| +3s | `RUNNING` on worker `a80a9c3f` (A) | `GET /tasks/{id}` |
+| +4s | A cut off the network. It keeps computing. | `docker network disconnect` |
+| +10.5s | Lease expired and reclaimed, **`overdue_seconds: 0.437`**, `excluded_worker_id: a80a9c3f` | coordinator `task_lease_expired` |
+| +11.4s | Attempt **1** delivered to worker `0852497f` (B), which **starts from the beginning** | `assigned_at 13:08:40.520` |
+| +38.6s | `COMPLETED` by B, `duration_seconds: 27.206` | `GET /tasks/{id}` |
+| +50.9s | A, reconnected, submits the result of the attempt it finished anyway → **refused `superseded`** | coordinator `task_result_not_applied outcome=superseded attempt_number=0` |
+
+**The three executions and their fingerprints** (Decision #106's 12-hex
+result fingerprint, from the workers' own logs):
+
+| Execution | Worker | Elapsed | Fingerprint |
+|---|---|---|---|
+| An earlier, uninterrupted task of the same shape | A | 13.597s | `2c7324ca2eca` |
+| Attempt 0 — abandoned, finished anyway, refused | A | **28.799s** | `2c7324ca2eca` |
+| Attempt 1 — the full re-execution that counted | B | 27.206s | `2c7324ca2eca` |
+
+The stored result body is `6b4ab10d92…`, **identical to the independently
+computed digest**, with `attempt_number: 1` and `session_epoch: 2`. The
+task's `attempts` array carries exactly one row —
+`attempt_number: 0, worker_id: a80a9c3f, outcome: REASSIGNED, reason:
+lease_expired` — and `GET /tasks/depth` reports `fenced_results: 0`,
+because a late result for a task that has already **completed** is 3.3's
+`superseded`, not 3.4's fence. The two answers are ordered, and this run
+shows the ordering rather than describing it.
+
+**Why 27.206s and not 13.597s, said plainly:** both workers were computing
+the same 10,000,000 rounds simultaneously on a 4-core laptop. The
+re-execution was slowed by contention, **not** by any per-attempt
+overhead. It is quoted rather than tuned away because tuning it would mean
+not running the abandoned attempt, which is the thing being demonstrated.
+
+### Repeated execution: four identical tasks, one digest
+
+Four separate tasks with identical parameters, submitted in one call
+(`count: 4`) and spread across both workers:
+
+| Task | Worker | Attempt | Duration | Idempotency token | Digest |
+|---|---|---|---|---|---|
+| `feb79b1f` | B | 0 | 29.992s | `c2804322` | `6b4ab10d92…` |
+| `de1adc1c` | A | 0 | 27.427s | `7bcf2c47` | `6b4ab10d92…` |
+| `c8fdca6f` | B | 0 | 29.993s | `da069d3e` | `6b4ab10d92…` |
+| `410dc2d4` | A | 0 | 27.384s | `2673f690` | `6b4ab10d92…` |
+
+**1 distinct digest, 4 distinct idempotency tokens.** The tokens matter:
+they prove these were four genuine executions rather than one result
+deduplicated four ways, which is exactly the confusion Step 3.3's
+machinery could otherwise create.
+
+**Totals across the step: seven executions of the workload on two
+different workers produced one value**, and that value was computed
+independently before any of them ran. Final ledger for the demo stack:
+`{"depth": 0, "counts": {"COMPLETED": 6}, "fenced_results": 0}`.
+
+### The unit-level evidence
+
+`tests/test_reexecution.py`, 12 tests, in the suite:
+
+- Three runs of each value-deterministic type return an identical value
+  **and an identical fingerprint** — the fingerprint too, because that is
+  what a live run logs, so a determinism claim that held for the value but
+  not for its canonical JSON could not be checked from a log.
+- A `count_to_n` cancelled after exactly 3 chunks (a deterministic cancel
+  flag, not a timer) is redone in **100** chunks starting at 0.01, and
+  returns `n`.
+- A `hash_rounds` cancelled after 5 chunks is redone in **100** and
+  reaches `SHA256_1000_ROUNDS`, the vector `test_executors.py` computed
+  independently.
+- Execution with `open` and `socket.socket` replaced by a raising stub
+  succeeds for all four types.
+- `worker/executors.py`'s imports are within the eight-module allowlist.
+- Concurrent execution in a thread pool agrees with serial execution,
+  three times over — the property one worker running several tasks in one
+  process depends on.
+- **On the real worker path**: a `sleep(1.0)` cancelled at ~0.3s reports
+  `capacity` and **no result**, and when the same task id is delivered
+  again the second execution runs a **full** second (`result >= 1.0`,
+  `duration_seconds >= 1.0`) rather than the 0.7s a resume would take, and
+  `runner.running` is empty afterwards.
+- `sleep`'s two executions are asserted to agree only within 0.5s and to
+  each meet their requested duration — the honest form of the criterion
+  for a duration-valued result.
+
+## 3.6.5 What building this step found
+
+**1. The obvious test for "no partial work is reused" is vacuous, and it
+took a mutation check to see it.**
+The first version of this file's tests asserted that a cancelled execution
+followed by a clean one returns the right answer. Both a `count_to_n`
+mutant that kept its counter in module state and a `hash_rounds` mutant
+that saved the partial digest and resumed from it **passed** — because for
+these workloads resuming *is* correct: the chain restarted from a
+half-built digest ends at the same place. The assertion could not fail for
+the reason it was written. Rewritten to count chunk boundaries, both
+mutants fail. **This is the single most useful thing the step produced**,
+and it generalises: for a pure function, "did you redo the work" is not a
+question the return value can answer.
+
+**2. The strongest argument for the policy is structural, not
+behavioural.** There is no message type, no column and no Redis key that
+can carry partial state, so a resume is not something the system could do
+incorrectly — it is something it cannot express. Re-reading the wire
+protocol to confirm that was worth more than another test.
+
+**3. The mutation checks were run rather than assumed, and two of four
+initially found nothing.** Four deliberate defects were injected: an
+impure executor that writes a file (**caught** — `AssertionError: an
+executor touched the outside world`), a non-deterministic executor
+returning `random.random()` (**caught**), a resuming counter (**not
+caught** until #203's rewrite), and a resuming digest (**not caught**
+until #203's rewrite). Reported including the two that initially failed
+to catch anything, per §10.
+
+**4. The late result was `superseded`, not `fenced`, and that is
+correct.** Fencing (3.4) answers a result for a task that is still live;
+once another attempt has driven the task to `COMPLETED`, the terminal
+state check from 3.3 answers first. A reader expecting `fenced_results` to
+tick on this demo would be reading the wrong counter, so the ordering is
+written down here rather than discovered again in Step 3.9.
+
+## 3.6.6 Demo and failure demo
+
+Both run against a local Compose stack with **two** workers. `$A` is the
+stack's admin secret and `$P` its compose project name.
+
+**Demo — an interrupted task is redone in full and gets the same answer**
+
+1. Start the stack, then a second worker with its own identity volume:
+   ```bash
+   docker run -d --name $P-worker-b --network ${P}_default \
+     -v $P-identity-b:/var/lib/worker-identity \
+     -v "$PWD/certs:/certs:ro" \
+     -e COORDINATOR_URL=https://coordinator:8443 \
+     -e ENROLLMENT_SECRET=<the stack's enrollment secret> \
+     $P-worker
+   ```
+2. Submit the known-answer workload:
+   ```bash
+   curl -sk https://localhost:$PORT/tasks -H "X-Admin-Secret: $A" \
+     -H 'Content-Type: application/json' \
+     -d '{"task_type":"hash_rounds","parameters":{"rounds":10000000}}'
+   ```
+3. Poll `GET /tasks/{id}` until `RUNNING`, note `assigned_worker_id`, then
+   **cut that worker off the network** — not `docker pause`, which lets it
+   read the cancel:
+   ```bash
+   docker network disconnect ${P}_default $P-worker-1
+   ```
+4. Watch `attempt_count` go to 1 and `assigned_worker_id` change. The new
+   worker starts at zero: its `duration_seconds` on completion is a **full**
+   execution, not a remainder.
+5. Reconnect the cut worker (`docker network connect`) and watch its late
+   result be refused — `task_result_refused outcome=superseded` in the
+   worker log, `task_result_not_applied` in the coordinator's.
+6. **Verify the answer:** the stored `result` equals
+   `6b4ab10d92373474a97d10639e667f6b734af012f9be29997f1befd1c7166199`,
+   and both workers logged the same `result_fingerprint`.
+
+**On screen:** two `task_execution_completed` lines with the same
+fingerprint from different workers; one `COMPLETED` task; one `attempts`
+row with `outcome: REASSIGNED`.
+
+**Failure demo — the cost of the policy, shown rather than described**
+
+The same run *is* the failure demo. What it deliberately triggers is
+**work being thrown away**: worker A computes 28.8 seconds of hashing
+whose result is refused. Read it off the two logs side by side —
+A's `task_execution_completed elapsed_seconds: 28.799` immediately
+followed by `task_result_refused`, against B's identical fingerprint that
+was kept. If the policy were checkpoint-and-resume, that 28.8s would have
+been salvaged; it is not, and this is what that decision costs.
+
+**Second failure demo — the purity guard actually fails**
+
+Break the property on purpose and watch the suite catch it:
+```bash
+python - <<'PY'
+from worker import executors
+real = executors.run_count_to_n
+def impure(parameters, progress=None, cancel=None):
+    open("side-effect.tmp", "w").write("x")     # the defect
+    return real(parameters, progress, cancel)
+executors.EXECUTORS["count_to_n"] = impure
+PY
+pytest tests/test_reexecution.py -k opens_no_file
+```
+→ `AssertionError: an executor touched the outside world`. Adding
+`import os` to `worker/executors.py` fails
+`test_the_executor_module_imports_nothing_that_can_reach_the_outside_world`
+in the same file.
+
+**Capturable:** the two-fingerprint log excerpt; the task detail JSON with
+its single `REASSIGNED` attempt row; the four-task table with one digest
+and four tokens; the red test output from the impure executor.
+
+## 3.6.7 Forward path for stateful workloads — noted, NOT built
+
+For the record only. **None of this is scaffolded, and no code in the
+repository anticipates it** (CLAUDE.md §2 forbids it in V1).
+
+When real SQL work arrives, the workloads stop being pure in two distinct
+ways, and they need different answers:
+
+- **Read-only work — profiling, schema extraction, statistics.** Still
+  re-executable. The only cost of redoing it is the query time, so this
+  policy carries over unchanged. It is the case to keep in mind when
+  someone argues checkpointing is mandatory for V2: for most of the
+  pipeline it will not be.
+- **Mutating work — applying a cleaning plan to a customer's rows.**
+  Re-execution is not safe by construction, and no amount of executor
+  purity makes it so. The recovery unit has to become a **transaction the
+  worker can be told to retry or roll back**, keyed by the same
+  idempotency token that is already on the wire (Step 2.5) — so the
+  natural shape is: the coordinator hands out a token, the worker writes
+  it into the target database inside the same transaction as the change,
+  and a re-execution that finds its own token there reports the earlier
+  outcome instead of applying anything. That moves the idempotency
+  boundary from the coordinator's result table into the customer's
+  database, which is a design gate of its own and is where the argument
+  should happen.
+
+What would have to change here, listed so the estimate is not made from
+scratch later: a per-task-type declaration of whether it is re-executable,
+carried in the registry beside `DEFAULT_MAX_EXECUTION_SECONDS`; a retry
+policy that consults it instead of retrying unconditionally; and a
+terminal state for "not safe to retry" distinct from `FAILED`. **Three
+changes, all in the coordinator, none in the protocol** — which is the
+reason it is safe to defer.
+
+## 3.6.8 What Step 3.6 deliberately does NOT do
+
+- **It does not add a partial-progress view to the dashboard.** A worker
+  that lost a task can still show a stale `current_tasks` entry until its
+  `capacity` arrives or its Redis key expires. That is Step 3.7's
+  territory (reassignment visible in real time), not this step's.
+- **It does not add a determinism check to the coordinator.** Comparing a
+  refused attempt's result against the stored one would need the refused
+  body kept, which is a store this step exists to avoid.
+- **It does not claim §8.** No remote Internet worker took part; both
+  workers were local containers.
+- **It was not run by the user** — every measurement above is agent-run
+  (§15 items 3–4).
 
 ---
 
@@ -2260,13 +2684,308 @@ Extend the GUI so recovery is watchable as it happens.
 - Recovery timeline for any given task.
 
 **Exit criteria**
-- [ ] Killing a worker produces a visible reassignment in the browser as
-      it happens.
-- [ ] Attempt count increments visibly.
-- [ ] Failed tasks are inspectable with a reason.
-- [ ] Stale rejections appear in the GUI.
-- [ ] A task's full recovery timeline is viewable.
-- [ ] Panels stay readable during a chaos run.
+- [x] Killing a worker produces a visible reassignment in the browser as
+      it happens — measured, §3.7.4: `docker kill` at 07:31:04Z, the
+      `REASSIGNED` row written 07:31:2xZ and on screen at the next 3s poll.
+- [x] Attempt count increments visibly — the feed's `attempt` column and
+      the task console's, both from `attempt_count`; the killed task moved
+      0 → 1 (§3.7.4).
+- [x] Failed tasks are inspectable with a reason — the failed-tasks panel
+      and the drawer, both reading `task_attempts`. **This is what forced
+      the step's one production change** (Decision **#209**): a
+      worker-reported failure stored no reason at all until now.
+- [x] Stale rejections appear in the GUI — a live `FENCED` /
+      `stale_attempt` row in the feed, and the fenced tile from
+      `GET /tasks/depth` (§3.7.4).
+- [x] A task's full recovery timeline is viewable — the drawer merges the
+      lifecycle and the abnormal endings into one chronological list
+      (§3.7.3), which is what "full" means here.
+- [x] Panels stay readable during a chaos run — **honestly, during a
+      self-inflicted churn, not the Step 3.8 harness, which does not
+      exist yet.** 40 tasks under a 5s lease produced **174 reassignments,
+      23 exhaustions and 198 attempt rows**; the page held at its 100-event
+      cap with every panel in place (§3.7.5). Re-check this against 3.8's
+      real chaos suite when there is one.
+
+---
+
+# Step 3.7 — the recovery console (2026-08-06)
+
+**Status: DONE and APPROVED by the user 2026-08-06 (Decision #212),
+MERGED as PR #61 (`main` at `7c3c962`) and DEPLOYED to both
+environments.** Decisions **#207–#211**. Suite **462 passed** (was 441 at
+3.6), `ruff` clean. **One new page, one new coordinator read, and one
+behaviour change** — no migration, no new table, no new Redis key, no
+protocol change, and zero files under `worker/`.
+
+**The approval was given by direction and §15 items 3–4 are NOT
+satisfied** — no demo or failure demo was run in the user's presence, and
+none is reported here as one (§10, Decision #212). Everything in §3.7.4
+and §3.7.5 is agent-run. The two gaps that travel with the approval are
+§3.7.5's churn standing in for a chaos run that does not exist yet, and
+the `executor_error` reason having tests rather than a live demo.
+
+**Verified on the deployed system after the merge:** public staging
+`/health` returns `7c3c9629d79886c6d516d7eff8f32e94ad37d319` with a
+validated certificate, and `/ui/recovery`, `/tasks/attempts` and
+`/api/tasks/attempts` each answer **401 rather than 404** there — so the
+new page and the new read are routed by the ingress rules that already
+existed, which is Decision #207's and #208's path choice holding in the
+one environment that would have broken a top-level `/attempts`.
+
+The step's brief is "extend the GUI so recovery is watchable as it
+happens", and most of what it lists was already built by the steps that
+produced the data: the attempt counter has been a column on the task
+console since 3.2, the fenced tile since 3.4, the per-task attempt list
+since 3.2, and `GET /workers/failures` since 3.2 — **an endpoint no page
+had ever called**. What did not exist was any way to see something go
+wrong without already knowing where to look.
+
+## 3.7.1 What was missing, precisely
+
+| The brief asks for | What existed | What this step added |
+|---|---|---|
+| Failed workers panel | `GET /workers` with a coordinator-observed status | the panel |
+| Failed tasks, inspectable, with a reason | `?status=FAILED` and, for an exhaustion, an attempt row | the panel — **and a reason for the other kind of failure**, which had none |
+| Attempt count per task | the task console's `attempt` column (3.2) | the same value on the feed, per event |
+| Reassignment events **in real time** | nothing — `task_attempts` was readable per task and per worker only | `GET /tasks/attempts` and the feed |
+| Rejected stale results surfaced | the fenced **count** (3.4) | the individual events, with which task and which worker |
+| Per-worker reliability counters | `GET /workers/failures` (3.2), never called by any page | the panel that calls it |
+| Recovery timeline for a task | a lifecycle list and an attempts list, separately | the two merged chronologically |
+
+Two of those rows are the real work. The rest is display.
+
+## 3.7.2 Five decisions
+
+**#207 — A third page, `/ui/recovery`, rather than more panels on the two
+existing consoles.**
+
+Alternatives: (a) extend the task console, which already has the drawer
+and the fenced tile; (b) extend the fleet view, which already has worker
+status; (c) a page of its own.
+
+(c). The fleet view answers "who is connected" and the task console
+answers "what is this task doing" — recovery answers "what just went
+wrong, and did the system handle it", which is a different question asked
+at a different moment. Bolting it onto either page makes that page worse
+at its own job exactly when the fleet is churning, and the criterion this
+step has to meet is that the panels stay readable *then*. The page is
+under `/ui/` for the reason `/ui/tasks` is (Step 2.7): the public ingress
+owns the `/tasks` and `/workers` prefixes, so a page outside `/ui/` would
+work in Docker Compose and 404 in staging.
+
+**#208 — The feed is a new coordinator read under `/tasks/`, and it ships
+no migration and no index.**
+
+Alternatives: (a) let the page poll `GET /tasks/{id}` for tasks it already
+knows about — which cannot show an event for a task nobody is watching;
+(b) a top-level `/attempts`; (c) `/tasks/attempts`, declared before
+`/tasks/{task_id}`.
+
+(c) and no index. A top-level path would need an ingress rule, and the
+class of bug that produces — works in Compose, 404 in staging — is what
+CLAUDE.md §3.5 exists to prevent. On the index: this query orders by
+`recorded_at` where the table's two indexes lead with `task_id` and
+`worker_id`, so it is a scan and a top-N sort. That is the same trade
+`fenced_result_count` already documented and took, because `task_attempts`
+holds one row per *abnormal* ending. **Measured at 29 ms for `limit=100`
+against 166 rows, mid-churn, over local TLS** — and the trigger for
+revisiting it is written down rather than left to taste: an index belongs
+there when the table passes ~10⁶ rows or the query shows up in a slow log.
+Step 3.8's chaos harness is what will produce the first honest reading of
+either.
+
+**#209 — A worker-reported failure now writes a `task_attempts` row.**
+
+This is the step's only production behaviour change, and it is not
+scope creep — it is the exit criterion. `handle_task_failed` logged
+`error_type` and stored **nothing**, so of the two ways a task can reach
+`FAILED`, one carried a full attempt row and the other carried no reason
+anywhere except one replica's log stream. "Failed tasks are inspectable
+with a reason" was false for half of them.
+
+Alternatives: (a) a column on `tasks`, which needs a migration and a
+second place to look; (b) show the operator "see the coordinator logs",
+which is the thing a dashboard exists to replace; (c) an attempt row,
+outcome `FAILED`, reason `executor_error:<type>`.
+
+(c). No migration, no new vocabulary — `FAILED` is already what an
+exhaustion writes — and it lands in every view that already reads that
+table: the drawer, the feed, the failed-tasks panel and
+`GET /workers/failures`, none of which needed a line of change to show it.
+The row is built **from the task row inside the transition's own
+transaction**: `attempt_number` is `tasks.attempt_count` read in the same
+statement, so a worker cannot name an attempt the task never reached
+(§12), and a task cannot become terminal without the record of why. A
+`NOT_OWNER` — the §12 case, a worker reporting on somebody else's task —
+writes nothing, which is asserted rather than assumed
+(`test_a_failure_the_database_refuses_records_no_reason`).
+
+**#210 — Readability under churn is a hold control and capped panels, not
+a slower poll.**
+
+Alternatives: (a) poll slowly enough that the table is stable; (b) freeze
+on hover; (c) an explicit hold, with the panels capped and scrollable.
+
+(c). (a) makes the page fail its own first criterion — "visible as it
+happens" — to fix a second one. (b) surprises: a mouse resting anywhere
+silently stops the view being live, and an operator who looks away comes
+back to stale data with nothing saying so. Hold stops the **redraw**, not
+the polling, so nothing is missed and releasing it shows the current
+state rather than replaying a queue. The feed and the failed-tasks list
+are capped at 46vh and 30vh and scroll inside themselves, so a hundred
+events cannot push the reliability panel off the bottom of a screen that
+was readable a minute earlier.
+
+**#211 — The failed-task panel reports *endings*, never a derived
+"attempts made".**
+
+Found by reading the first screenshot rather than by a test. The task
+console renders `attempt_count + 1`, correctly, because it is naming the
+attempt running *now* and a live first attempt shown as "0" reads as "not
+attempted". Copied onto a terminal task that is wrong — and "attempts
+made" cannot be derived either, because **an exhaustion counts its own
+last attempt (the reclaimer increments on the way to `FAILED`) and an
+executor error does not**. Any total would be right for one kind of
+failure and wrong for the other, and wrong again the first time a third
+kind is added. So neither view computes it: the column says how many
+attempts ended abnormally, which is exactly what the counter holds, and
+the attempt *number* is shown only while there is a live attempt to
+number.
+
+## 3.7.3 The merged recovery timeline
+
+The criterion says a task's **full** recovery timeline. Until this step
+the two halves were separate lists in the task console's drawer — the
+lifecycle the task moved through (`timeline`, reconstructed from its own
+timestamp columns) and the attempts that ended abnormally (`attempts`).
+Interleaved by time they are one story: queued, assigned, running, lease
+expired, queued again, assigned elsewhere, completed. Read apart they are
+two, with the operator doing the merge in their head against two clocks.
+
+The merge adds no authority it does not have. Every entry still names
+where it came from — a lifecycle entry names the column that recorded it
+(`from created_at`), an attempt entry names its outcome, its reason and
+its worker — so nothing in the merged list is less checkable than it was
+in the split one.
+
+## 3.7.4 Measurements
+
+Against `dcds37`, a local Compose stack with two workers, `sleep`'s lease
+shortened to 20s so a reclaim happens in a demo rather than a minute.
+**Every number below was read off the running system.**
+
+**A reassignment, watched:**
+
+| | |
+|---|---|
+| `docker kill` of the holding worker | **07:31:04Z** |
+| `REASSIGNED` / `lease_expired` row written | **07:31:19.113Z** — **15.1s later**, the shortened lease plus the reclaimer's 5s sweep |
+| Visible in the feed | the next 3s poll; it was the top row at 07:31:56Z reading "37s ago" |
+| The task | `RUNNING`, `attempt_count` **0 → 1**, held by the other worker |
+
+The earlier of the two runs is the cleaner one to quote for the counter:
+task `372237f8`, killed at **07:19:08Z**, its `REASSIGNED` row written at
+**07:19:21.613Z**, and polled `RUNNING` on a *different* worker at
+**07:19:26Z** with `attempt_count` **1** — 18 seconds from kill to
+recovered, with the attempt column incrementing on screen in between.
+
+**Failure, with a reason:** two tasks driven terminal by exhausting their
+attempts (a `sleep` policy of `max_attempts: 1` set through
+`PUT /tasks/policies/sleep`, then the holder paused) appear in the
+failed-tasks panel with `lease_expired` and their ending counts, and open
+into the merged timeline. The **executor-error** reason
+(`executor_error:ZeroDivisionError`) is proven by tests end to end through
+`handle_task_failed`, **not by a live demo** — see §3.7.6.
+
+**A fence, unplanned:** the paused worker resumed mid-run and submitted
+the result of a task it had already lost. That produced a real `FENCED` /
+`stale_attempt` row, which is the criterion "stale rejections appear in
+the GUI" met by an event nobody staged.
+
+**The feed, as an API:**
+
+| Read | Result |
+|---|---|
+| `GET /tasks/attempts` unfiltered | the events, newest first |
+| `?outcome=FAILED` | 2 of 5 rows, the two exhaustions |
+| `?outcome=REASIGNED` (typo) | **400**, naming the four valid outcomes |
+| `?worker_id=nope` | **400** |
+| `?limit=100000` | 200, `"limit": 200` — capped by `TASK_LIST_MAX_LIMIT` |
+| `limit=100` against 166 rows, mid-churn | **29 ms**, three consecutive reads |
+
+**Through the dashboard proxy**, which is the path the browser actually
+takes: `GET /api/tasks/attempts?limit=5` returned the same events, and the
+operator credential appears in no response and in no page.
+
+## 3.7.5 The churn run — and what it does not claim
+
+40 `sleep(25)` tasks under a deliberately hostile `sleep` policy
+(`lease_ttl_seconds: 5`, `max_attempts: 6`), two workers, so **every**
+attempt lost its task mid-execution:
+
+| | |
+|---|---|
+| `REASSIGNED` rows | **174** |
+| `FAILED` rows (attempts exhausted) | **23** |
+| `FENCED` rows | 1 |
+| Attempt rows total | **198** |
+| Reliability panel, at the peak | 80 and 81 reassignments on the two workers |
+| Feed | held at its 100-event cap, scrolling inside its own panel |
+| Every other panel | in place, none pushed off screen |
+| After the policy was restored | queue drained to **0**, 28 `COMPLETED`, 23 `FAILED` |
+
+**This is not the chaos run the criterion names.** Step 3.8 owns that, and
+it does not exist. What this shows is that the page's layout survives two
+orders of magnitude more events than the demo produced, which is the part
+that can be shown today. The criterion is ticked on that basis and the
+gap is stated rather than papered over — re-check it against 3.8's suite.
+
+## 3.7.6 Demo and failure demo
+
+**Demo (run against `dcds37`, agent-run):**
+
+1. Open `/ui/recovery`. Four tiles, an empty feed saying so.
+2. Submit a `sleep(90)`; watch it start on a worker (fleet view).
+3. `docker kill` that worker's container.
+4. Within one lease window a `REASSIGNED` / `lease_expired` row appears at
+   the top of the feed, flashing once, with the task's attempt column
+   showing 1 and the failed-workers panel showing the killed worker
+   `OFFLINE`.
+5. Click the task id: the drawer shows the merged recovery timeline.
+
+**Failure demo — the console's own failure, which is the one this page
+has to survive:** `docker stop dcds37-coordinator-1`. Within two polls the
+banner reads `coordinator unreachable — retrying every 3s, view will
+resume automatically`, the clock reads `disconnected`, **and the last data
+stays on screen rather than being blanked**. `docker start` — the view
+resumes on the next successful poll with no reload (clock back at
+07:34:02Z).
+
+Screenshots captured: the console with events, the drawer's merged
+timeline, the console under churn, and the console with the coordinator
+stopped.
+
+## 3.7.7 What Step 3.7 deliberately does NOT do
+
+- **It adds no WebSocket to the dashboard.** Phase 1.8's polling decision,
+  unchanged and for the same reason: a 3s poll already reads as real-time,
+  and "the view recovers when the browser's connection drops" stays "the
+  next poll succeeds" rather than becoming a second reconnect protocol to
+  build and verify.
+- **It does not index `task_attempts`** — #208, with the trigger named.
+- **It does not add a chaos harness.** Step 3.8 owns it; the churn in
+  §3.7.5 is a hand-run policy change, not a suite.
+- **It does not surface a fenced result's rejected body.** Step 3.3 refuses
+  to keep it, and showing "a result was thrown away" without showing which
+  bytes is the whole of what 3.3 decided.
+- **It does not retry an executor error.** #209 records the reason; the
+  policy that a raised executor is terminal is Step 3.2's and is unchanged.
+- **It does not claim §8.** No remote Internet worker took part; both
+  workers were local containers, and the page has not been opened against
+  staging.
+- **It was not run by the user** — every measurement above is agent-run
+  (§15 items 3–4).
 
 ---
 

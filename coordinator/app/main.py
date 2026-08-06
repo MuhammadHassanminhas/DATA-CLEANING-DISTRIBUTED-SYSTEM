@@ -115,6 +115,7 @@ from app.task_queue import (
     cancel_queued_task,
     completions_per_minute,
     counts_by_status,
+    KNOWN_ATTEMPT_OUTCOMES,
     dequeue,
     enqueue_batch,
     fenced_result_count,
@@ -122,6 +123,7 @@ from app.task_queue import (
     list_tasks,
     purge_expired_results,
     queue_depth,
+    recent_attempts,
     renew_worker_leases,
     task_attempts,
     worker_failure_counts,
@@ -1605,6 +1607,88 @@ async def task_queue_depth(
         fenced = await fenced_result_count(session)
 
     return {"depth": depth, "counts": counts, "fenced_results": fenced}
+
+
+@app.get("/tasks/attempts")
+async def list_attempts(
+    request: Request,
+    response: Response,
+    outcome: list[str] | None = Query(default=None),
+    worker_id: str | None = None,
+    limit: int = Query(default=50, ge=1),
+    x_admin_secret: str = Header(default=""),
+) -> dict[str, object]:
+    """Abnormal endings across the fleet, newest first (Phase 3.7).
+
+    The recovery console's live feed. Steps 3.2 and 3.4 made every
+    reassignment, exhaustion and fence durable in `task_attempts`, but both
+    reads over it need to be told where to look — one task, or one worker.
+    Reassignment "visible in real time" is the case where nothing is known
+    in advance, so this is the read that was missing.
+
+    **Under `/tasks/` rather than at `/attempts`**, and declared before
+    `/tasks/{task_id}` so FastAPI's in-order matching does not read
+    `attempts` as a task id. The prefix is not cosmetic: the public ingress
+    routes `/tasks` to the coordinator (Step 1.5.5), so a top-level
+    `/attempts` would work in Docker Compose and 404 in staging — the exact
+    environment-dependent difference §3.5 exists to prevent, and the same
+    reasoning that put the dashboard's pages under `/ui/`.
+
+    `limit` is capped by `TASK_LIST_MAX_LIMIT`, the cap `GET /tasks` already
+    uses, rather than a second tunable that can disagree with it.
+
+    An unknown `outcome` is a **400, not an empty list** — on a console
+    whose whole job is to show that something went wrong, a typo answered
+    with "no events" reads as "nothing is going wrong".
+    """
+    rejection = await _operator_guard(
+        request, response, secret=x_admin_secret, event="task_attempts"
+    )
+    if rejection is not None:
+        return rejection
+
+    if outcome:
+        unknown = [value for value in outcome if value not in KNOWN_ATTEMPT_OUTCOMES]
+        if unknown:
+            response.status_code = 400
+            detail = (
+                f"unknown outcome {unknown[0]!r}: expected one of "
+                f"{', '.join(KNOWN_ATTEMPT_OUTCOMES)}"
+            )
+            logger.warning("task_attempts_rejected_invalid_filter", extra=_admin_log(detail=detail))
+            return {"detail": detail}
+
+    if worker_id is not None:
+        try:
+            uuid.UUID(worker_id)
+        except ValueError:
+            response.status_code = 400
+            return {"detail": "worker_id is not a valid UUID"}
+
+    capped = min(limit, task_list_max_limit())
+    async with get_session() as session:
+        rows = await recent_attempts(
+            session, limit=capped, outcomes=outcome, worker_id=worker_id
+        )
+
+    return {
+        "attempts": [
+            {
+                "attempt_id": str(row["id"]),
+                "task_id": str(row["task_id"]),
+                "attempt_number": row["attempt_number"],
+                "worker_id": str(row["worker_id"]) if row["worker_id"] else None,
+                "outcome": row["outcome"],
+                "reason": row["reason"],
+                "correlation_id": row["correlation_id"],
+                "recorded_at": row["recorded_at"].isoformat(),
+            }
+            for row in rows
+        ],
+        "count": len(rows),
+        "limit": capped,
+        "filters": {"outcome": outcome, "worker_id": worker_id},
+    }
 
 
 @app.get("/tasks/throughput")

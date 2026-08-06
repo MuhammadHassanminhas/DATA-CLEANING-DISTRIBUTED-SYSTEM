@@ -248,6 +248,7 @@ fact about the task rather than a gap.
 | `FAILED` | either of the above | the same, but the attempts had run out — the task is terminally `FAILED` |
 | `FENCED` | `stale_attempt` | a result arrived from an **earlier attempt** of a task this worker holds again; refused, nothing written |
 | `FENCED` | `task_reassigned` | a result arrived from a worker the task had been reassigned away from; refused, nothing written |
+| `FAILED` | `executor_error:<type>` | **Phase 3.7** — the worker reported `task_failed`: its executor raised, and this is the exception **type**, never a message and never a traceback (§12). The task is terminally `FAILED` after one attempt; nothing was retried, because a task whose code raises will raise again |
 | `EXPIRED` | `stranded_pre_m3` | closed by migration `0006`'s backfill, before the lease engine existed |
 
 The two `FENCED` rows are the only entries here that record a **refusal**
@@ -389,6 +390,61 @@ Phase 1.8. Same credential. Returns every registered worker with its live
 status, last heartbeat, CPU/memory, latency, declared capabilities and
 current tasks. This is what the dashboard reads.
 
+### 5.9 `GET /tasks/attempts` — the recovery feed
+
+Every abnormal ending across the whole fleet, **newest first** (Phase 3.7).
+The read behind the recovery console's live feed.
+
+```bash
+curl -sk "https://localhost:8443/tasks/attempts?outcome=REASSIGNED&limit=20" \
+  -H "X-Admin-Secret: $ADMIN_SECRET"
+```
+
+| Query parameter | Notes |
+|---|---|
+| `outcome` | repeatable — `?outcome=REASSIGNED&outcome=FENCED`. One of `EXPIRED`, `REASSIGNED`, `FENCED`, `FAILED` |
+| `worker_id` | UUID; the events belonging to one worker |
+| `limit` | default 50, capped by `TASK_LIST_MAX_LIMIT` (default 200) — the same cap §5.2 uses, not a second tunable |
+
+```json
+{"attempts":[{"attempt_id":"452f0db5-…","task_id":"372237f8-…",
+              "attempt_number":0,"worker_id":"5ace0370-…",
+              "outcome":"REASSIGNED","reason":"lease_expired",
+              "correlation_id":"4a34fd35-…",
+              "recorded_at":"2026-08-06T07:19:21.613226+00:00"}],
+ "count":1,"limit":50,
+ "filters":{"outcome":null,"worker_id":null}}
+```
+
+The rows are the same `task_attempts` rows §5.3 shows under `attempts` for
+one task, and §5.5 counts for `fenced_results` — read the other way. The
+vocabulary is §5.3's table, unchanged.
+
+**This is the read the other two cannot replace.** §5.3 answers "what
+happened to *this* task" and `GET /workers/failures` answers "how often has
+*this* worker failed"; both need to be told where to look. Watching a
+reassignment happen is the case where nothing is known in advance.
+
+**Ordering is `recorded_at DESC, id DESC`.** The tie-break is not
+decoration: one reclaim writes several rows in a single statement and they
+share `recorded_at` to the microsecond, so without it two consecutive polls
+can return the same rows in a different order — which reads on screen as
+events shuffling.
+
+**An unknown `outcome` is a 400, not an empty list**, for the same reason
+§5.2's unknown status is: on a console opened because something is
+suspected, a typo answered with "no events" reads as "nothing is going
+wrong".
+
+**No index and no migration** (Phase 3.7). This orders by `recorded_at`
+where the table's two indexes lead with `task_id` and `worker_id`, so an
+unfiltered call is a scan and a top-N sort — the same trade §5.5's
+`fenced_results` already takes, because `task_attempts` holds one row per
+*abnormal* ending and is small by construction. **Measured at 29 ms
+end-to-end for `limit=100` against 166 rows** over local TLS, mid-churn.
+An index belongs here when the table passes ~10⁶ rows or the query appears
+in the slow log.
+
 ---
 
 ## 6. Task types
@@ -463,5 +519,7 @@ Stated so none of it is mistaken for an oversight:
   deployment that puts many operators behind one dashboard should raise it.
 
 Since Step 2.7 there **is** a browser view of all of this — the task console
-at `/ui/tasks` on the dashboard. It reads the endpoints above through a
-server-side proxy, so the operator credential never reaches the browser.
+at `/ui/tasks` on the dashboard, and since Step 3.7 the recovery console at
+`/ui/recovery` (§5.9's feed, §5.3's attempts, `GET /workers/failures`). Both
+read the endpoints above through a server-side proxy, so the operator
+credential never reaches the browser.

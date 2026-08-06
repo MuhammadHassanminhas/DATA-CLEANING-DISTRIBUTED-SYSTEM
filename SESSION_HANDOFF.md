@@ -8,6 +8,200 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## ⇒ 2026-08-06 (session 28) — STEP 3.6 RESCUED AND MERGED, STEP 3.7 BUILT, MERGED, DEPLOYED AND APPROVED
+
+**The session-27 gap this entry warned about is CLOSED.** PR #59 was
+merged in session 29 and session 27's entry now sits directly below this
+one, in date order — 3.4 and 3.5 deployed, 3.5 closed six of six,
+Decisions #204–#206. `PHASE_STATE.md` never had the gap.
+
+**Four things were asked for and all four are done: fix Step 3.6 being
+stranded on the wrong base, build Step 3.7 end to end, merge both, and
+record 3.7's approval.** Decisions **#207–#211** for the step and **#212**
+for the approval, full record in `docs/phase-3-fault-tolerance.md`
+**§3.7.1–§3.7.7**. Suite **462 passed** (was 441), `ruff` clean, `main` at
+**`7c3c962`** and both environments deployed.
+
+### ⇒ START HERE NEXT SESSION
+
+0. **DONE in session 29: `docs/session-28-close` merged as PR #63**, 14 of
+   14 checks green, `main` at **`e2f6200`**. It could not be inside PR #62
+   — it records that PR's own merge and deploy. Same call sessions 9, 10,
+   12, 17, 20, 22 and 27 made.
+
+   **PR #62 IS MERGED AND DEPLOYED.** `main` at **`406e340`**, CI
+   **462 passed**, CD run `31089330070` **`success` on BOTH `staging /
+   deploy` and `production / deploy`** — the production reviewer gate was
+   parked for a while and then cleared. Public staging `/health` returns
+   `406e34031df932eeb5cf7a962256fc2aa9b59bca` with a validated
+   certificate, `/ready` reports database and redis ok. **Nothing is
+   parked now, so `az aks stop` is safe.**
+
+   One thing worth keeping about that verification: **the first request to
+   public staging after an idle gap came back empty and the retry answered
+   200.** Seen before this deploy and after it, so it is not attributed to
+   the deploy — the same behaviour session 27 noted. Still not diagnosed
+   and still not investigated.
+1. **Step 3.7 is APPROVED (Decision #212), merged and deployed. Nothing
+   about the step itself is owing.** **Steps 3.8–3.9 are NOT STARTED and
+   must not begin without an explicit go-ahead (§9).** Step 3.8 is the
+   chaos harness, and it is what Step 3.7's sixth criterion is waiting on
+   — re-check the recovery console's readability against a real chaos run
+   when 3.8 has one.
+2. **PRs #60, #61 and #62 are all MERGED and DEPLOYED.** `main` went
+   `8a8d5f6` → **`9c9c9fe`** (#60, Step 3.6's rescue, CI **441 passed**) →
+   **`7c3c962`** (#61, Step 3.7, CI **462 passed**) → **`406e340`** (#62,
+   the approval record). **All three CD runs report `success` on staging
+   and production**, and public staging serves `406e340` with a validated
+   certificate.
+   **⚠ The AKS cluster is RUNNING and BILLING.** Both CD runs have
+   finished, so a stop interrupts nothing:
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+   Never run that while a deploy gate is parked (session 23's lesson).
+3. **PR #59 (`docs/session-27-close`) and PR #50 (`docs/session-24-close`)
+   are both still open.** #59 will likely conflict with #60 and #61 —
+   all three touch `PHASE_STATE.md`'s snapshot row and `SESSION_HANDOFF.md`.
+   Merge order decides the work; keeping both sides is the resolution, as
+   it was in #60.
+4. **Nothing is running locally at close, and `dcds37` no longer exists.**
+   Step 3.7's demo stack (coordinator **9485**, dashboard **9486**, two
+   workers) and the standalone unit-test database `dcds37-pg` /
+   `dcds37-redis` on **55437** / **6394** — which the 462-test run used —
+   were up for the whole session and are **gone**: no `dcds37` container
+   and no `dcds37` volume remains. Checked at close, not assumed.
+   **Recreating it means a fresh `--env-file`**, because that file lived in
+   the session scratchpad and died with it; its credentials were throwaway
+   and were **not** `.env`'s. The demo commands in §3.7.6 need that stack,
+   so **running them later means standing it up again**.
+
+   Two leftovers, both harmless: the **`dcds37_default` network** survives
+   the teardown (`docker network rm dcds37_default`), and every earlier
+   stack — `dcds27`, `dcds31`–`dcds36`, plus `data_cleaning_distributed_system-*`
+   and two `k3d-*` containers — is **`exited`, not running**, occupying
+   disk rather than CPU. `docker system prune` territory whenever it is
+   wanted; nothing here depends on any of them.
+5. Still open and unchanged: **no remote Internet worker has taken part in
+   any M3 step (§8 not claimed for 3.1–3.7)**, **every M3 demo has been
+   agent-run rather than user-run** (§15 items 3–4), and
+   `GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` are still to rotate.
+6. **Four branches survive their merges and can be deleted**, local and
+   remote: `phase-3.5-restart-recovery` and `phase-3.7-dashboard-v3` (both
+   merged this session), and `docs/session-27-close` / `docs/session-24-close`
+   once #59 and #50 are dealt with. Deleting them is tidiness, not a
+   blocker — but `phase-3.5-restart-recovery` is the branch whose survival
+   caused #56 to land on the wrong base in the first place.
+
+### Step 3.6's rescue — PR #60
+
+PR #56 was merged into `phase-3.5-restart-recovery`, a branch already
+folded into `main`, so 3.6's code landed nowhere. It cannot be retargeted
+(`Cannot change the base branch of a closed pull request`), so `main` was
+merged **into** that branch and a new PR opened.
+
+`PHASE_STATE.md` conflicted in the three predicted regions and all three
+resolved by keeping both sides: `main`'s "sixth criterion now MET" clause
+plus this branch's Decision #199 approval, `main`'s Step 3.5 register row
+with its `AWAITING APPROVAL` opening replaced, and the decisions log
+ordered 199→206 with the stale numbering note deleted. **CI on the merge
+commit reported `441 passed`**, exactly the predicted 429 + 12.
+
+### What Step 3.7 actually changes
+
+Most of what the step's brief lists already existed — the attempt column
+(3.2), the fenced tile (3.4), the per-task attempt list (3.2), and
+`GET /workers/failures` (3.2), **an endpoint no page had ever called**.
+What did not exist was any way to see something go wrong *without already
+knowing where to look*:
+
+| | Before | After |
+|---|---|---|
+| "What just went wrong?" | open the right task, or grep a replica's log | `GET /tasks/attempts` — fleet-wide, newest first |
+| A worker-reported failure's reason | logged, **stored nowhere** | a `FAILED` / `executor_error:<type>` attempt row |
+| Per-worker reliability | an endpoint with no reader | the reliability panel |
+| A task's recovery timeline | two lists, merged by the reader | one chronological list |
+| Where you watch recovery | nowhere in particular | `/ui/recovery` |
+
+**One production behaviour change, and it is the exit criterion rather
+than scope creep** (#209): "failed tasks are inspectable with a reason"
+was false for half the ways a task can fail.
+
+### The measurements that matter
+
+- **`docker kill` at 07:31:04Z → `REASSIGNED` / `lease_expired` row at
+  07:31:19.113Z → on screen at the next 3s poll**, attempt 0 → 1. An
+  earlier run had the task recovered onto a *different* worker 18s after
+  the kill.
+- **A `FENCED` / `stale_attempt` nobody staged**: a paused worker resumed
+  and submitted a result for a task it had already lost. That is the
+  "stale rejections appear in the GUI" criterion met by a real event.
+- **Churn: 40 tasks under a 5s lease produced 174 reassignments, 23
+  exhaustions and 198 attempt rows.** The page held at its 100-event cap
+  with every panel in place, and drained afterwards to depth 0. **This is
+  not the Step 3.8 chaos run** — 3.8 does not exist — and the criterion is
+  ticked on that basis explicitly.
+- **The feed costs 29 ms for `limit=100` against 166 rows**, mid-churn,
+  over local TLS. That is the number behind shipping **no index and no
+  migration** (#208), with the revisit trigger named: ~10⁶ rows or a
+  slow-log appearance.
+- **Failure demo:** `docker stop` the coordinator → banner, `disconnected`
+  clock, **last data kept on screen rather than blanked**; `docker start`
+  → the view resumes on the next poll with no reload.
+
+### Three things building it found
+
+1. **An off-by-one that only a screenshot could show.** The task console
+   renders `attempt_count + 1`, correctly, because it names the attempt
+   running now. Copied onto a *terminal* task it is wrong — and "attempts
+   made" cannot be derived at all, because an exhaustion counts its own
+   last attempt and an executor error does not (Decision #211).
+2. **`ORDER BY recorded_at` alone is unstable.** One reclaim writes several
+   rows in a single statement sharing `recorded_at` to the microsecond, so
+   two polls can return them in different orders — which reads on screen as
+   events shuffling. The tie-break is `id DESC`.
+3. **A test module that only passes when another ran first is not a test.**
+   `test_recovery_views.py` touches the database without going through the
+   app, so it migrates in its own module fixture rather than relying on
+   whichever earlier module happened to start the coordinator.
+
+### What is NOT done
+
+- **§15 items 3–4 are NOT satisfied for Step 3.7.** The approval
+  (Decision #212) was given by direction immediately after the demo
+  commands were supplied, and **no demo or failure demo was run in the
+  agent's presence**. Recorded as a user scope call, not as a satisfied
+  criterion — the same family as #120, #187, #193 and #199. The commands
+  are in §3.7.6 and can still be run against `dcds37` while it is up.
+- **The executor-error reason has no live demo** — it is proven end to end
+  through `handle_task_failed` by tests. No operator API can make a
+  validated payload raise, so producing one live would mean shipping a
+  deliberately broken executor.
+- **The chaos-run criterion rests on a hand-run churn**, not a suite.
+- **The recovery console has never been opened against staging**, and **no
+  remote Internet worker took part**, so §8 is not claimed for 3.7.
+- **No user-run demo or failure demo** — every run above was agent-run.
+
+### State at close
+
+- **`main` at `406e340`**, both environments deployed and verified on it.
+- **Three PRs merged this session: #60, #61, #62.** The only open one that
+  belongs to this session is the small `docs/session-28-close` PR carrying
+  item 0. **PRs #59 and #50 are also open**, both stale docs branches from
+  earlier sessions, and **#59 will conflict** with what #60, #61 and #62
+  rewrote in `PHASE_STATE.md` and this file; keeping both sides is the
+  resolution, as it was in #60.
+- **The AKS cluster is UP and BILLING, and nothing is parked** — every CD
+  run has finished, so a stop interrupts nothing.
+- **Nothing runs locally.** See item 4.
+- Suite **462 passed** in CI on `main`; `ruff` clean.
+
+**`.env` was not read and not modified this session, and no secret was
+printed.** `dcds37` ran on throwaway credentials from a file in the
+session scratchpad, and that stack no longer exists.
+
+---
+
 ## ⇒ 2026-08-06 (session 27) — 3.4 AND 3.5 FINALLY DEPLOYED, TWO REAL DEFECTS FOUND AND FIXED, STEP 3.5 CLOSED SIX OF SIX. STEP 3.6'S CODE IS NOT ON `main`.
 
 **⚠ This file skips session 26 on `main`.** Session 26's entry was
@@ -213,6 +407,136 @@ off CD's tick:
 `ADMIN_SECRET` and `ENROLLMENT_SECRET`, and was NOT modified. No secret
 was printed at any point.** The admin credential was confirmed functional
 against public staging (`/tasks/depth` → 200) before the run.
+
+---
+
+## ⇒ 2026-08-05 (session 26) — STEP 3.5 APPROVED, STEP 3.6 BUILT AND VERIFIED, ALL FIVE CRITERIA MET, NO PRODUCTION CODE CHANGED
+
+**You approved Step 3.5 and directed that Step 3.6 be built end to end,
+taking the decisions myself.** Both are done. 3.5's approval is Decision
+**#199**; 3.6 is Decisions **#200–#203**, full record in
+`docs/phase-3-fault-tolerance.md` §3.6.1–§3.6.8. Suite **438 passed** (was
+426), `ruff` clean. **`git diff --stat` against `phase-3.5-restart-recovery`
+touches nothing under `coordinator/`, `worker/`, `dashboard/`, `protocol/`,
+`infra/` or `alembic/`** — twelve new tests and documentation are the whole
+step, which is the answer the step's own brief invited.
+
+### ⇒ START HERE NEXT SESSION
+
+1. **Approve or reject Step 3.6.** It is **PR #56**, branch
+   `phase-3.6-partial-completion`, based on `phase-3.5-restart-recovery`
+   and **green — 14 of 14 checks, `MERGEABLE` / `CLEAN`**, read from the
+   API rather than off a tick. The `test` job reports **438 passed**,
+   corroborating the local count on ephemeral Postgres/Redis.
+   **Steps 3.7–3.9 are NOT STARTED and must not begin without an explicit
+   go-ahead (§9).**
+2. **⚠ The merge queue is now THREE deep: PR #54 (`phase-3.4-fencing` →
+   `main`), PR #55 (`phase-3.5-restart-recovery` → `phase-3.4-fencing`),
+   PR #56 (`phase-3.6-partial-completion` → `phase-3.5-restart-recovery`).
+   All three are green and `CLEAN`.** `main` is still at
+   **`770d937`**, so **neither environment runs 3.4, 3.5 or 3.6**. Merge
+   order is #54, then #55, then 3.6. **I did not merge anything and did not
+   touch the cluster:** merging #54 triggers CD, which deploys both
+   environments and spends cluster time, and that is your call to make, not
+   a side effect of a build step. PR #50 (`docs/session-24-close`) is still
+   open from session 24.
+3. **⚠ Step 3.5's sixth exit criterion is still UNMET** — the rolling
+   Kubernetes upgrade. Approving 3.5 did not close it (said so in Decision
+   #199). It cannot be closed until #55 merges and deploys; command
+   sequence in §3.5.5.
+4. **⚠ Local Docker stacks are RUNNING.** `dcds36` is this step's demo
+   stack (coordinator **9485**, dashboard **9486**) plus a second worker
+   container `dcds36-worker-b` on its own volume. **It is deliberately
+   NOT at stock configuration** — `TASK_LEASE_TTL_SECONDS=10`,
+   `LEASE_DISCONNECT_GRACE_SECONDS=3`, `LEASE_RECLAIM_INTERVAL_SECONDS=2`,
+   `TASK_RETRY_EXCLUSION_SECONDS=5`, `TASK_RETRY_BACKOFF_BASE_SECONDS=1`,
+   `WORKER_MAX_CONCURRENT=2` — so no timing read off it is a measurement of
+   the shipped defaults, and §3.6.4 says so before quoting a number. Its
+   env file lives in **this session's scratchpad and dies with it**; the
+   credentials in it are throwaway and are **not** `.env`'s. `dcds34` and
+   `dcds35` were left up from earlier sessions, including the standalone
+   `dcds34-pg` / `dcds34-redis` unit-test database on **55434** / **6391**
+   that the 438-test run used. Teardown:
+   ```bash
+   docker compose -p dcds36 down -v
+   docker rm -f dcds36-worker-b
+   docker volume rm dcds36-identity-b
+   docker compose -p dcds35 down -v
+   docker compose -p dcds34 down -v
+   docker rm -f dcds34-worker-b dcds34-pg dcds34-redis
+   docker volume rm dcds34-identity-b dcds35-identity-b
+   ```
+5. **The AKS cluster was NOT checked this session.** Per your report at the
+   end of session 25 it was running and billing; that is your report, not
+   my measurement (§10).
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+6. Still open and unchanged: **no remote Internet worker has taken part in
+   any M3 step (§8 not claimed for 3.1–3.6)**, **every M3 demo has been
+   agent-run rather than user-run** (§15 items 3–4), and
+   `GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` are still to rotate.
+
+### What Step 3.6 decided
+
+**An interrupted attempt is discarded and the task is re-executed in full.
+No checkpointing.** The alternatives were compared rather than dismissed:
+executor-level checkpoint-and-resume needs a store for partial state, a
+message type with its own caps, and — decisively — it would make
+worker-supplied state an *input* to the next execution, which §12 forbids
+and which Steps 3.3 and 3.4 exist to prevent. Segmenting tasks is the same
+objection plus a requirement that workloads be decomposable. Both add a
+second recovery path, which gate §3.0.2 already rejected.
+
+The cost of the policy is one abandoned attempt's CPU, and it is a measured
+number rather than a shrug: **28.799 seconds** thrown away in the live
+reassignment below.
+
+### The measurements that matter
+
+- **Seven executions of one 10,000,000-round `hash_rounds` workload across
+  two workers produced ONE digest** —
+  `6b4ab10d92373474a97d10639e667f6b734af012f9be29997f1befd1c7166199`, which
+  was computed **outside the repository** with a plain `hashlib` loop before
+  any of them ran.
+- **The reassignment, reproduced.** Holding worker cut off the Docker
+  network 4s in; lease reclaimed **0.437s overdue**; attempt 1 delivered to
+  the second worker, which **started from zero** and completed in 27.206s.
+  The cut worker finished its abandoned attempt anyway at **28.799s with an
+  identical fingerprint**, reconnected, submitted, and was refused
+  **`superseded`**. One `attempts` row, `outcome: REASSIGNED`.
+- **Four identical tasks: 1 distinct digest, 4 distinct idempotency
+  tokens** — the tokens are what prove these were four real executions
+  rather than one result deduplicated four ways.
+- **Purity enforced two ways and both confirmed to fail on purpose**: an
+  executor that writes a file trips `AssertionError: an executor touched
+  the outside world`, and adding `import os` to `worker/executors.py` trips
+  the static allowlist test.
+
+### The one thing worth carrying forward
+
+**The obvious test for "no partial work was reused" is vacuous, and only a
+mutation check showed it.** A mutant that saved the partial digest and
+resumed from it *passed* a known-answer assertion — because for a pure
+workload, resuming and restarting produce the **same answer**. The return
+value cannot answer "did you redo the work". The tests now count chunk
+boundaries instead (100 progress reports starting at 0.01), and both
+resuming mutants fail. Four mutants were injected in total and **two of
+them initially caught nothing**; that is reported here rather than tidied
+away (§10).
+
+### What is NOT done
+
+- **Nothing merged, nothing deployed, cluster untouched.**
+- **No remote Internet worker**, so §8 is **not** claimed for 3.6.
+- **No user-run demo or failure demo** — every run above was agent-run.
+- **No dashboard work.** A worker that lost a task can still show a stale
+  `current_tasks` entry until its `capacity` arrives or the Redis key
+  expires. That is Step 3.7's territory and was left there deliberately.
+
+**`.env` was not read and not modified this session, and no secret was
+printed.** `dcds36` runs on throwaway credentials from a file in the
+session scratchpad.
 
 ---
 
