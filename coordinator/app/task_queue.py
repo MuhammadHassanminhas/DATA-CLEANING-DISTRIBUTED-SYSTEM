@@ -1380,6 +1380,157 @@ async def worker_failure_counts(session: AsyncSession) -> list[dict[str, Any]]:
     return [dict(row) for row in result.mappings().all()]
 
 
+# Phase 3.7. Every `outcome` string the table has ever been written with:
+# `EXPIRED` by migration 0006's backfill, the other three by Steps 3.2 and
+# 3.4. Listed here so the fleet-wide feed can reject an unknown filter with
+# a 400 rather than answering "no events", which on a recovery console reads
+# as "nothing is going wrong" — the same call `GET /tasks` makes for an
+# unknown status.
+KNOWN_ATTEMPT_OUTCOMES = ("EXPIRED", REASSIGNED_OUTCOME, FENCED_OUTCOME, EXHAUSTED_OUTCOME)
+
+
+async def recent_attempts(
+    session: AsyncSession,
+    *,
+    limit: int = 50,
+    outcomes: list[str] | None = None,
+    worker_id: uuid.UUID | str | None = None,
+) -> list[dict[str, Any]]:
+    """Abnormal endings across the whole fleet, newest first (Phase 3.7).
+
+    The read `task_attempts` did not have. Step 3.2 gave it a per-task view
+    (`task_attempts`) and a per-worker aggregate (`worker_failure_counts`),
+    and both answer a question you can only ask once you already know which
+    task or which worker to ask about. Watching a reassignment happen is the
+    opposite: nothing is known in advance, and the event is the thing that
+    tells you where to look.
+
+    **No index and no migration, deliberately.** This orders by
+    `recorded_at` where the table's two indexes lead with `task_id` and
+    `worker_id`, so an unfiltered call is a scan and a top-N sort. That is
+    the same trade `fenced_result_count` already takes and for the same
+    reason: `task_attempts` holds one row per *abnormal* ending, so it is
+    small by construction where `tasks` is not. **The trigger for revisiting
+    it is named rather than left to taste** — an index belongs here when the
+    table passes ~10^6 rows or this query shows up in the slow log, and Step
+    3.8's chaos harness is what will produce the first honest measurement of
+    either.
+
+    The filters are built rather than parameterised into one statement:
+    binding a NULL array to `= ANY(:outcomes)` is exactly the shape that
+    produced asyncpg's `AmbiguousParameterError` in Step 3.4. Every value is
+    still bound, never interpolated — the outcome names are whitelisted by
+    the caller and the placeholders below are generated, not the values.
+    """
+    clauses: list[str] = []
+    params: dict[str, Any] = {"limit": limit}
+
+    if outcomes:
+        names = [f"outcome_{index}" for index in range(len(outcomes))]
+        clauses.append("outcome IN (" + ", ".join(f":{name}" for name in names) + ")")
+        params.update(dict(zip(names, outcomes, strict=True)))
+
+    if worker_id is not None:
+        try:
+            params["worker_id"] = str(uuid.UUID(str(worker_id)))
+        except (ValueError, AttributeError):
+            return []
+        clauses.append("worker_id = CAST(:worker_id AS uuid)")
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    result = await session.execute(
+        text(
+            "SELECT id, task_id, attempt_number, worker_id, outcome, reason, "
+            "correlation_id, recorded_at "
+            f"FROM task_attempts {where} "
+            # `id` breaks the tie because a reclaim writes several rows in
+            # one statement and they share `recorded_at` to the microsecond.
+            # Without it the feed's order is unstable between two polls that
+            # see the same rows, which reads on screen as events shuffling.
+            "ORDER BY recorded_at DESC, id DESC LIMIT :limit"
+        ),
+        params,
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+# Phase 3.7. The reason a worker-reported failure never had. Until this step
+# `handle_task_failed` logged the exception type and stored nothing, so a
+# task that reached `FAILED` because its executor raised was inspectable in
+# the GUI as the word "failed" and nothing else — while a task that failed by
+# exhausting its attempts carried a full attempt row. The exit criterion
+# "failed tasks are inspectable with a reason" is false for half of the ways
+# a task can fail without this.
+#
+# `executor_error:<type>` rather than the bare type: `reason` is read
+# alongside `lease_expired` and `execution_deadline_exceeded`, and the prefix
+# is what says which of those two families a row belongs to — something the
+# coordinator observed, or something a worker reported.
+REASON_EXECUTOR_ERROR = "executor_error"
+# The exception **type** only, which is all `handle_task_failed` accepts and
+# all it has ever logged. Never a message and never a traceback: both can
+# carry payload data, and payload data must not reach a log or a row (§12).
+_REASON_MAX_LENGTH = 120
+
+_RECORD_EXECUTION_FAILURE_SQL = text(
+    """
+    INSERT INTO task_attempts
+        (id, task_id, attempt_number, worker_id, outcome, reason, correlation_id)
+    SELECT gen_random_uuid(), t.id, t.attempt_count, CAST(:worker_id AS uuid),
+           CAST(:outcome AS text), :reason, :correlation_id
+    FROM tasks AS t
+    WHERE t.id = CAST(:task_id AS uuid)
+      AND NOT EXISTS (
+          SELECT 1 FROM task_attempts
+          WHERE task_id = t.id
+            AND worker_id = CAST(:worker_id AS uuid)
+            AND attempt_number = t.attempt_count
+            AND outcome = CAST(:outcome AS text)
+      )
+    """
+)
+
+
+async def record_execution_failure(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    worker_id: uuid.UUID | str,
+    error_type: str,
+    correlation_id: str | None = None,
+) -> None:
+    """Record why a worker-reported failure happened. Does not commit.
+
+    Written from the task row rather than from anything the worker sent:
+    `attempt_number` is `tasks.attempt_count` read in the same statement, so
+    a worker cannot name an attempt the task never reached (§12) — the same
+    property Step 3.4 had to enforce with an explicit bound, obtained here
+    for free because the value never leaves the database.
+
+    The `NOT EXISTS` makes a repeat submission a no-op (§3.7 invariant). The
+    caller only reaches this on a genuine `ASSIGNED|RUNNING -> FAILED`
+    transition, which happens once, so the guard is for the case where that
+    stops being true rather than for one that exists today.
+    """
+    try:
+        parsed_task = uuid.UUID(str(task_id))
+        parsed_worker = uuid.UUID(str(worker_id))
+    except (ValueError, AttributeError):
+        return
+
+    reason = f"{REASON_EXECUTOR_ERROR}:{error_type}"[:_REASON_MAX_LENGTH]
+    await session.execute(
+        _RECORD_EXECUTION_FAILURE_SQL,
+        {
+            "task_id": str(parsed_task),
+            "worker_id": str(parsed_worker),
+            "outcome": EXHAUSTED_OUTCOME,
+            "reason": reason,
+            "correlation_id": correlation_id or None,
+        },
+    )
+
+
 async def get_task(session: AsyncSession, task_id: str) -> dict[str, Any] | None:
     """One task with its result envelope, or None (Phase 2.5).
 

@@ -54,7 +54,9 @@ docker compose up --build
 Once every container reports healthy (`docker compose ps`):
 
 - Coordinator: https://localhost:8443/health
-- Dashboard: https://localhost:8444/
+- Dashboard — fleet: https://localhost:8444/
+- Dashboard — tasks: https://localhost:8444/ui/tasks
+- Dashboard — recovery: https://localhost:8444/ui/recovery
 
 Your browser will warn about the self-signed dev CA — that's expected.
 Trust `certs/dev-ca.crt` locally to silence the warning, or click
