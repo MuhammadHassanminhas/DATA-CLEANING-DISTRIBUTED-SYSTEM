@@ -1015,6 +1015,103 @@ session scratchpad, not from `.env`.
 
 ---
 
+## ⇒ 2026-08-03 (session 24) — PR #49 MERGED AND DEPLOYED TO BOTH ENVIRONMENTS, NO FEATURE WORK
+
+**Four things were asked for and four were done: merge PR #49, take CD to
+green on both jobs, verify staging's version from outside, and delete the
+branch.** No application code was touched, no test was run, no demo was
+performed, and **the cluster was deliberately left running at your explicit
+instruction.** `main` is at **`e121e9bc2883a31328d1ee7a69f469a7abb4348e`**,
+and **both environments run it.**
+
+### ⇒ START HERE NEXT SESSION
+
+1. **⚠ The AKS cluster is RUNNING and was deliberately NOT stopped**, at
+   your explicit instruction. It is billing.
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+2. **Merge the small PR carrying this closing entry** once CI is green. It
+   cannot be inside PR #49 — it records that PR's own merge and deploy.
+   Same call sessions 9, 10, 12, 17, 20, 22 and 23 made. **Merging it
+   triggers CD, so the cluster must be up when you do, or CD fails on its
+   cluster-up guard.**
+3. **Milestone 3 — Fault Tolerance. NOT STARTED. Do not begin without an
+   explicit go-ahead (§9).**
+4. Still open and unchanged: the **user-run demo including a remote
+   Internet worker** (session 21b's eighteen failure demos were agent-run
+   and local-only), `GRAFANA_ADMIN_PASSWORD` and `POSTGRES_PASSWORD`
+   rotation, and staging's ~20,636 stranded `ASSIGNED` rows for M3 to
+   reclaim.
+
+### PR #49 — merged clean, first time in several sessions with nothing to fix
+
+- Merged on **14 of 14 checks SUCCESS**, `mergeable=MERGEABLE`,
+  `mergeStateStatus=CLEAN` — checked before merging, not after.
+- Merge commit **`e121e9bc2883a31328d1ee7a69f469a7abb4348e`**, merged
+  11:30:32Z. **`gh pr merge` worked with no classifier denial this
+  session** — the non-uniformity recorded in sessions 14, 15, 17 and 20 did
+  not appear.
+- Its own CI run **`30809815875` `success`**.
+- Branch `docs/session-23-production-verification` deleted local **and**
+  remote, `git fetch --prune` run, and the ref is absent from both
+  listings.
+
+### ⚠ The production gate did NOT park this time — worth knowing, and unexplained
+
+CD run **`30809889387`**: **`staging / deploy` `success` and
+`production / deploy` `success`**, and **production went green without
+waiting for a reviewer approval**. Every prior session records approving
+that gate by hand, or finding it parked.
+
+**Recorded as an observation, not a diagnosis (§10): the reason was not
+investigated and is not claimed.** Two things it could be and neither was
+checked — a GitHub environment reviewer rule that treats the same actor's
+merge differently, or a protection-rule change made outside this session.
+**It matters because the gate is the only human checkpoint in front of
+production**; if it can pass silently, a production deploy can now happen
+without anyone clicking anything. **Worth confirming in Phase 3 whether the
+`production` environment still has its required reviewer.**
+
+### Verified on the running system rather than off CD's tick
+
+Public staging, **with no `-k` and no `--insecure`**, read after the deploy
+finished:
+
+```
+{"status":"healthy","version":"e121e9bc2883a31328d1ee7a69f469a7abb4348e"}
+{"status":"ready","checks":{"database":"ok","redis":"ok"}}
+```
+
+So the Let's Encrypt certificate genuinely validated and the coordinator
+reported the merge SHA as its own version.
+
+**Production was NOT read interactively and is not claimed to have been.**
+It rests on **Decision #151's check** — CD's "Smoke test + version assert"
+step, which execs into the running coordinator and fails the job unless the
+deployed SHA appears in `/health`. That step shows `✓` in this run's
+production job, and `Rollback on failure` did **not** fire (skipped). This
+is the agreed permanent check, not a gap.
+
+**Last session's Helm trap did not recur:** the cluster stayed up through
+the whole run, so nothing was left `pending-upgrade` and no rollback was
+needed.
+
+### Cluster and local state at close
+
+- **The AKS cluster is UP and BILLING at close**, left running at your
+  explicit instruction. Stop command is in START HERE above.
+- On `main`, fast-forwarded `4fb1a92 → e121e9b` and in sync with
+  `origin/main`. **Nothing running locally** — no compose stack was
+  started, no container, volume or network was created.
+- **`.env` was not read and not modified, and no secret was printed.**
+- Unchanged from session 23 and still true: the deploy step passes
+  `--atomic`, which warns `Flag --atomic has been deprecated, use
+  --rollback-on-failure instead`. Cosmetic; rename next time
+  `_deploy-env.yml` is touched.
+
+---
+
 ## ⇒ 2026-08-03 (session 23) — PR #48 MERGED, PRODUCTION-VERIFICATION ITEM CLOSED (#151), NO FEATURE WORK
 
 **Three things were asked for and three were done: merge the session-22
