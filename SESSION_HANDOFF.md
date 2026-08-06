@@ -24,12 +24,17 @@ for the approval, full record in `docs/phase-3-fault-tolerance.md`
 
 ### ⇒ START HERE NEXT SESSION
 
+0. **Merge PR #62** — `docs/approve-3.7`, this entry and Decision #212.
+   **14 of 14 checks, `MERGEABLE` / `CLEAN`** at session close. It cannot
+   record its own merge, so until it lands `main` does not know Step 3.7
+   was approved (§14). **⚠ Merging triggers CD, so the cluster must be up
+   or CD fails on its cluster-up guard.**
 1. **Step 3.7 is APPROVED (Decision #212), merged and deployed. Nothing
-   about it is owing.** **Steps 3.8–3.9 are NOT STARTED and must not begin
-   without an explicit go-ahead (§9).** Step 3.8 is the chaos harness, and
-   it is what Step 3.7's sixth criterion is waiting on — re-check the
-   recovery console's readability against a real chaos run when 3.8 has
-   one.
+   about the step itself is owing.** **Steps 3.8–3.9 are NOT STARTED and
+   must not begin without an explicit go-ahead (§9).** Step 3.8 is the
+   chaos harness, and it is what Step 3.7's sixth criterion is waiting on
+   — re-check the recovery console's readability against a real chaos run
+   when 3.8 has one.
 2. **PRs #60 and #61 are MERGED and DEPLOYED.** `main` went `8a8d5f6` →
    **`9c9c9fe`** (#60, Step 3.6's rescue, CI **441 passed**) →
    **`7c3c962`** (#61, Step 3.7, CI **462 passed**). Both CD runs report
@@ -46,28 +51,33 @@ for the approval, full record in `docs/phase-3-fault-tolerance.md`
    all three touch `PHASE_STATE.md`'s snapshot row and `SESSION_HANDOFF.md`.
    Merge order decides the work; keeping both sides is the resolution, as
    it was in #60.
-4. **⚠ Local Docker is RUNNING and was left up deliberately.** `dcds37` is
-   Step 3.7's demo stack (coordinator **9485**, dashboard **9486**) with a
-   second worker `dcds37-worker-b`, plus `dcds37-pg` / `dcds37-redis`, the
-   standalone unit-test database on **55437** / **6394** that the 462-test
-   run used. **`dcds37`'s `sleep` policy was restored to defaults** (the
-   demo raised `max_attempts` and shortened the lease; `DELETE
-   /tasks/policies/sleep` was run and the queue drained to depth 0), but
-   its coordinator still runs with **`TASK_LEASE_TTL_SECONDS=20` and
-   `LEASE_DISCONNECT_GRACE_SECONDS=10`**, which are *not* the shipped
-   defaults — nothing read off it is a measurement of stock configuration.
-   Teardown:
-   ```bash
-   docker compose -p dcds37 down -v
-   docker rm -f dcds37-worker-b dcds37-pg dcds37-redis
-   docker volume rm dcds37-identity-b
-   ```
-   The env file lives in **this session's scratchpad and dies with it**;
-   its credentials are throwaway and are **not** `.env`'s.
+4. **Nothing is running locally at close, and `dcds37` no longer exists.**
+   Step 3.7's demo stack (coordinator **9485**, dashboard **9486**, two
+   workers) and the standalone unit-test database `dcds37-pg` /
+   `dcds37-redis` on **55437** / **6394** — which the 462-test run used —
+   were up for the whole session and are **gone**: no `dcds37` container
+   and no `dcds37` volume remains. Checked at close, not assumed.
+   **Recreating it means a fresh `--env-file`**, because that file lived in
+   the session scratchpad and died with it; its credentials were throwaway
+   and were **not** `.env`'s. The demo commands in §3.7.6 need that stack,
+   so **running them later means standing it up again**.
+
+   Two leftovers, both harmless: the **`dcds37_default` network** survives
+   the teardown (`docker network rm dcds37_default`), and every earlier
+   stack — `dcds27`, `dcds31`–`dcds36`, plus `data_cleaning_distributed_system-*`
+   and two `k3d-*` containers — is **`exited`, not running**, occupying
+   disk rather than CPU. `docker system prune` territory whenever it is
+   wanted; nothing here depends on any of them.
 5. Still open and unchanged: **no remote Internet worker has taken part in
    any M3 step (§8 not claimed for 3.1–3.7)**, **every M3 demo has been
    agent-run rather than user-run** (§15 items 3–4), and
    `GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` are still to rotate.
+6. **Four branches survive their merges and can be deleted**, local and
+   remote: `phase-3.5-restart-recovery` and `phase-3.7-dashboard-v3` (both
+   merged this session), and `docs/session-27-close` / `docs/session-24-close`
+   once #59 and #50 are dealt with. Deleting them is tidiness, not a
+   blocker — but `phase-3.5-restart-recovery` is the branch whose survival
+   caused #56 to land on the wrong base in the first place.
 
 ### Step 3.6's rescue — PR #60
 
@@ -158,9 +168,21 @@ was false for half the ways a task can fail.
   remote Internet worker took part**, so §8 is not claimed for 3.7.
 - **No user-run demo or failure demo** — every run above was agent-run.
 
+### State at close
+
+- **`main` at `7c3c962`**, both environments deployed and verified on it.
+- **PR #62 open and green** (14 of 14, `MERGEABLE` / `CLEAN`) — this entry
+  and Decision #212. **PRs #59 and #50 also open**, both stale docs
+  branches, and **#59 will conflict** with what #60, #61 and #62 rewrote
+  in `PHASE_STATE.md` and this file; keeping both sides is the resolution.
+- **The AKS cluster is UP and BILLING.** No deploy gate is parked, so a
+  stop is safe — but merging #62 needs it up.
+- **Nothing runs locally.** See item 4.
+- Suite **462 passed** in CI on `main`; `ruff` clean.
+
 **`.env` was not read and not modified this session, and no secret was
-printed.** `dcds37` runs on throwaway credentials from a file in the
-session scratchpad.
+printed.** `dcds37` ran on throwaway credentials from a file in the
+session scratchpad, and that stack no longer exists.
 
 ---
 
