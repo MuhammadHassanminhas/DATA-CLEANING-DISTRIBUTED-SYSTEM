@@ -8,33 +8,35 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
-## ⇒ 2026-08-06 (session 28) — STEP 3.6 RESCUED ONTO A PR AGAINST `main`, STEP 3.7 BUILT AND VERIFIED, ALL SIX CRITERIA MET
+## ⇒ 2026-08-06 (session 28) — STEP 3.6 RESCUED AND MERGED, STEP 3.7 BUILT, MERGED, DEPLOYED AND APPROVED
 
 **⚠ This file's next entry down is session 26.** Session 27's entry is on
-`docs/session-27-close` (PR #59, open, not merged), which neither this
-branch nor `main` carries yet. `PHASE_STATE.md` has no such gap — read it
-for what session 27 did (3.4 and 3.5 deployed, 3.5 closed six of six,
-Decisions #204–#206).
+`docs/session-27-close` (PR #59, open, not merged), which `main` does not
+carry. `PHASE_STATE.md` has no such gap — read it for what session 27 did
+(3.4 and 3.5 deployed, 3.5 closed six of six, Decisions #204–#206).
 
-**Two things were asked for and both are done: fix Step 3.6 being stranded
-on the wrong base, then build Step 3.7 end to end.** Decisions
-**#207–#211**, full record in `docs/phase-3-fault-tolerance.md`
-**§3.7.1–§3.7.7**. Suite **462 passed** (was 441), `ruff` clean.
+**Four things were asked for and all four are done: fix Step 3.6 being
+stranded on the wrong base, build Step 3.7 end to end, merge both, and
+record 3.7's approval.** Decisions **#207–#211** for the step and **#212**
+for the approval, full record in `docs/phase-3-fault-tolerance.md`
+**§3.7.1–§3.7.7**. Suite **462 passed** (was 441), `ruff` clean, `main` at
+**`7c3c962`** and both environments deployed.
 
 ### ⇒ START HERE NEXT SESSION
 
-1. **Approve or reject Step 3.7.** It is on branch
-   `phase-3.7-dashboard-v3` as **PR #61, stacked on PR #60** (not on
-   `main`). **Steps 3.8–3.9 are NOT STARTED and must not begin without an
-   explicit go-ahead (§9).**
-2. **Merge PR #60 first, then PR #61.** #60 is Step 3.6's rescue —
-   `phase-3.5-restart-recovery` → `main`, **14 of 14 checks, `MERGEABLE` /
-   `CLEAN`**, CI reporting **441 passed** on the merge commit `58802c6`.
-   GitHub retargets #61 to `main` when #60 merges, the way #55 was
-   retargeted behind #54.
-   **⚠ Merging either triggers CD**, which needs the AKS cluster up.
-   **The cluster was NOT checked this session** — its state is unknown and
-   it may be billing:
+1. **Step 3.7 is APPROVED (Decision #212), merged and deployed. Nothing
+   about it is owing.** **Steps 3.8–3.9 are NOT STARTED and must not begin
+   without an explicit go-ahead (§9).** Step 3.8 is the chaos harness, and
+   it is what Step 3.7's sixth criterion is waiting on — re-check the
+   recovery console's readability against a real chaos run when 3.8 has
+   one.
+2. **PRs #60 and #61 are MERGED and DEPLOYED.** `main` went `8a8d5f6` →
+   **`9c9c9fe`** (#60, Step 3.6's rescue, CI **441 passed**) →
+   **`7c3c962`** (#61, Step 3.7, CI **462 passed**). Both CD runs report
+   `success` on **staging and production**, and public staging serves
+   `7c3c962` with a validated certificate.
+   **⚠ The AKS cluster is RUNNING and BILLING.** Both CD runs have
+   finished, so a stop interrupts nothing:
    ```powershell
    az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
    ```
@@ -141,8 +143,12 @@ was false for half the ways a task can fail.
 
 ### What is NOT done
 
-- **Nothing is merged and nothing is deployed.** `main` is at `8a8d5f6`,
-  so neither environment runs Step 3.6 or Step 3.7.
+- **§15 items 3–4 are NOT satisfied for Step 3.7.** The approval
+  (Decision #212) was given by direction immediately after the demo
+  commands were supplied, and **no demo or failure demo was run in the
+  agent's presence**. Recorded as a user scope call, not as a satisfied
+  criterion — the same family as #120, #187, #193 and #199. The commands
+  are in §3.7.6 and can still be run against `dcds37` while it is up.
 - **The executor-error reason has no live demo** — it is proven end to end
   through `handle_task_failed` by tests. No operator API can make a
   validated payload raise, so producing one live would mean shipping a
