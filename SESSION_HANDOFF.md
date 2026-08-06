@@ -8,6 +8,105 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## ⇒ 2026-08-06 (session 29) — THE MERGE BACKLOG IS EMPTY: PRs #63, #59 AND #50 ALL MERGED AND DEPLOYED, NO FEATURE WORK
+
+**One thing was asked for and it is done: clear every open PR.** Three
+merged in order — **#63** (session 28's close), **#59** (session 27's
+close, stale since 06:09Z) and **#50** (session 24's close, stale since
+2026-08-03) — each with CI green and CD `success` on **both** staging and
+production. `main` went `406e340` → **`e2f6200`** → **`8e6d674`** →
+**`2ad7bf1`**. **No application code was touched, no test was run, no
+demo was performed, and no step was started.**
+
+**Zero pull requests are open** for the first time since session 23.
+
+### ⇒ START HERE NEXT SESSION
+
+1. **Merge the small PR carrying this entry** once CI is green. It cannot
+   be inside #50 — it records that PR's own merge and deploy. Same call
+   sessions 9, 10, 12, 17, 20, 22, 27 and 28 made.
+2. **Step 3.8 (chaos testing harness) and Step 3.9 (M3 demo and
+   verification) are NOT STARTED and must not begin without an explicit
+   go-ahead (§9).** Nothing about Steps 3.1–3.7 is owing; 3.7's sixth
+   criterion still wants a re-check against a real chaos run once 3.8 has
+   one.
+3. **⚠ The AKS cluster is RUNNING and BILLING.** All three CD runs have
+   finished and **nothing is parked**, so a stop interrupts nothing:
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+   Never run that while a deploy gate is parked (session 23's lesson).
+4. **Three merged branches are deleted, local and remote**
+   (`docs/session-28-close`, `docs/session-27-close`,
+   `docs/session-24-close`). **`phase-3.5-restart-recovery` and
+   `phase-3.7-dashboard-v3` still survive their merges** and can go
+   whenever — tidiness, not a blocker.
+5. Still open and unchanged: **no remote Internet worker has taken part in
+   any M3 step (§8 not claimed for 3.1–3.7)**, **every M3 demo has been
+   agent-run rather than user-run** (§15 items 3–4), and
+   `GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` are still to rotate.
+6. **Nothing runs locally.** No compose stack was started and no
+   container, volume or network was created this session.
+
+### How the two stale PRs were resolved
+
+Both conflicted exactly where session 28 predicted, and **keeping both
+sides was the resolution in every documentation region**:
+
+| PR | File | Conflict | Resolution |
+|---|---|---|---|
+| #59 | `SESSION_HANDOFF.md` | its session 27 entry vs main's session 28 entry, same place | both kept, ordered **28 → 27 → 26** |
+| #59 | `PHASE_STATE.md` | auto-merged one-sidedly to session 27's `Last updated` row | row brought level with main by hand |
+| #50 | `SESSION_HANDOFF.md` | its session 24 entry vs sessions 25–28 | both kept, session 24 placed **between 25 and 23** |
+| #50 | `PHASE_STATE.md` | "M2 IN PROGRESS" and "M3 NOT STARTED" snapshot rows | **main taken whole** — see below |
+
+**The one place "keep both sides" was the wrong answer is worth keeping.**
+#50's two `PHASE_STATE.md` conflicts are stale status rows, and main's
+replacements already carry the old text verbatim as history — under "The
+M2 record follows and is kept for history" and "Prior status, kept". Both
+sides would have duplicated those sentences into the same cell, so main's
+rows were taken whole and the file came out **byte-identical to main**.
+Merging by rule rather than by reading would have got this wrong.
+
+**A second thing auto-merge got silently wrong:** #59's `PHASE_STATE.md`
+`Last updated` row did **not** conflict — git resolved it to the branch's
+side, which read as of session 27 ("PR #56 is still OPEN", "Step 3.6's
+code is not on `main`", "a NEW PR is required"). All three were true when
+written and none was true any more. Corrected in the merge commit, with
+the stranding account kept and marked resolved by PR #60, because it is
+the record of how it happened. **A clean auto-merge is not evidence the
+result is true.**
+
+### Verified rather than taken off CD's tick
+
+- CD run for `e2f6200` (#63): **`success` on both jobs.**
+- CD run `31094514537` for `8e6d674` (#59): **`success` on both jobs.**
+- CD run `31094729518` for `2ad7bf1` (#50): **`success` on both jobs** —
+  the production reviewer gate cleared on its own each time.
+- Public staging `/health` returns
+  **`2ad7bf1e4f8c49aeade84d94e4dee2f97d938744`** with **no `-k`**, so the
+  Let's Encrypt certificate genuinely validated, and `/ready` reports
+  `database: ok`, `redis: ok`.
+- **The idle-gap behaviour reproduced again, third session running:** the
+  first request to public staging came back **empty** and the immediate
+  retry answered 200. Not attributed to this deploy — it predates it.
+  **Still not diagnosed and still not investigated.**
+
+### What is NOT done
+
+- **No step was built, no test was run, no demo of any kind was
+  performed** — by the agent or the user.
+- **No remote Internet worker ran**, so §8 is not claimed for anything
+  here.
+- **Production's own `/health` was not read interactively** — it rests on
+  CD's in-cluster version assert, which is Decision #151's permanent
+  check, unchanged.
+
+**`.env` was not read and not modified this session, and no secret was
+printed.**
+
+---
+
 ## ⇒ 2026-08-06 (session 28) — STEP 3.6 RESCUED AND MERGED, STEP 3.7 BUILT, MERGED, DEPLOYED AND APPROVED
 
 **The session-27 gap this entry warned about is CLOSED.** PR #59 was
