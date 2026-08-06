@@ -65,6 +65,7 @@ jobs:
           fi
 
       - name: Helm deploy (--atomic = auto-rollback on a failed rollout, criterion 3)
+        id: helm
         run: |
           helm upgrade --install "$RELEASE" infra/helm/platform \
             --namespace "$NS" \
@@ -91,8 +92,16 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "$SHA" || { echo "::error::/health version does not match deployed SHA $SHA"; exit 1; }
 
-      - name: Rollback on failure (belt-and-suspenders beyond --atomic)
-        if: failure()
+      # Only when the SMOKE TEST failed after a SUCCESSFUL upgrade. `helm
+      # rollback` with no revision means "the one before latest", so running
+      # it after --atomic has already rolled back walks FORWARD onto the
+      # failed revision: on 2026-08-05 that turned rev 61 ("Rollback to 59",
+      # correct) into rev 62 ("Rollback to 60") and left the release reading
+      # `deployed` while pointing at a crashlooping image. --atomic already
+      # covers a failed rollout; this step exists only for the case it does
+      # not — a green upgrade whose smoke test then rejects the version.
+      - name: Rollback a bad version that deployed cleanly but failed its smoke test
+        if: failure() && steps.helm.outcome == 'success'
         run: helm -n "$NS" rollback "$RELEASE" 2>/dev/null || true
 
       - name: Record deploy event + duration (criterion 5, logged with SHA)
