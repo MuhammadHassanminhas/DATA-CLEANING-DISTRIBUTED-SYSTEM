@@ -2711,11 +2711,27 @@ Extend the GUI so recovery is watchable as it happens.
 
 # Step 3.7 — the recovery console (2026-08-06)
 
-**Status: BUILT and VERIFIED, AWAITING APPROVAL.** Decisions
-**#207–#211**. Suite **462 passed** (was 441 at 3.6), `ruff` clean. **One
-new page, one new coordinator read, and one behaviour change** — no
-migration, no new table, no new Redis key, no protocol change, and zero
-files under `worker/`.
+**Status: DONE and APPROVED by the user 2026-08-06 (Decision #212),
+MERGED as PR #61 (`main` at `7c3c962`) and DEPLOYED to both
+environments.** Decisions **#207–#211**. Suite **462 passed** (was 441 at
+3.6), `ruff` clean. **One new page, one new coordinator read, and one
+behaviour change** — no migration, no new table, no new Redis key, no
+protocol change, and zero files under `worker/`.
+
+**The approval was given by direction and §15 items 3–4 are NOT
+satisfied** — no demo or failure demo was run in the user's presence, and
+none is reported here as one (§10, Decision #212). Everything in §3.7.4
+and §3.7.5 is agent-run. The two gaps that travel with the approval are
+§3.7.5's churn standing in for a chaos run that does not exist yet, and
+the `executor_error` reason having tests rather than a live demo.
+
+**Verified on the deployed system after the merge:** public staging
+`/health` returns `7c3c9629d79886c6d516d7eff8f32e94ad37d319` with a
+validated certificate, and `/ui/recovery`, `/tasks/attempts` and
+`/api/tasks/attempts` each answer **401 rather than 404** there — so the
+new page and the new read are routed by the ingress rules that already
+existed, which is Decision #207's and #208's path choice holding in the
+one environment that would have broken a top-level `/attempts`.
 
 The step's brief is "extend the GUI so recovery is watchable as it
 happens", and most of what it lists was already built by the steps that
