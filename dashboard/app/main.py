@@ -75,6 +75,24 @@ def tasks_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "tasks.html")
 
 
+@app.get("/ui/recovery")
+def recovery_page() -> FileResponse:
+    """The recovery console (Phase 3.7).
+
+    Under `/ui/` for the same reason `/ui/tasks` is: the public ingress owns
+    the `/tasks` and `/workers` prefixes, and a page outside `/ui/` would
+    work in Docker Compose and be unreachable in staging.
+
+    A third page rather than more panels on the other two. The fleet view
+    answers "who is connected" and the task console answers "what is this
+    task doing"; recovery answers "what just went wrong, and did the system
+    handle it" — which is a different question, watched at a different
+    moment, and it is the one that must stay readable while a chaos run is
+    making all three noisy (§6).
+    """
+    return FileResponse(STATIC_DIR / "recovery.html")
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "healthy"}
@@ -188,6 +206,42 @@ async def api_tasks(request: Request, response: Response) -> Any:
 @app.get("/api/tasks/depth")
 async def api_depth(response: Response) -> Any:
     return await _proxy(response, "GET", "/tasks/depth")
+
+
+@app.get("/api/tasks/attempts")
+async def api_attempts(request: Request, response: Response) -> Any:
+    """Proxy `GET /tasks/attempts` — the recovery feed (Phase 3.7).
+
+    Declared before `/api/tasks/{task_id}` for the same reason the
+    coordinator declares its own route before `/tasks/{task_id}`: FastAPI
+    matches in order, and `attempts` must not be read as a task id.
+
+    Whitelisted like `/api/tasks`, and `outcome` is repeatable, so the page
+    can ask for reassignments and fences together. The **values** are not
+    validated here — the coordinator owns that vocabulary and answers 400
+    for an unknown one, and a second validator here could only ever disagree
+    with it.
+    """
+    params: dict[str, Any] = {}
+    outcomes = request.query_params.getlist("outcome")
+    if outcomes:
+        params["outcome"] = outcomes
+    for name in ("worker_id", "limit"):
+        value = request.query_params.get(name)
+        if value:
+            params[name] = value
+    return await _proxy(response, "GET", "/tasks/attempts", params=params)
+
+
+@app.get("/api/workers/failures")
+async def api_worker_failures(response: Response) -> Any:
+    """Proxy `GET /workers/failures` — per-worker reliability counters.
+
+    The endpoint has existed since Step 3.2 and nothing in the GUI has ever
+    read it. Step 3.7 is where "per-worker reliability counters" stops being
+    an API and becomes something an operator can see.
+    """
+    return await _proxy(response, "GET", "/workers/failures")
 
 
 @app.get("/api/tasks/throughput")
