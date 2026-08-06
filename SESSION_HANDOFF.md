@@ -8,6 +8,214 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## ⇒ 2026-08-06 (session 27) — 3.4 AND 3.5 FINALLY DEPLOYED, TWO REAL DEFECTS FOUND AND FIXED, STEP 3.5 CLOSED SIX OF SIX. STEP 3.6'S CODE IS NOT ON `main`.
+
+**⚠ This file skips session 26 on `main`.** Session 26's entry was
+written on `phase-3.6-partial-completion` and merged into
+`phase-3.5-restart-recovery`, which `main` does not track — see the
+blocker below. It arrives when that branch merges. `PHASE_STATE.md` has
+no such gap.
+
+**You approved Step 3.6 and directed that PRs #54, #55 and #56 be merged
+and Step 3.5's sixth criterion closed.** #54 and #55 you had already
+merged yourself. What that merge exposed was a **real defect that no
+local environment can reproduce**, and closing the criterion meant fixing
+it first. `main` went `31e3cba` → **`3c55314`** (PR #57, the fixes) →
+**`8a8d5f6`** (PR #58, the closure), both merged by you, CI and CD green
+on each. Decisions **#204–#206**, full record in
+`docs/phase-3-fault-tolerance.md` **§3.5.7**.
+
+### ⇒ START HERE NEXT SESSION
+
+1. **⚠ STEP 3.6'S CODE IS NOT ON `main`, and this is the one thing owing.**
+   PR #56 was **merged** 04:24Z — but into **`phase-3.5-restart-recovery`**,
+   a branch already folded into `main` nine hours earlier through the
+   #55 → #54 chain. So `tests/test_reexecution.py` (369 lines) and 3.6's
+   documentation are on that branch and nowhere else.
+   **It cannot be retargeted** — `gh pr edit 56 --base main` fails with
+   `Cannot change the base branch of a closed pull request`.
+   **Open a NEW PR from `phase-3.5-restart-recovery` (`ab866ad`) to
+   `main`.** It is 5 ahead / 7 behind.
+
+   Test-merged locally this session, then aborted (nothing was pushed):
+   `docs/phase-3-fault-tolerance.md`, `SESSION_HANDOFF.md` and the new
+   test file **merge cleanly**. **`PHASE_STATE.md` conflicts in three
+   regions — the Snapshot milestone row, the M3 register row, and the
+   Decisions log — and all three resolve by KEEPING BOTH SIDES.** Order
+   the decisions 199→206, and delete the parenthetical under #206 saying
+   #199–#203 were still open; it stops being true on merge.
+   Expect **441** tests after it lands: `main`'s 429 plus 3.6's twelve.
+
+   **Steps 3.7–3.9 are NOT STARTED and must not begin without an explicit
+   go-ahead (§9).**
+2. **⚠ The AKS cluster is RUNNING and BILLING.** It was up when this
+   session started — not started by me — and every CD run has finished,
+   so a stop interrupts nothing:
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+   **Never run that while a deploy gate is parked** — that is what broke
+   production in session 23.
+3. **Nothing is running locally.** **Docker Desktop is STOPPED**, so
+   `dcds34`, `dcds35` and `dcds36` — which sessions 24–26 left up and
+   listed for teardown — **are gone.** No compose stack was started this
+   session and no container, volume or network was created. The teardown
+   commands in the session 25 and 26 entries below are now moot.
+4. Still open and unchanged: **no remote Internet worker has taken part
+   in any M3 step (§8 not claimed for 3.1–3.6)**, **every M3 demo has
+   been agent-run rather than user-run** (§15 items 3–4), and
+   `GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD` are still to rotate.
+
+### The defect that mattered, and why the criterion caught it
+
+Merging 3.4 and 3.5 to `main` produced a **failed deploy**, not a green
+one. CD run `31009413604`: `Updated: 1/3 — context deadline exceeded`,
+with the new pod in `CrashLoopBackOff` from its first second:
+
+```
+File "/app/coordinator/app/serve.py", line 126, in build_config
+    port=int(os.environ.get("COORDINATOR_PORT", "8443")),
+ValueError: invalid literal for int() with base 10: 'tcp://10.0.67.120:8443'
+```
+
+kubelet injects `<SERVICE>_PORT=tcp://<ip>:<port>` into every pod for
+every Service in the namespace. The chart ships a Service named
+`coordinator`, and **Step 3.5's own entrypoint change — `uvicorn
+app.main:app` to `python -m app.serve` — is the first thing in the
+project's history to read `COORDINATOR_PORT` from the environment.**
+
+**Compose injects no service links, so all 438 tests and every local
+demo passed.** The step that introduced it is the step whose single
+unverified criterion was the rollout. **That is the argument for not
+waiving criteria because they are inconvenient to run**, and it is worth
+carrying forward further than this defect.
+
+Confirmed on the running pod rather than reasoned about:
+
+| Variable | Resolved in-pod | Pinned in the ConfigMap? |
+|---|---|---|
+| `COORDINATOR_PORT` | `tcp://10.0.67.120:8443` | **no** — the crash input |
+| `POSTGRES_PORT` | `5432` | yes — the pinned value **wins** |
+| `REDIS_PORT` | `6379` | yes — wins |
+| `DASHBOARD_PORT` | `tcp://10.0.226.138:8444` | no — latent, nothing reads it |
+
+`POSTGRES_PORT` and `REDIS_PORT` have carried the identical collision
+since M1.5 and never broken, because `configmap.yaml` pins them.
+**Decision #204: pin the coordinator's own host and port the same way**,
+chosen over `enableServiceLinks: false` — which kills the whole class in
+one line but changes pod-wide behaviour to fix a two-variable problem and
+diverges from how the chart already solves this.
+`tests/test_chart_env.py` (new) fails if any env var the coordinator
+reads is left for kubelet to inject; **mutation-checked by deleting the
+pin**, which fails it naming `COORDINATOR_PORT`.
+
+### The second defect: the rollback rolled FORWARD onto the break
+
+`helm rollback` with no revision means "the one before latest". After
+`--atomic` had already rolled the failed upgrade back, the latest
+revision **was** that rollback, so its predecessor was the failed
+upgrade. Staging rev **61 "Rollback to 59"** (correct) became rev **62
+"Rollback to 60"** — the release reading `deployed` while pointing at a
+crashlooping image, which is how staging was found at session start.
+
+**Decision #205: gate it on `failure() && steps.helm.outcome ==
+'success'` rather than delete it** — that is the one case `--atomic` does
+not cover, a clean upgrade whose smoke test rejects the version.
+
+### Step 3.5's sixth criterion — CLOSED, six of six
+
+Measured against **public staging over the real Internet**, validated
+certificate, no `-k` and no `--insecure`:
+
+```bash
+python scripts/loadtest.py restart \
+  --url https://dcds-staging.centralindia.cloudapp.azure.com \
+  --workers 5 --max-concurrent 4 --tasks 400 \
+  --task-type hash_rounds --parameters '{"rounds": 1000000}' \
+  --restart-after 15 \
+  --restart-command "kubectl -n staging rollout restart deploy/coordinator"
+```
+
+**All eight harness checks passed.**
+
+| Measurement | Value |
+|---|---|
+| Enqueued / read back / `COMPLETED` | **400 / 400 / 400** |
+| Distinct rows / stored results | 400 / 400 |
+| In flight at the restart | **20 received, 0 completed** |
+| Rollout | rc **0**, **37.535s**, all **3** replicas replaced |
+| Fleet | 5 back, **12 sessions on 5 registrations** — no re-enrollment |
+| Queue depth | max **354** → final **0** |
+| Rate-limited retries | **0** |
+
+`work_was_in_flight_at_restart` is what stops this being a burst with a
+restart bolted on.
+
+**Two things reported rather than tidied away:**
+
+1. **One redelivery out of 217 deliveries.** Step 3.5's local
+   single-restart run measured zero. A *rolling* upgrade drains three
+   replicas in sequence, so a delivery crossing a rollover can be
+   reclaimed and re-sent. It produced **no duplicate row and no second
+   result** — Steps 3.3 and 3.4 doing exactly their job. No task loss was
+   the criterion; zero redeliveries never was.
+2. **Fleet was 5, not 100.** Staging runs the shipped
+   `REGISTER_RATE_LIMIT_PER_MINUTE` default of 5 per source IP, and it
+   was **left as deployed rather than weakened to flatter the test** —
+   the same call Decision #142 made for Step 2.8. This proves the path
+   and the property, **not a ceiling**. Throughput of 1.2 tasks/s is a
+   statement about five laptop-simulated workers chewing `hash_rounds`,
+   not about the coordinator.
+
+### Deployed and verified on the running system
+
+Both environments run **`8a8d5f6`**, checked after the deploy rather than
+off CD's tick:
+
+- **Staging:** 3/3 coordinator pods Ready, **0 restarts**; public
+  `/health` returns `8a8d5f6dbe4a203bf044664f4286084044606985` with a
+  validated certificate; `/ready` reports `database: ok, redis: ok`;
+  Helm rev **64 `deployed` "Upgrade complete"**.
+- **Production:** 2/2 Ready, **0 restarts**, image tag `8a8d5f6`. CD's
+  in-cluster `/health` version assert passed — production's permanent
+  check per Decision #151. `kubectl exec` into production was denied by
+  the harness classifier again, so that assert is the evidence, not an
+  interactive read.
+- **The defect itself, read from the new pod: `COORDINATOR_PORT=8443`.**
+- **PR #58's own deploy was a second rolling upgrade and it also
+  completed cleanly** — independent corroboration beyond the
+  instrumented §3.5.5 run.
+
+### Three things worth carrying forward
+
+1. **A criterion that is inconvenient to verify is the one most worth
+   verifying.** See above. Nothing in 438 tests could reach this.
+2. **`helm rollback` with no revision is a footgun in a failure handler.**
+   It means "previous", not "last good", and after an automatic rollback
+   those are opposite things.
+3. **`gh pr merge` and the GitHub MCP merge tool were BOTH denied by the
+   harness permission classifier all session.** Every merge this session
+   was performed by the user. Not a judgement about the changes — plan
+   for it, because it makes the agent unable to complete a merge step.
+
+### What is NOT done
+
+- **Step 3.6 is not on `main`** — item 1 above, the whole of what is owing.
+- **No remote Internet worker**, so §8 is **not** claimed for any M3 step.
+- **No user-run demo or failure demo** — the §3.5.5 run was agent-run.
+- **Production was not rolling-upgraded under load.** Staging only.
+- **The public staging endpoint intermittently times out on the first
+  request after an idle gap**, then answers 200 on retry. Seen before and
+  after this work, so **not** attributed to the rollout. Noted, not
+  diagnosed, and not investigated.
+
+**`.env` was read this session to supply the load harness's
+`ADMIN_SECRET` and `ENROLLMENT_SECRET`, and was NOT modified. No secret
+was printed at any point.** The admin credential was confirmed functional
+against public staging (`/tasks/depth` → 200) before the run.
+
+---
+
 ## ⇒ 2026-08-05 (session 25) — STEP 3.4 APPROVED, STEP 3.5 BUILT AND VERIFIED, BOTH PUSHED AS PRs #54 AND #55, CI GREEN, NOT MERGED
 
 **You approved Step 3.4 and directed that Step 3.5 be built end to end
