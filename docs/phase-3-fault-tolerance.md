@@ -2684,13 +2684,292 @@ Extend the GUI so recovery is watchable as it happens.
 - Recovery timeline for any given task.
 
 **Exit criteria**
-- [ ] Killing a worker produces a visible reassignment in the browser as
-      it happens.
-- [ ] Attempt count increments visibly.
-- [ ] Failed tasks are inspectable with a reason.
-- [ ] Stale rejections appear in the GUI.
-- [ ] A task's full recovery timeline is viewable.
-- [ ] Panels stay readable during a chaos run.
+- [x] Killing a worker produces a visible reassignment in the browser as
+      it happens — measured, §3.7.4: `docker kill` at 07:31:04Z, the
+      `REASSIGNED` row written 07:31:2xZ and on screen at the next 3s poll.
+- [x] Attempt count increments visibly — the feed's `attempt` column and
+      the task console's, both from `attempt_count`; the killed task moved
+      0 → 1 (§3.7.4).
+- [x] Failed tasks are inspectable with a reason — the failed-tasks panel
+      and the drawer, both reading `task_attempts`. **This is what forced
+      the step's one production change** (Decision **#209**): a
+      worker-reported failure stored no reason at all until now.
+- [x] Stale rejections appear in the GUI — a live `FENCED` /
+      `stale_attempt` row in the feed, and the fenced tile from
+      `GET /tasks/depth` (§3.7.4).
+- [x] A task's full recovery timeline is viewable — the drawer merges the
+      lifecycle and the abnormal endings into one chronological list
+      (§3.7.3), which is what "full" means here.
+- [x] Panels stay readable during a chaos run — **honestly, during a
+      self-inflicted churn, not the Step 3.8 harness, which does not
+      exist yet.** 40 tasks under a 5s lease produced **174 reassignments,
+      23 exhaustions and 198 attempt rows**; the page held at its 100-event
+      cap with every panel in place (§3.7.5). Re-check this against 3.8's
+      real chaos suite when there is one.
+
+---
+
+# Step 3.7 — the recovery console (2026-08-06)
+
+**Status: BUILT and VERIFIED, AWAITING APPROVAL.** Decisions
+**#207–#211**. Suite **462 passed** (was 441 at 3.6), `ruff` clean. **One
+new page, one new coordinator read, and one behaviour change** — no
+migration, no new table, no new Redis key, no protocol change, and zero
+files under `worker/`.
+
+The step's brief is "extend the GUI so recovery is watchable as it
+happens", and most of what it lists was already built by the steps that
+produced the data: the attempt counter has been a column on the task
+console since 3.2, the fenced tile since 3.4, the per-task attempt list
+since 3.2, and `GET /workers/failures` since 3.2 — **an endpoint no page
+had ever called**. What did not exist was any way to see something go
+wrong without already knowing where to look.
+
+## 3.7.1 What was missing, precisely
+
+| The brief asks for | What existed | What this step added |
+|---|---|---|
+| Failed workers panel | `GET /workers` with a coordinator-observed status | the panel |
+| Failed tasks, inspectable, with a reason | `?status=FAILED` and, for an exhaustion, an attempt row | the panel — **and a reason for the other kind of failure**, which had none |
+| Attempt count per task | the task console's `attempt` column (3.2) | the same value on the feed, per event |
+| Reassignment events **in real time** | nothing — `task_attempts` was readable per task and per worker only | `GET /tasks/attempts` and the feed |
+| Rejected stale results surfaced | the fenced **count** (3.4) | the individual events, with which task and which worker |
+| Per-worker reliability counters | `GET /workers/failures` (3.2), never called by any page | the panel that calls it |
+| Recovery timeline for a task | a lifecycle list and an attempts list, separately | the two merged chronologically |
+
+Two of those rows are the real work. The rest is display.
+
+## 3.7.2 Five decisions
+
+**#207 — A third page, `/ui/recovery`, rather than more panels on the two
+existing consoles.**
+
+Alternatives: (a) extend the task console, which already has the drawer
+and the fenced tile; (b) extend the fleet view, which already has worker
+status; (c) a page of its own.
+
+(c). The fleet view answers "who is connected" and the task console
+answers "what is this task doing" — recovery answers "what just went
+wrong, and did the system handle it", which is a different question asked
+at a different moment. Bolting it onto either page makes that page worse
+at its own job exactly when the fleet is churning, and the criterion this
+step has to meet is that the panels stay readable *then*. The page is
+under `/ui/` for the reason `/ui/tasks` is (Step 2.7): the public ingress
+owns the `/tasks` and `/workers` prefixes, so a page outside `/ui/` would
+work in Docker Compose and 404 in staging.
+
+**#208 — The feed is a new coordinator read under `/tasks/`, and it ships
+no migration and no index.**
+
+Alternatives: (a) let the page poll `GET /tasks/{id}` for tasks it already
+knows about — which cannot show an event for a task nobody is watching;
+(b) a top-level `/attempts`; (c) `/tasks/attempts`, declared before
+`/tasks/{task_id}`.
+
+(c) and no index. A top-level path would need an ingress rule, and the
+class of bug that produces — works in Compose, 404 in staging — is what
+CLAUDE.md §3.5 exists to prevent. On the index: this query orders by
+`recorded_at` where the table's two indexes lead with `task_id` and
+`worker_id`, so it is a scan and a top-N sort. That is the same trade
+`fenced_result_count` already documented and took, because `task_attempts`
+holds one row per *abnormal* ending. **Measured at 29 ms for `limit=100`
+against 166 rows, mid-churn, over local TLS** — and the trigger for
+revisiting it is written down rather than left to taste: an index belongs
+there when the table passes ~10⁶ rows or the query shows up in a slow log.
+Step 3.8's chaos harness is what will produce the first honest reading of
+either.
+
+**#209 — A worker-reported failure now writes a `task_attempts` row.**
+
+This is the step's only production behaviour change, and it is not
+scope creep — it is the exit criterion. `handle_task_failed` logged
+`error_type` and stored **nothing**, so of the two ways a task can reach
+`FAILED`, one carried a full attempt row and the other carried no reason
+anywhere except one replica's log stream. "Failed tasks are inspectable
+with a reason" was false for half of them.
+
+Alternatives: (a) a column on `tasks`, which needs a migration and a
+second place to look; (b) show the operator "see the coordinator logs",
+which is the thing a dashboard exists to replace; (c) an attempt row,
+outcome `FAILED`, reason `executor_error:<type>`.
+
+(c). No migration, no new vocabulary — `FAILED` is already what an
+exhaustion writes — and it lands in every view that already reads that
+table: the drawer, the feed, the failed-tasks panel and
+`GET /workers/failures`, none of which needed a line of change to show it.
+The row is built **from the task row inside the transition's own
+transaction**: `attempt_number` is `tasks.attempt_count` read in the same
+statement, so a worker cannot name an attempt the task never reached
+(§12), and a task cannot become terminal without the record of why. A
+`NOT_OWNER` — the §12 case, a worker reporting on somebody else's task —
+writes nothing, which is asserted rather than assumed
+(`test_a_failure_the_database_refuses_records_no_reason`).
+
+**#210 — Readability under churn is a hold control and capped panels, not
+a slower poll.**
+
+Alternatives: (a) poll slowly enough that the table is stable; (b) freeze
+on hover; (c) an explicit hold, with the panels capped and scrollable.
+
+(c). (a) makes the page fail its own first criterion — "visible as it
+happens" — to fix a second one. (b) surprises: a mouse resting anywhere
+silently stops the view being live, and an operator who looks away comes
+back to stale data with nothing saying so. Hold stops the **redraw**, not
+the polling, so nothing is missed and releasing it shows the current
+state rather than replaying a queue. The feed and the failed-tasks list
+are capped at 46vh and 30vh and scroll inside themselves, so a hundred
+events cannot push the reliability panel off the bottom of a screen that
+was readable a minute earlier.
+
+**#211 — The failed-task panel reports *endings*, never a derived
+"attempts made".**
+
+Found by reading the first screenshot rather than by a test. The task
+console renders `attempt_count + 1`, correctly, because it is naming the
+attempt running *now* and a live first attempt shown as "0" reads as "not
+attempted". Copied onto a terminal task that is wrong — and "attempts
+made" cannot be derived either, because **an exhaustion counts its own
+last attempt (the reclaimer increments on the way to `FAILED`) and an
+executor error does not**. Any total would be right for one kind of
+failure and wrong for the other, and wrong again the first time a third
+kind is added. So neither view computes it: the column says how many
+attempts ended abnormally, which is exactly what the counter holds, and
+the attempt *number* is shown only while there is a live attempt to
+number.
+
+## 3.7.3 The merged recovery timeline
+
+The criterion says a task's **full** recovery timeline. Until this step
+the two halves were separate lists in the task console's drawer — the
+lifecycle the task moved through (`timeline`, reconstructed from its own
+timestamp columns) and the attempts that ended abnormally (`attempts`).
+Interleaved by time they are one story: queued, assigned, running, lease
+expired, queued again, assigned elsewhere, completed. Read apart they are
+two, with the operator doing the merge in their head against two clocks.
+
+The merge adds no authority it does not have. Every entry still names
+where it came from — a lifecycle entry names the column that recorded it
+(`from created_at`), an attempt entry names its outcome, its reason and
+its worker — so nothing in the merged list is less checkable than it was
+in the split one.
+
+## 3.7.4 Measurements
+
+Against `dcds37`, a local Compose stack with two workers, `sleep`'s lease
+shortened to 20s so a reclaim happens in a demo rather than a minute.
+**Every number below was read off the running system.**
+
+**A reassignment, watched:**
+
+| | |
+|---|---|
+| `docker kill` of the holding worker | **07:31:04Z** |
+| `REASSIGNED` / `lease_expired` row written | **07:31:19.113Z** — **15.1s later**, the shortened lease plus the reclaimer's 5s sweep |
+| Visible in the feed | the next 3s poll; it was the top row at 07:31:56Z reading "37s ago" |
+| The task | `RUNNING`, `attempt_count` **0 → 1**, held by the other worker |
+
+The earlier of the two runs is the cleaner one to quote for the counter:
+task `372237f8`, killed at **07:19:08Z**, its `REASSIGNED` row written at
+**07:19:21.613Z**, and polled `RUNNING` on a *different* worker at
+**07:19:26Z** with `attempt_count` **1** — 18 seconds from kill to
+recovered, with the attempt column incrementing on screen in between.
+
+**Failure, with a reason:** two tasks driven terminal by exhausting their
+attempts (a `sleep` policy of `max_attempts: 1` set through
+`PUT /tasks/policies/sleep`, then the holder paused) appear in the
+failed-tasks panel with `lease_expired` and their ending counts, and open
+into the merged timeline. The **executor-error** reason
+(`executor_error:ZeroDivisionError`) is proven by tests end to end through
+`handle_task_failed`, **not by a live demo** — see §3.7.6.
+
+**A fence, unplanned:** the paused worker resumed mid-run and submitted
+the result of a task it had already lost. That produced a real `FENCED` /
+`stale_attempt` row, which is the criterion "stale rejections appear in
+the GUI" met by an event nobody staged.
+
+**The feed, as an API:**
+
+| Read | Result |
+|---|---|
+| `GET /tasks/attempts` unfiltered | the events, newest first |
+| `?outcome=FAILED` | 2 of 5 rows, the two exhaustions |
+| `?outcome=REASIGNED` (typo) | **400**, naming the four valid outcomes |
+| `?worker_id=nope` | **400** |
+| `?limit=100000` | 200, `"limit": 200` — capped by `TASK_LIST_MAX_LIMIT` |
+| `limit=100` against 166 rows, mid-churn | **29 ms**, three consecutive reads |
+
+**Through the dashboard proxy**, which is the path the browser actually
+takes: `GET /api/tasks/attempts?limit=5` returned the same events, and the
+operator credential appears in no response and in no page.
+
+## 3.7.5 The churn run — and what it does not claim
+
+40 `sleep(25)` tasks under a deliberately hostile `sleep` policy
+(`lease_ttl_seconds: 5`, `max_attempts: 6`), two workers, so **every**
+attempt lost its task mid-execution:
+
+| | |
+|---|---|
+| `REASSIGNED` rows | **174** |
+| `FAILED` rows (attempts exhausted) | **23** |
+| `FENCED` rows | 1 |
+| Attempt rows total | **198** |
+| Reliability panel, at the peak | 80 and 81 reassignments on the two workers |
+| Feed | held at its 100-event cap, scrolling inside its own panel |
+| Every other panel | in place, none pushed off screen |
+| After the policy was restored | queue drained to **0**, 28 `COMPLETED`, 23 `FAILED` |
+
+**This is not the chaos run the criterion names.** Step 3.8 owns that, and
+it does not exist. What this shows is that the page's layout survives two
+orders of magnitude more events than the demo produced, which is the part
+that can be shown today. The criterion is ticked on that basis and the
+gap is stated rather than papered over — re-check it against 3.8's suite.
+
+## 3.7.6 Demo and failure demo
+
+**Demo (run against `dcds37`, agent-run):**
+
+1. Open `/ui/recovery`. Four tiles, an empty feed saying so.
+2. Submit a `sleep(90)`; watch it start on a worker (fleet view).
+3. `docker kill` that worker's container.
+4. Within one lease window a `REASSIGNED` / `lease_expired` row appears at
+   the top of the feed, flashing once, with the task's attempt column
+   showing 1 and the failed-workers panel showing the killed worker
+   `OFFLINE`.
+5. Click the task id: the drawer shows the merged recovery timeline.
+
+**Failure demo — the console's own failure, which is the one this page
+has to survive:** `docker stop dcds37-coordinator-1`. Within two polls the
+banner reads `coordinator unreachable — retrying every 3s, view will
+resume automatically`, the clock reads `disconnected`, **and the last data
+stays on screen rather than being blanked**. `docker start` — the view
+resumes on the next successful poll with no reload (clock back at
+07:34:02Z).
+
+Screenshots captured: the console with events, the drawer's merged
+timeline, the console under churn, and the console with the coordinator
+stopped.
+
+## 3.7.7 What Step 3.7 deliberately does NOT do
+
+- **It adds no WebSocket to the dashboard.** Phase 1.8's polling decision,
+  unchanged and for the same reason: a 3s poll already reads as real-time,
+  and "the view recovers when the browser's connection drops" stays "the
+  next poll succeeds" rather than becoming a second reconnect protocol to
+  build and verify.
+- **It does not index `task_attempts`** — #208, with the trigger named.
+- **It does not add a chaos harness.** Step 3.8 owns it; the churn in
+  §3.7.5 is a hand-run policy change, not a suite.
+- **It does not surface a fenced result's rejected body.** Step 3.3 refuses
+  to keep it, and showing "a result was thrown away" without showing which
+  bytes is the whole of what 3.3 decided.
+- **It does not retry an executor error.** #209 records the reason; the
+  policy that a raised executor is terminal is Step 3.2's and is unchanged.
+- **It does not claim §8.** No remote Internet worker took part; both
+  workers were local containers, and the page has not been opened against
+  staging.
+- **It was not run by the user** — every measurement above is agent-run
+  (§15 items 3–4).
 
 ---
 
