@@ -8,6 +8,157 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## ⇒ 2026-08-06 (session 30) — STEP 3.8 BUILT AND VERIFIED, SIX OF SIX CRITERIA, NO PRODUCTION CODE CHANGED
+
+**You directed that the next step be built end to end with the decisions
+taken here.** Done: Step 3.8, the chaos harness. Decisions **#213–#217**,
+full record in `docs/phase-3-fault-tolerance.md` **§3.8.1–§3.8.7**, runbook
+in `docs/chaos-testing.md`. Suite **513 passed** (was 462), `ruff` clean.
+**`git diff --stat` touches nothing under `coordinator/`, `worker/`,
+`dashboard/`, `protocol/`, `infra/` or `alembic/`** — a new script, four
+hooks on the load harness's simulated worker, 51 tests and a scheduled
+workflow are the whole step.
+
+**One thing was read as an assumption rather than guessed at: "the next
+step" was taken to mean 3.8.** Step 3.1 is long done, approved, merged and
+deployed, so there was nothing to deliver there.
+
+### ⇒ START HERE NEXT SESSION
+
+1. **Approve or reject Step 3.8.** It is **PR #65**, branch
+   `phase-3.8-chaos-harness`, head **`78a7691`**, and **green — 14 of 14
+   checks, `MERGEABLE` / `CLEAN`**, read from the API rather than off a
+   tick. The `test` job reports **513 passed** against ephemeral
+   Postgres/Redis, corroborating the local count. **NOT MERGED, so no
+   environment runs it and the chaos workflow cannot fire.**
+   **Step 3.9 is NOT STARTED and must not begin without an explicit
+   go-ahead (§9).**
+2. **⚠ The chaos workflow has NEVER RUN.** GitHub only schedules and
+   dispatches workflows that are on the default branch, so
+   `.github/workflows/chaos.yml` cannot fire until this merges. **After
+   the merge, the one command that proves it:**
+   ```bash
+   gh workflow run "Chaos suite" -f workers=10 -f tasks=500
+   ```
+   Step 3.9's "chaos suite green in CI" is where that gets claimed. It is
+   **not** claimed for 3.8, and the step document says so.
+3. **⚠ The AKS cluster is RUNNING and BILLING.** The staging chaos run
+   used it. Nothing is parked:
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+4. **⚠ Local Docker is RUNNING.** `dcds38` is this step's demo stack
+   (coordinator **9495**, dashboard **9496**) and it is **deliberately NOT
+   at stock configuration** — `TASK_LEASE_TTL_SECONDS=20`,
+   `LEASE_DISCONNECT_GRACE_SECONDS=5`, `LEASE_RECLAIM_INTERVAL_SECONDS=2`,
+   retry backoff 2s/10s, exclusion 10s — so **no timing measured on it is
+   a measurement of the shipped defaults**, and §3.8.5 says so before
+   quoting a number. `TASK_MAX_ATTEMPTS` was left at the shipped **3**.
+   Beside it: `dcds38-pg` / `dcds38-redis`, the standalone unit-test
+   database on **55438** / **6395** that the 513-test run used. Its env
+   file lives in **this session's scratchpad and dies with it**; the
+   credentials in it are throwaway and are **not** `.env`'s. Teardown:
+   ```bash
+   docker compose -p dcds38 down -v
+   docker rm -f dcds38-pg dcds38-redis
+   ```
+5. **`.env` WAS read this session** — to supply `ADMIN_SECRET` and
+   `ENROLLMENT_SECRET` for the staging run — and was **not modified**.
+   **No secret was printed at any point.**
+6. Still open and unchanged: **no worker has ever run outside this laptop
+   in any M3 step**, **every M3 demo has been agent-run rather than
+   user-run** (§15 items 3–4), and `GRAFANA_ADMIN_PASSWORD` /
+   `POSTGRES_PASSWORD` are still to rotate.
+
+### What Step 3.8 actually is
+
+`scripts/chaos.py`, which **imports `scripts/loadtest.py` instead of
+reimplementing it** (#213). Every simulated worker is Step 2.8's — a real
+registration, a real session, real result envelopes — so the coordinator
+cannot tell a fault here from a fault anywhere. Four faults go over the
+protocol and therefore work identically against Compose and public
+staging; everything below the protocol (pod eviction, database and Redis
+blips) is `--chaos-command` (#214), the same call Step 3.5 made.
+
+### The measurements that matter
+
+- **The criterion run: 1,000 tasks, 10 workers, 17 kills at one every 5s.**
+  1,040 delivered / 1,000 distinct / **39 redeliveries**, **41
+  `REASSIGNED` `lease_expired`** rows, and **1,000 rows = 1,000 distinct =
+  1,000 `COMPLETED` = 1,000 results**. Converged **0.285s** after chaos
+  stopped, queue depth 960 → 0.
+- **All four faults, 1,000 tasks:** 28 faults, **11 injections answered —
+  7 `duplicate`, 4 `superseded`, none accepted**, 1,000 of 1,000.
+- **Staging, over the real Internet, no `--insecure`: 300 of 300
+  `COMPLETED`**, 300 results, 0 rate-limited retries, 9 injections
+  refused, 8 `REASSIGNED` and 3 `FENCED`, converged 24.845s. Five workers,
+  because staging's shipped 5-per-IP registration limit was **left as
+  deployed rather than raised**.
+- **The fence, reached live:** 12 `FENCED` / `task_reassigned` rows from
+  thawed workers submitting for tasks already reassigned.
+
+### The failure demo was not staged
+
+The targeted fence run also **failed loudly, which is the sixth
+criterion**: `sleep(30)` tasks under a 20s lease lose the lease on every
+attempt, so all six exhausted three attempts, ended terminally `FAILED`,
+and the harness printed **`FAIL: no_task_lost`** and exited **1**. It went
+looking for a fence and found a genuine invariant violation on the way.
+
+### Three things building it found
+
+1. **The `kill` fault was a lie and every check still passed.** Aborting
+   the socket alone left the executions running and the pending results
+   intact, so the "killed" worker finished its own work and re-sent it on
+   reconnect — a network drop. **1,000 tasks under 13 kills gave 0
+   redeliveries and 1 reassignment, all green.** The number that should
+   have been large being zero is what caught it; no test would have.
+   Cancelling the executions and dropping the buffer took the same seed to
+   39 redeliveries and 41 reassignments (#216).
+2. **The reconnecting worker declared work it no longer had** —
+   `received - completed` is not "what I am running".
+3. **A test that passed alone and failed in the suite.** "Missing
+   credentials" was asserted against an environment that exports them, so
+   it only held when nothing else had. Found by running the whole suite,
+   not the file.
+
+### What is NOT done
+
+- **The chaos workflow has never run.** See item 2.
+- **No database blip, no Redis blip, no pod eviction** — available through
+  `--chaos-command`, and **no run used one**.
+- **No timing is asserted anywhere**, deliberately.
+- **The stale injection cannot guarantee a `FENCED` verdict** rather than
+  a `superseded` one; the same timing dependence Step 3.4 recorded.
+- **No worker ran outside this laptop.** §8 is claimed only in the sense
+  that the coordinator was remote and the certificate validated.
+- **No user-run demo or failure demo** — every run above was agent-run.
+- **Nothing merged and nothing deployed.** `main` is untouched at
+  **`21613d6`**, which is what both environments still run.
+
+### State at close — checked, not assumed
+
+- **PR #65 is OPEN, `MERGEABLE` / `CLEAN`**, 14 of 14 checks green, `test`
+  reporting **513 passed**. The step's own head was `78a7691`; **the
+  commit carrying this paragraph is the branch tip**, so the SHA to check
+  is whatever `origin/phase-3.8-chaos-harness` points at — CI was
+  confirmed green on that tip too, after this entry was pushed.
+- **`main` is at `21613d6`** and public staging `/health` returns
+  `21613d606b523fa4497f53d7a1125fe30f341bb6` — so **the cluster is UP and
+  BILLING at close**, which is how the staging chaos run was possible.
+  Nothing is parked; the stop command is item 3.
+- **Six containers are running**, all verified at close:
+  `dcds38-coordinator-1`, `dcds38-dashboard-1`, `dcds38-postgres-1` and
+  `dcds38-redis-1` **Up (healthy)**, plus the standalone `dcds38-pg` and
+  `dcds38-redis` unit-test pair on **55438** / **6395**. Teardown is item 4.
+- **The working tree is clean** on `phase-3.8-chaos-harness`, everything
+  committed and pushed. Three commits, one concern each: the harness, the
+  workflow, the record.
+- **No branch was deleted this session.** `phase-3.5-restart-recovery` and
+  `phase-3.7-dashboard-v3` still survive their merges, as before.
+
+---
+
 ## ⇒ 2026-08-06 (session 29) — THE MERGE BACKLOG IS EMPTY: PRs #63, #59 AND #50 ALL MERGED AND DEPLOYED, NO FEATURE WORK
 
 **One thing was asked for and it is done: clear every open PR.** Three

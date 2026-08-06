@@ -3002,14 +3002,226 @@ Automate the failures.
 - Runs in CI on a schedule.
 
 **Exit criteria**
-- [ ] Chaos suite runs from a single documented command.
-- [ ] 1,000 tasks with continuous random worker kills complete with zero
+- [x] Chaos suite runs from a single documented command.
+- [x] 1,000 tasks with continuous random worker kills complete with zero
       loss — counted automatically.
-- [ ] Zero double completions across the run — verified against the
+- [x] Zero double completions across the run — verified against the
       result ledger.
-- [ ] System converges to a clean state after chaos stops — verified.
-- [ ] Chaos run passes against staging over the public Internet.
-- [ ] Any invariant violation fails the run loudly.
+- [x] System converges to a clean state after chaos stops — verified.
+- [x] Chaos run passes against staging over the public Internet.
+- [x] Any invariant violation fails the run loudly.
+
+## 3.8.1 What was built, and what was reused
+
+**`scripts/chaos.py`, which imports `scripts/loadtest.py` rather than
+reimplementing it (Decision #213).** Step 2.8's harness already contains a
+simulated worker that registers for real, holds a real WebSocket session,
+runs the real executors and submits real result envelopes; a fleet builder
+that respects the registration limiter; the enqueue and read-back paths;
+the queue sampler; and a `main()` whose exit code is already the contract
+this step needs. Writing a second one of those to get four faults would
+have been the largest avoidable thing in Milestone 3.
+
+What the chaos harness adds is **four faults, an invariant evaluator and a
+convergence wait**. What `loadtest.py` gained is four small hooks the
+faults need — the ack's `outcome` recorded rather than only its `accepted`
+flag, a retained copy of each submitted envelope, a `frozen` flag, and
+`kill_session()`. Those live on `SimWorker` rather than in a subclass
+because the alternative is overriding `_receive_loop` wholesale to add two
+lines to it.
+
+| | Step 2.8 `loadtest.py` | Step 3.8 `chaos.py` |
+|---|---|---|
+| Question | how fast, and is anything lost when nothing goes wrong | things go wrong continuously — does the ledger still add up |
+| Workload | cheapest possible, so the coordinator saturates | long enough to still be *running* when a fault lands |
+| Verdict | throughput and latency, plus loss checks | invariants only; no timing is asserted |
+| Faults | none (`restart` restarts once) | one every `--fault-interval` for the whole drain |
+
+## 3.8.2 The four faults, and why each is that shape
+
+| Fault | What it does | What it exercises |
+|---|---|---|
+| `kill` | `transport.abort()` — an RST, no close frame — **and cancels every execution in flight and drops every unacknowledged result** | a killed container: the socket dies, the work dies with it, the identity survives and reconnects |
+| `freeze` | the session stops reading, heartbeating and executing while the socket stays open | the *silent worker* path (≤65s, §3.1), and on release a genuine stale submission for a task already lost |
+| `duplicate` | a completed task's exact envelope, re-sent | Step 3.3 — must answer `duplicate` and store nothing |
+| `stale` | an earlier attempt number with a fresh idempotency token | Step 3.4 — must be refused, never transition a task |
+
+Everything below the protocol — coordinator eviction, a database blip, a
+Redis blip — is `--chaos-command`, repeatable, run on the same schedule
+(Decision #214). **A harness cannot know how to evict a pod in every
+environment, and one that shelled out to Docker directly could only ever
+test the local one** — the same call Step 3.5 made with
+`--restart-command`, and what keeps a single command working against both
+Compose and public staging.
+
+## 3.8.3 The invariants, and the one that is deliberately strict
+
+From the gate's own list for this step (§3.0.13). Every one is counted
+from the coordinator's rows through the operator API, never from the
+harness's own tally (Decision #140):
+
+| Check | Means |
+|---|---|
+| `chaos_was_actually_applied` | **a green run that injected nothing is the failure mode this step exists to avoid** |
+| `every_task_read_back`, `no_duplicate_task_rows` | the batch exists exactly once |
+| `no_task_lost` | `COMPLETED == accepted` |
+| `every_completion_has_one_result` | no completion without a stored result |
+| `no_injected_submission_completed_a_task` | zero double completion — the one outcome absent from the refusal set is `transitioned` |
+| `every_acked_injection_was_refused` | every injected submission got a *known* refusal verdict, not an unrecognised one |
+| `no_injection_unanswered_on_a_live_session` | see §3.8.4 |
+| `converged_no_tasks_in_flight`, `converged_within_timeout` | nothing `QUEUED`, `ASSIGNED` or `RUNNING` once chaos stops |
+
+**`no_task_lost` counts a terminally `FAILED` task as a failure of the run
+(Decision #215), and that is a choice rather than an oversight.** A task
+that exhausted its retries is not a lost row — Step 3.2 made that outcome
+correct and visible — but under a fault load the fleet is meant to
+survive, a terminal failure is a result worth stopping for. The report's
+`by_status` says which it was, so the distinction is never hidden.
+
+**Queue depth is reported and never asserted.** Depth is global, and a
+deployed environment has work of its own; asserting it would fail a
+correct run against staging for someone else's task. Convergence is the
+absence of in-flight *rows*, which is the gate's own wording.
+
+## 3.8.4 Three things building it found
+
+1. **The `kill` fault was a lie, and only a measurement showed it.** The
+   first version aborted the socket and nothing else, so every execution
+   coroutine kept running and every unacknowledged result stayed in the
+   worker's pending buffer — the "killed" worker finished its own tasks
+   and re-sent the results on reconnect. **1,000 tasks under 13 kills
+   produced 0 redeliveries and 1 reassignment**: the coordinator had
+   almost nothing to recover, because nothing had been lost. That is a
+   network drop, not a kill. With the executions cancelled and the pending
+   buffer dropped, the same seed produced **39 redeliveries and 41
+   `REASSIGNED` rows** — and still 1,000 of 1,000 completed. **Every check
+   passed both times**, so no test would have caught it; the number that
+   should have been large being zero is what caught it.
+2. **The reconnecting worker was declaring work it no longer had.**
+   `hello` sent `tasks_in_flight = received - completed`, which is a
+   different quantity from "what I am running": after a kill it is still
+   large while the executions are gone. It is now
+   `len(running) + len(pending)`, the same answer as before for every
+   scenario that kills nothing (Decision #216).
+3. **An injection whose ack never arrives is not automatically a defect,
+   and the first version failed the run for one.** The harness kills
+   sockets itself, so a submission injected a moment before a kill was
+   never going to be answered. Failing on it would mean failing the run
+   for doing its job. The discriminator is the worker's session count
+   captured at injection time: more sessions now than then means the
+   socket died in between, and that injection is **excused and reported**.
+   One left unanswered on a session that stayed up is a real defect and
+   still fails.
+
+## 3.8.5 The measurements
+
+All local numbers are from `dcds38`, a Compose stack at **shortened lease
+windows** — `TASK_LEASE_TTL_SECONDS=20`, `LEASE_DISCONNECT_GRACE_SECONDS=5`,
+`LEASE_RECLAIM_INTERVAL_SECONDS=2`, retry backoff 2s/10s, exclusion 10s —
+so **no timing below is a measurement of the shipped defaults**. The
+invariants do not depend on the window; waiting out a 60s TTL after every
+fault would have made a two-minute run a twenty-minute one for no extra
+coverage. `TASK_MAX_ATTEMPTS` was left at its shipped **3**, because the
+retry budget is exactly what a zero-loss claim rests on.
+
+**The criterion run — 1,000 tasks, continuous random worker kills:**
+
+| | |
+|---|---|
+| Fleet | 10 workers × 4 credits, `sleep(2)` workload |
+| Faults | **17 kills**, one every 5s for the whole drain |
+| Delivery | 1,040 delivered, 1,000 distinct, **39 redeliveries** |
+| Coordinator's own recovery record | **41 `REASSIGNED` / `lease_expired`** rows |
+| Ledger | **1,000 rows, 1,000 distinct, 1,000 `COMPLETED`, 1,000 results** |
+| Convergence | **0.285s** after chaos stopped; queue depth 960 → 0 |
+| Verdict | every check green, exit 0 |
+
+**All four faults, 1,000 tasks:** 28 faults (7 kills, 10 freezes, 7
+duplicates, 4 stale), **11 injections answered — 7 `duplicate`, 4
+`superseded`, none accepted**, 12 redeliveries, 53 `REASSIGNED` rows,
+**1,000 of 1,000 completed** with 1,000 results, converged in 0.277s.
+
+**Against public staging, over the real Internet, with no `--insecure`:**
+5 workers (the shipped `REGISTER_RATE_LIMIT_PER_MINUTE` of 5 per source
+IP, **left as deployed rather than weakened for the test** — the same call
+as Decision #142 and Step 3.5), 300 tasks, 12 faults. **300 of 300
+`COMPLETED`, 300 distinct rows, 300 results, 0 rate-limited retries**, 9
+injections answered (5 `duplicate`, 4 `superseded`), 2 redeliveries, and
+the coordinator's feed showing **8 `REASSIGNED` and 3 `FENCED` /
+`task_reassigned`**. Converged in **24.845s**. Every check green.
+
+**The fence, reached live:** a targeted run — 3 workers, six `sleep(30)`
+tasks, freeze only — produced **12 `FENCED` / `task_reassigned` rows**,
+where a thawed worker submitted for a task that had been reassigned and
+was still running elsewhere. That is Step 3.4's rule firing under chaos
+rather than under a staged reproduction.
+
+## 3.8.6 The failure demo, and it was not staged
+
+That same targeted run **failed loudly, which is the sixth criterion**:
+
+```
+FAIL: no_task_lost
+exit=1
+```
+
+`sleep(30)` under a 20-second lease means **every** attempt loses its
+lease before it can finish, so all six tasks burned three attempts and
+ended terminally `FAILED` — 0 completed, 0 results. The harness said so in
+one line, named the check, and exited 1. Nothing about it was arranged:
+the run existed to produce a fence and produced a genuine invariant
+violation on the way.
+
+The deliberate version, for a demo:
+
+```bash
+# every attempt outlives its lease — tasks exhaust their retries and the
+# run must go red
+python scripts/chaos.py --url https://localhost:9495 \
+  --workers 3 --tasks 6 --max-concurrent 2 \
+  --task-type sleep --parameters '{"seconds": 30}' \
+  --faults freeze --freeze-seconds 26 --insecure
+```
+
+`tests/test_chaos.py` covers the same contract deterministically: 51
+tests, each breaking one input and asserting the verdict flips — including
+that `transitioned` is not in the refusal set, which is the one mutation
+that would make the whole harness useless.
+
+## 3.8.7 What Step 3.8 deliberately does NOT do
+
+- **No production code changed.** The whole step is `scripts/chaos.py`,
+  four hooks on the load harness's simulated worker, a test module and a
+  scheduled workflow. `git diff --stat` touches nothing under
+  `coordinator/`, `worker/`, `dashboard/`, `protocol/`, `infra/` or
+  `alembic/`.
+- **It has not run in CI.** `.github/workflows/chaos.yml` is scheduled
+  weekly and dispatchable, but GitHub only schedules and dispatches
+  workflows that are on the default branch, so **its first run happens
+  after this merges**. Step 3.9's "chaos suite green in CI" is where that
+  is claimed, not here.
+- **It injects no database or Redis blip of its own** — those are
+  `--chaos-command`, and no run in §3.8.5 passed one, so **no dependency
+  blip has been exercised**. The mechanism is the same subprocess path
+  Step 3.5's restart command used and is unproven here.
+- **It does not evict a Kubernetes pod.** Same reason: available through
+  `--chaos-command`, not run.
+- **It asserts no timing.** Not a single number in §3.8.5 is a threshold;
+  a chaos run on shared hardware that gated on latency would be
+  re-run until it passed.
+- **The stale injection cannot guarantee a `FENCED` verdict.** It is
+  refused either way, but whether that refusal is `fenced` or `superseded`
+  depends on whether the task is still live when the submission lands —
+  the same timing dependence Step 3.4 recorded. The fence is reached
+  reliably by the freeze fault with tasks longer than the lease, which is
+  what §3.8.5's targeted run did.
+- **It was not run by the user** — every run above is agent-run (§15
+  items 3–4).
+- **§8 IS claimed for this step**: the staging run in §3.8.5 went over the
+  public Internet against a validated certificate. What it did **not** do
+  is run a worker on a machine outside this laptop, so the "worker outside
+  the local network" reading of §8 is still not satisfied — the harness's
+  fleet is local, the coordinator is remote.
 
 ---
 
