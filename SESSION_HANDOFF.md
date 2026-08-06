@@ -138,8 +138,11 @@ looking for a fence and found a genuine invariant violation on the way.
 
 ### State at close — checked, not assumed
 
-- **PR #65 is OPEN, `MERGEABLE` / `CLEAN`**, head `78a7691`, 14 of 14
-  checks green, `test` reporting **513 passed**.
+- **PR #65 is OPEN, `MERGEABLE` / `CLEAN`**, 14 of 14 checks green, `test`
+  reporting **513 passed**. The step's own head was `78a7691`; **the
+  commit carrying this paragraph is the branch tip**, so the SHA to check
+  is whatever `origin/phase-3.8-chaos-harness` points at — CI was
+  confirmed green on that tip too, after this entry was pushed.
 - **`main` is at `21613d6`** and public staging `/health` returns
   `21613d606b523fa4497f53d7a1125fe30f341bb6` — so **the cluster is UP and
   BILLING at close**, which is how the staging chaos run was possible.
