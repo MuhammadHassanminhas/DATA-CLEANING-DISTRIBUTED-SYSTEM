@@ -286,10 +286,48 @@ class SimWorker:
         self.pending: dict[str, dict] = {}   # task_id -> envelope awaiting ack
         self.sent_at: dict[str, float] = {}
 
+        # Phase 3.8. Four pieces of state the chaos harness needs and no
+        # earlier scenario did. They are here rather than in a subclass
+        # because the alternative is overriding `_receive_loop` wholesale to
+        # add two lines to it.
+        #
+        # `outcomes` is the coordinator's own verdict per task —
+        # `transitioned`, `duplicate`, `superseded`, `fenced`, `not_owner`.
+        # Step 3.3 and 3.4 made those distinctions real and the ack has
+        # carried them since; nothing had read them until chaos needed to
+        # assert that an injected duplicate created nothing.
+        self.outcomes: dict[str, str] = {}
+        # A submitted envelope, kept after its ack. `pending` is popped on
+        # ack by design, so without this there is nothing left to re-send.
+        self.submitted: dict[str, dict] = {}
+        # Which attempt this worker was handed, per task. The stale
+        # injection needs a number the coordinator once considered current.
+        self.assignments: dict[str, int] = {}
+        # `docker pause` in a flag: the socket stays open and unread while
+        # this is set, so the coordinator sees silence rather than a close.
+        self.frozen = False
+        self.kills = 0
+        # An injected submission's verdict, kept apart from `outcomes`.
+        # Reading it out of `outcomes` instead would be a race: a task can
+        # legitimately be acked twice, and "did the value change" cannot
+        # distinguish an injection's verdict from a retry's.
+        self.awaiting_injection: set[str] = set()
+        self.injection_outcomes: list[dict] = []
+
         self._slots: asyncio.Semaphore | None = None
         self._ws = None
         self._send_lock: asyncio.Lock | None = None
         self._epoch = 0
+        # Executions in flight, and the task ids behind them. Phase 3.8
+        # needs both: a kill cancels the coroutines, and `hello` declares
+        # the count.
+        self._executing: set[asyncio.Task] = set()
+        self._running: set[str] = set()
+
+    @property
+    def is_connected(self) -> bool:
+        """Holding a session right now. Phase 3.8 asks constantly."""
+        return self._ws is not None
 
     # -- HTTP identity ------------------------------------------------
 
@@ -416,7 +454,16 @@ class SimWorker:
                 # still executing across the restart (Decision #101).
                 # Without it a reconnecting worker looks idle and is handed
                 # a full set of new credits on top of what it is running.
-                "tasks_in_flight": max(0, len(self.received) - len(self.completed)),
+                #
+                # **Counted from what is actually running, since Phase 3.8.**
+                # It was `received - completed`, which is a different
+                # quantity: after a kill that quantity is still large while
+                # the executions are gone, so a killed worker would come
+                # back claiming to run work it had lost. Executions in
+                # flight plus results awaiting an ack is the honest answer,
+                # and it is the same answer as before for every scenario
+                # that does not kill anything.
+                "tasks_in_flight": len(self._running) + len(self.pending),
             }, str(uuid.uuid4()))
             ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
             if ack.get("message_type") != "hello_ack":
@@ -442,8 +489,19 @@ class SimWorker:
                 await asyncio.gather(*helpers, return_exceptions=True)
 
     async def _receive_loop(self, stop: asyncio.Event) -> None:
-        executing: set[asyncio.Task] = set()
+        # Held on the instance rather than locally since Phase 3.8: a kill
+        # has to be able to cancel the work in flight, and a local set is
+        # reachable only from inside this method.
+        executing = self._executing
         while not stop.is_set():
+            # **Frozen means unread, not ignored** (Phase 3.8). Reading and
+            # discarding would answer nothing while still draining the
+            # socket; not reading at all is what a paused process does, and
+            # it is what makes a resumed worker submit the result of a task
+            # it has already lost — the stale submission Step 3.4 fences.
+            if self.frozen:
+                await asyncio.sleep(0.25)
+                continue
             try:
                 raw = await asyncio.wait_for(self._ws.recv(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -468,6 +526,24 @@ class SimWorker:
                 # the tenth attempt (worker.py `_handle_result_ack`).
                 self.pending.pop(task_id, None)
                 self.sent_at.pop(task_id, None)
+                # Phase 3.8: the verdict, not just the boolean. `accepted`
+                # is true for both `transitioned` and `duplicate`, which are
+                # the same news to a worker and very different news to an
+                # invariant.
+                outcome = payload.get("outcome")
+                if outcome:
+                    self.outcomes[task_id] = str(outcome)
+                if task_id in self.awaiting_injection:
+                    self.awaiting_injection.discard(task_id)
+                    self.injection_outcomes.append({
+                        "task_id": task_id,
+                        "outcome": str(outcome or "none"),
+                        "accepted": bool(payload.get("accepted")),
+                    })
+                    # An injected submission must not be counted as this
+                    # worker completing the task: it did not, and
+                    # `duplicate` carries `accepted: true`.
+                    continue
                 if payload.get("accepted"):
                     self.completed.add(task_id)
 
@@ -478,6 +554,13 @@ class SimWorker:
     async def _heartbeat_loop(self, stop: asyncio.Event) -> None:
         sequence = 0
         while not stop.is_set():
+            if self.frozen:
+                # A frozen worker's heartbeats stop with everything else.
+                # This is the whole point of the fault: the coordinator sees
+                # a live socket and no traffic, which is the ≤65s detection
+                # path Step 3.1 measured, not the ≤35s close path.
+                await asyncio.sleep(0.25)
+                continue
             sequence += 1
             await self._send("heartbeat", {
                 "sequence": sequence,
@@ -492,6 +575,8 @@ class SimWorker:
     async def _result_retry_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             await asyncio.sleep(RESULT_RETRY_SECONDS / 2)
+            if self.frozen:
+                continue
             now = time.monotonic()
             for task_id, envelope in list(self.pending.items()):
                 if now - self.sent_at.get(task_id, now) < RESULT_RETRY_SECONDS:
@@ -524,6 +609,8 @@ class SimWorker:
 
         await self._slots.acquire()
         self.received.append(task_id)
+        self.assignments[task_id] = int(payload.get("attempt") or 0)
+        self._running.add(task_id)
         try:
             await self._send("task_ack", {"task_id": task_id, "accepted": True, "reason": None},
                              correlation_id)
@@ -551,9 +638,67 @@ class SimWorker:
             }
             self.pending[task_id] = envelope
             self.sent_at[task_id] = time.monotonic()
+            self.submitted[task_id] = envelope
             await self._send("task_result", envelope, correlation_id)
         finally:
+            self._running.discard(task_id)
             self._slots.release()
+
+    # -- Phase 3.8 fault injection ------------------------------------
+
+    async def kill_session(self) -> bool:
+        """Drop the socket the way a killed container does: no close frame.
+
+        `transport.abort()` rather than `ws.close()`, and the difference is
+        the whole fault. A close frame is a *polite* disconnect, which Step
+        3.1 shortens the lease on; an abort is an RST, which is what a
+        `docker kill` or a yanked network cable produces. The reconnect loop
+        in `run()` brings the worker back on its existing identity, so this
+        models a restarted container rather than a machine that never
+        returns.
+        """
+        ws = self._ws
+        if ws is None:
+            return False
+        self.kills += 1
+
+        # **The work dies with the process, and getting this wrong made the
+        # fault a lie.** The first version aborted only the socket, which
+        # left every execution coroutine running and every unacknowledged
+        # result in `pending` — so the "killed" worker finished its own
+        # tasks and re-sent the results on reconnect. A 1,000-task run under
+        # 13 kills then produced **zero** redeliveries and one reassignment:
+        # the coordinator had almost nothing to recover, because nothing had
+        # actually been lost. That is a network drop, not a kill.
+        for execution in list(self._executing):
+            execution.cancel()
+        self._executing.clear()
+        self._running.clear()
+        self.pending.clear()
+        self.sent_at.clear()
+        try:
+            transport = getattr(ws, "transport", None)
+            if transport is not None:
+                transport.abort()
+            else:  # pragma: no cover — depends on the websockets version
+                await ws.close()
+            return True
+        except Exception:  # noqa: BLE001 — a socket that is already gone is a killed socket
+            return True
+
+    async def resubmit(self, task_id: str, envelope: dict) -> bool:
+        """Send a `task_result` frame this worker has no business sending.
+
+        The injection point for both the duplicate and the stale fault. It
+        deliberately does **not** touch `pending`: a re-send that entered the
+        retry loop would keep re-sending itself, and the point is to make
+        exactly one submission and read exactly one verdict.
+        """
+        self.awaiting_injection.add(task_id)
+        sent = await self._send("task_result", envelope, str(uuid.uuid4()))
+        if not sent:
+            self.awaiting_injection.discard(task_id)
+        return sent
 
     async def _execute(self, task_type: str, parameters: dict) -> Any:
         # ponytail: `sleep` is awaited rather than run through the real
