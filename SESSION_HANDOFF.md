@@ -26,8 +26,13 @@ deployed, so there was nothing to deliver there.
 ### ⇒ START HERE NEXT SESSION
 
 1. **Approve or reject Step 3.8.** It is **PR #65**, branch
-   `phase-3.8-chaos-harness`. **Step 3.9 is NOT STARTED and must not begin
-   without an explicit go-ahead (§9).**
+   `phase-3.8-chaos-harness`, head **`78a7691`**, and **green — 14 of 14
+   checks, `MERGEABLE` / `CLEAN`**, read from the API rather than off a
+   tick. The `test` job reports **513 passed** against ephemeral
+   Postgres/Redis, corroborating the local count. **NOT MERGED, so no
+   environment runs it and the chaos workflow cannot fire.**
+   **Step 3.9 is NOT STARTED and must not begin without an explicit
+   go-ahead (§9).**
 2. **⚠ The chaos workflow has NEVER RUN.** GitHub only schedules and
    dispatches workflows that are on the default branch, so
    `.github/workflows/chaos.yml` cannot fire until this merges. **After
@@ -128,6 +133,26 @@ looking for a fence and found a genuine invariant violation on the way.
 - **No worker ran outside this laptop.** §8 is claimed only in the sense
   that the coordinator was remote and the certificate validated.
 - **No user-run demo or failure demo** — every run above was agent-run.
+- **Nothing merged and nothing deployed.** `main` is untouched at
+  **`21613d6`**, which is what both environments still run.
+
+### State at close — checked, not assumed
+
+- **PR #65 is OPEN, `MERGEABLE` / `CLEAN`**, head `78a7691`, 14 of 14
+  checks green, `test` reporting **513 passed**.
+- **`main` is at `21613d6`** and public staging `/health` returns
+  `21613d606b523fa4497f53d7a1125fe30f341bb6` — so **the cluster is UP and
+  BILLING at close**, which is how the staging chaos run was possible.
+  Nothing is parked; the stop command is item 3.
+- **Six containers are running**, all verified at close:
+  `dcds38-coordinator-1`, `dcds38-dashboard-1`, `dcds38-postgres-1` and
+  `dcds38-redis-1` **Up (healthy)**, plus the standalone `dcds38-pg` and
+  `dcds38-redis` unit-test pair on **55438** / **6395**. Teardown is item 4.
+- **The working tree is clean** on `phase-3.8-chaos-harness`, everything
+  committed and pushed. Three commits, one concern each: the harness, the
+  workflow, the record.
+- **No branch was deleted this session.** `phase-3.5-restart-recovery` and
+  `phase-3.7-dashboard-v3` still survive their merges, as before.
 
 ---
 
