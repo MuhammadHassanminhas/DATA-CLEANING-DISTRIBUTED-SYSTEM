@@ -3195,11 +3195,19 @@ that would make the whole harness useless.
   scheduled workflow. `git diff --stat` touches nothing under
   `coordinator/`, `worker/`, `dashboard/`, `protocol/`, `infra/` or
   `alembic/`.
-- **It has not run in CI.** `.github/workflows/chaos.yml` is scheduled
-  weekly and dispatchable, but GitHub only schedules and dispatches
-  workflows that are on the default branch, so **its first run happens
-  after this merges**. Step 3.9's "chaos suite green in CI" is where that
-  is claimed, not here.
+- ~~**It has not run in CI.**~~ **It has now — once, on 2026-08-06, after
+  the merge, and it was green.** It could not run before: GitHub only
+  schedules and dispatches workflows that are on the default branch. Run
+  `31100821098`, `workflow_dispatch` on `main`, 10 workers / 500 tasks,
+  seed `744996882` — 11 of 11 checks true, 14 faults applied (7 `kill`,
+  4 `duplicate`, 3 `freeze`, 3 `thaw`), 508 delivered / 500 distinct /
+  8 redeliveries, 8 `REASSIGNED` `lease_expired` rows, 4 injections all
+  refused `duplicate`, **500 rows = 500 distinct = 500 `COMPLETED` = 500
+  results**, converged 0.108s to queue depth 0. Same shortened lease
+  windows as §3.8.5, so the same caveat applies to its timings. **Step
+  3.9's "chaos suite green in CI" is still where that is claimed for the
+  milestone, not here** — this is one dispatched run, not the weekly
+  schedule proving itself.
 - **It injects no database or Redis blip of its own** — those are
   `--chaos-command`, and no run in §3.8.5 passed one, so **no dependency
   blip has been exercised**. The mechanism is the same subprocess path

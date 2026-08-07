@@ -16,6 +16,11 @@ paragraph is a summary, not a substitute.
 Two ways to run it, both documented below: **Docker Compose** for local
 development, and **Azure AKS** for the deployed environments.
 
+**Moving to a different machine and resuming work on the existing
+cluster (not standing up a new one)?** Use `NEW_MACHINE_SETUP.md`
+instead of the AKS section below — it reuses the existing cluster,
+secrets, and Terraform state with no new keys.
+
 ## Layout
 
 ```

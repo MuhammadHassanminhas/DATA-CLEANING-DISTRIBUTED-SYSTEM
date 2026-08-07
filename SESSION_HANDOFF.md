@@ -8,6 +8,109 @@ the next session — it is not a source of truth, `PHASE_STATE.md` is.
 
 # Where things stand
 
+## ⇒ 2026-08-06 (session 31) — STEP 3.8 APPROVED, MERGED, DEPLOYED TO BOTH ENVIRONMENTS, AND THE CHAOS WORKFLOW RAN FOR THE FIRST TIME — GREEN
+
+**You approved Step 3.8 and asked for three things: merge PR #65, run the
+chaos suite, then tear down the local containers. All three are done.**
+No application code was written, no test was run locally, no step was
+started, and **no demo was performed** — you asked for the demo *commands*
+and they were written out in the session, not executed.
+
+### ⇒ START HERE NEXT SESSION
+
+1. **Merge the small PR carrying this entry** once CI is green. It cannot
+   live inside PR #65 — it records that PR's own merge, deploy and first
+   chaos run. Same call sessions 9, 10, 12, 17, 20, 22, 27, 28 and 29 made.
+2. **⚠ The AKS cluster is RUNNING and BILLING.** CD has finished on both
+   environments and nothing is parked, so a stop interrupts nothing:
+   ```powershell
+   az aks stop -g data-cleaning-distributed-system-rg -n data-cleaning-distributed-system
+   ```
+   Never run that while a deploy gate is parked (session 23's lesson).
+3. **Step 3.9 (M3 demo and verification) is NOT STARTED and must not begin
+   without an explicit go-ahead (§9).**
+4. **Step 3.8 still owes §15 items 3–4: a user-run demo and a user-run
+   failure demo.** Every run behind its evidence is agent-run. The exact
+   command sequence was written out this session — bring up a `dcds38`
+   Compose stack on 9495/9496 at shortened lease windows, run
+   `scripts/chaos.py` for the green case, then the `sleep(30)`-under-a-20s-
+   lease case for the red one. `docs/chaos-testing.md` is the runbook and
+   §3.8.6 carries the deliberate failure command verbatim.
+5. **Nothing runs locally.** The `dcds38` stack, the standalone
+   `dcds38-pg` / `dcds38-redis` pair, volume `dcds38_postgres-data` and
+   network `dcds38_default` are all removed — `docker ps` reports **zero
+   running containers**. The stopped `dcds31`–`dcds36`, `k3d-*`,
+   `auto_report-backend-1` and old `data_cleaning_distributed_system-*`
+   containers were left alone deliberately; teardown was asked for, not a
+   sweep.
+6. **`chaos-demo.json` (7,981 bytes, written 2026-08-06 17:37) is untracked
+   in the repository root** — a leftover `--json-out` from session 30's
+   local runs. Not committed, not `.gitignore`d. Delete it or keep it.
+7. Still open and unchanged: **no worker has ever run outside this laptop
+   in any M3 step**, and `GRAFANA_ADMIN_PASSWORD` / `POSTGRES_PASSWORD`
+   are still to rotate. **`.env` was NOT read or modified this session and
+   no secret was printed.**
+
+### What actually happened, in order
+
+1. **PR #65 merged** — read from the API first: `OPEN`, `MERGEABLE`,
+   `CLEAN`, 14 of 14 checks `SUCCESS`. Merge commit
+   **`6225de107ce987b4101ada1f69ea8289c0bd024a`**, `main` moved
+   `21613d6` → `6225de1`.
+2. **Chaos workflow dispatched on `main`** the moment the merge landed —
+   `gh workflow run "Chaos suite" -f workers=10 -f tasks=500`. **Run
+   `31100821098`, and it is the first time that workflow has ever fired.**
+3. **Post-merge CI green**, CD run **`31100885245`** `success` on
+   **`staging / deploy` and `production / deploy`**, and public staging
+   `/health` returns
+   `{"status":"healthy","version":"6225de107ce987b4101ada1f69ea8289c0bd024a"}`
+   over a validated certificate — no `-k`.
+4. **Local teardown**, verified: `docker ps` count **0**.
+
+### The first CI chaos run, from its own artifact
+
+`chaos-report.json`, seed `744996882`, 10 workers × 4 credits, 500 tasks,
+`sleep(2)`, faults `kill,freeze,duplicate,stale` at one every 4s:
+
+| | |
+|---|---|
+| Checks | **11 of 11 true** |
+| Faults | **14 applied** — 7 `kill`, 4 `duplicate`, 3 `freeze`, 3 `thaw` |
+| Fleet | 10 connected, 17 sessions total, 7 reconnects (p50 0.722s) |
+| Delivery | 508 delivered, 500 distinct, **8 redeliveries**, 0 refusals |
+| Coordinator's recovery feed | **8 `REASSIGNED`, all `lease_expired`** |
+| Injections | 4 acked, **4 `duplicate`, none accepted**, 0 unanswered on a live session |
+| Ledger | **500 rows = 500 distinct = 500 `COMPLETED` = 500 with result** |
+| Convergence | **0.108s**, final queue depth **0**, 0 rate-limited retries |
+| Throughput | 10.8 tasks/s over a 46.1s span; drain 58.4s, wall 62.1s |
+
+**That runner stack uses the same shortened lease windows as `dcds38`**
+(TTL 20s, grace 5s, reclaim 2s, backoff 2s/10s, exclusion 10s) and raises
+`REGISTER_RATE_LIMIT_PER_MINUTE` to 10000 because a harness fleet from one
+address is exactly what the limiter refuses. **No timing above is a
+measurement of the shipped defaults.**
+
+### What this run does NOT settle
+
+- **It is one dispatched run, not the weekly schedule proving itself.**
+  Step 3.9 still owns the "chaos suite green in CI" claim; §3.8.7 was
+  updated to say the run happened and to keep that boundary.
+- **No database blip, no Redis blip, no pod eviction** — still
+  `--chaos-command` only, still never exercised.
+- **Nobody has watched the dashboard during a chaos run.** The CI run has
+  no dashboard and no observer.
+
+### Files updated this session
+
+`PHASE_STATE.md` — the 3.8 register row now reads DONE / APPROVED /
+MERGED / DEPLOYED with the CD run and the live SHA, its "has NOT run in
+CI" clause is replaced by the run's numbers, and the `Last updated` row
+carries a session 31 paragraph. `docs/phase-3-fault-tolerance.md` §3.8.7 —
+the "has not run in CI" bullet struck through and replaced. This file —
+this entry. **No other file was touched.**
+
+---
+
 ## ⇒ 2026-08-06 (session 30) — STEP 3.8 BUILT AND VERIFIED, SIX OF SIX CRITERIA, NO PRODUCTION CODE CHANGED
 
 **You directed that the next step be built end to end with the decisions
